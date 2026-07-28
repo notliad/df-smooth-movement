@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <set>
 #include <unordered_map>
@@ -33,7 +34,7 @@ REQUIRE_GLOBAL(window_z);
 
 namespace {
 
-constexpr const char *plugin_version="0.2.0";
+constexpr const char *plugin_version="0.2.0+smooth-camera";
 
 #ifdef WIN32
 constexpr const char *sdl_library="SDL2.dll";
@@ -45,11 +46,13 @@ constexpr const char *sdl_library="libSDL2-2.0.so.0";
 DFLibrary *sdl_handle=nullptr;
 using RenderCopyF=int (*)(SDL_Renderer *,SDL_Texture *,const SDL_Rect *,const SDL_FRect *);
 using RenderFillRect=int (*)(SDL_Renderer *,const SDL_Rect *);
+using RenderSetClipRect=int (*)(SDL_Renderer *,const SDL_Rect *);
 using GetRenderDrawColor=int (*)(SDL_Renderer *,Uint8 *,Uint8 *,Uint8 *,Uint8 *);
 using SetRenderDrawColor=int (*)(SDL_Renderer *,Uint8,Uint8,Uint8,Uint8);
 using GetTicks=Uint32 (*)();
 RenderCopyF render_copy_f=nullptr;
 RenderFillRect render_fill_rect=nullptr;
+RenderSetClipRect render_set_clip_rect=nullptr;
 GetRenderDrawColor get_render_draw_color=nullptr;
 SetRenderDrawColor set_render_draw_color=nullptr;
 GetTicks get_ticks=nullptr;
@@ -66,6 +69,123 @@ bool has_view_signature=false;
 int32_t previous_pan_x=0;
 int32_t previous_pan_y=0;
 bool has_pan_context=false;
+
+// --- smooth camera glide -----------------------------------------------------------------------
+// The camera is visually unbound from the tile grid: when the map scrolls, the view keeps
+// rendering from the OLD position and exponentially catches up to the new one, drawing the world
+// at sub-tile pixel offsets in between. Pure render-state; the real camera (window_x/window_y)
+// is never touched.
+constexpr int32_t camera_max_glide_tiles=3;   // per-jump: farther than this snaps instantly
+constexpr double camera_tau_ms=35.0;          // catch-up time constant (~95% done after 100ms)
+double camera_offset_x=0.0;                   // remaining visual offset, in pixels
+double camera_offset_y=0.0;
+int32_t camera_pending_dx=0;                  // scroll delta announced but not yet in the buffers
+int32_t camera_pending_dy=0;
+int32_t camera_pending_frames=0;
+
+// Did the viewport buffers apply a scroll of (dwx,dwy) this frame? Tested on the BACKGROUND
+// layer: terrain is dense (nonzero nearly everywhere), so this works with no creatures on
+// screen. On a uniform screen the test can fire a frame early, but then a shifted render is
+// pixel-identical to an unshifted one, so the mistiming is invisible by construction.
+bool background_shift_matches(const df::graphic_viewportst *vp,int32_t dwx,int32_t dwy)
+{
+	int32_t considered=0;
+	int32_t matches=0;
+	for(int32_t x=0;x<vp->dim_x;++x)
+		{
+		const int32_t sx=x+dwx;
+		if(sx<0||sx>=vp->dim_x)continue;
+		for(int32_t y=0;y<vp->dim_y;++y)
+			{
+			const int32_t sy=y+dwy;
+			if(sy<0||sy>=vp->dim_y)continue;
+			const int32_t cur=vp->screentexpos_background[x*vp->dim_y+y];
+			if(cur==0)continue;
+			++considered;
+			if(vp->screentexpos_background_old[sx*vp->dim_y+sy]==cur)++matches;
+			}
+		}
+	return considered>0&&matches*5>=considered*3;
+}
+
+void cancel_camera_glide()
+{
+	camera_offset_x=0.0;
+	camera_offset_y=0.0;
+	camera_pending_dx=0;
+	camera_pending_dy=0;
+	camera_pending_frames=0;
+}
+
+// Track scroll changes, start the glide on the frame the buffers apply them, and decay the
+// offset toward zero. Called once per render frame.
+void update_camera(
+	df::renderer_2d_base *renderer,
+	const df::graphic_viewportst *vp,
+	uint32_t delta_ms)
+{
+	const int32_t wx=window_x?*window_x:0;
+	const int32_t wy=window_y?*window_y:0;
+	static int32_t prev_wx=0,prev_wy=0;
+	static bool has_prev=false;
+	if(has_prev&&(wx!=prev_wx||wy!=prev_wy))
+		{
+		const int32_t dx=wx-prev_wx;
+		const int32_t dy=wy-prev_wy;
+		if(std::abs(dx)>camera_max_glide_tiles||std::abs(dy)>camera_max_glide_tiles)
+			cancel_camera_glide();   // teleport-like jump: snap
+		else
+			{
+			camera_pending_dx+=dx;
+			camera_pending_dy+=dy;
+			camera_pending_frames=0;
+			}
+		}
+	prev_wx=wx;
+	prev_wy=wy;
+	has_prev=true;
+
+	if(camera_pending_dx!=0||camera_pending_dy!=0)
+		{
+		if(std::abs(camera_pending_dx)>camera_max_glide_tiles||
+			std::abs(camera_pending_dy)>camera_max_glide_tiles)
+			cancel_camera_glide();
+		else if(background_shift_matches(vp,camera_pending_dx,camera_pending_dy))
+			{
+			// The visual jump landed this frame: put the view back where it was and let the
+			// decay glide it to the new position.
+			const int32_t zoom=renderer->viewport_zoom_factor;
+			const double tile=double(zoom==128?32:std::max(1,zoom*32/128));
+			camera_offset_x+=camera_pending_dx*tile;
+			camera_offset_y+=camera_pending_dy*tile;
+			const double cap=tile*(camera_max_glide_tiles+0.5);
+			camera_offset_x=std::clamp(camera_offset_x,-cap,cap);
+			camera_offset_y=std::clamp(camera_offset_y,-cap,cap);
+			camera_pending_dx=0;
+			camera_pending_dy=0;
+			camera_pending_frames=0;
+			}
+		else if(++camera_pending_frames>4)
+			{
+			camera_pending_dx=0;
+			camera_pending_dy=0;
+			camera_pending_frames=0;
+			}
+		}
+
+	if(camera_offset_x!=0.0||camera_offset_y!=0.0)
+		{
+		const double k=std::exp(-double(delta_ms)/camera_tau_ms);
+		camera_offset_x*=k;
+		camera_offset_y*=k;
+		if(std::abs(camera_offset_x)<0.5&&std::abs(camera_offset_y)<0.5)
+			{
+			cancel_camera_glide();
+			// One engine-driven full redraw so the last sub-pixel-shifted frame is replaced.
+			if(gps!=nullptr)++gps->force_full_display_count;
+			}
+		}
+}
 
 constexpr uint32_t fire_bits=0x70000000U;
 
@@ -96,6 +216,7 @@ void update_visual_context(
 		{
 		++visual_context_revision;
 		previous_coverage.clear();
+		cancel_camera_glide();
 		}
 	previous_viewport=vp;
 	previous_view_signature=signature;
@@ -412,8 +533,14 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	animation_manager.end_frame();
 
 	if(vp==nullptr||!vp->flag.bits.active||
-		!animation_manager.requires_full_redraw()||
 		render_copy_f==nullptr||renderer->sdl_renderer==nullptr)
+		return;
+	if(render_set_clip_rect!=nullptr)
+		update_camera(renderer,vp,animation_manager.get_frame_delta_ms());
+	const int32_t glide_x=int32_t(std::lround(camera_offset_x));
+	const int32_t glide_y=int32_t(std::lround(camera_offset_y));
+	const bool glide=glide_x!=0||glide_y!=0;
+	if(!glide&&!animation_manager.requires_full_redraw())
 		return;
 
 	std::vector<render_proxyst> proxies=collect_proxies(renderer,vp);
@@ -432,14 +559,68 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 			upper_coverage.insert(proxy.coverage.begin(),proxy.coverage.end());
 		}
 
+	SDL_Renderer *sdl_renderer=static_cast<SDL_Renderer *>(renderer->sdl_renderer);
+	const int32_t zoom=renderer->viewport_zoom_factor;
+	const int32_t tile_size=zoom==128?32:std::max(1,zoom*32/128);
+
+	if(glide)
+		{
+		// Camera mid-glide: repaint the WHOLE map rect at the shifted origin so the world (and
+		// the creature proxies, which read origin at draw time) renders between tiles. The engine
+		// already drew this frame at the snapped position; everything here overdraws it, clipped
+		// to the map rect so shifted tiles never spill over the UI. The uncovered strip on the
+		// trailing edge stays black until the glide lands.
+		const SDL_Rect map_rect=
+			{
+			tile_pixel(vp->clipx[0],renderer->origin_x,zoom),
+			tile_pixel(vp->clipy[0],renderer->origin_y,zoom),
+			tile_pixel(vp->clipx[1]+1,renderer->origin_x,zoom)-
+				tile_pixel(vp->clipx[0],renderer->origin_x,zoom),
+			tile_pixel(vp->clipy[1]+1,renderer->origin_y,zoom)-
+				tile_pixel(vp->clipy[0],renderer->origin_y,zoom)
+			};
+		render_set_clip_rect(sdl_renderer,&map_rect);
+		Uint8 old_r=0,old_g=0,old_b=0,old_a=255;
+		get_render_draw_color(sdl_renderer,&old_r,&old_g,&old_b,&old_a);
+		set_render_draw_color(sdl_renderer,0,0,0,255);
+		render_fill_rect(sdl_renderer,&map_rect);
+		set_render_draw_color(sdl_renderer,old_r,old_g,old_b,old_a);
+
+		const int32_t saved_origin_x=renderer->origin_x;
+		const int32_t saved_origin_y=renderer->origin_y;
+		renderer->origin_x+=glide_x;
+		renderer->origin_y+=glide_y;
+		for(int32_t x=vp->clipx[0];x<=vp->clipx[1];++x)
+			{
+			for(int32_t y=vp->clipy[0];y<=vp->clipy[1];++y)
+				redraw_world_tile(renderer,vp,x,y,selected);
+			}
+		for(const render_proxyst &proxy:proxies)
+			{
+			if(static_cast<uint8_t>(proxy.layer)<3)draw_proxy(renderer,proxy);
+			}
+		for(const auto &[x,y]:main_coverage)
+			redraw_above_main(renderer,vp,x,y,selected);
+		for(const render_proxyst &proxy:proxies)
+			{
+			if(static_cast<uint8_t>(proxy.layer)>=3)draw_proxy(renderer,proxy);
+			}
+		for(const auto &[x,y]:upper_coverage)
+			redraw_above_upper(renderer,vp,x,y);
+		renderer->origin_x=saved_origin_x;
+		renderer->origin_y=saved_origin_y;
+		render_set_clip_rect(sdl_renderer,nullptr);
+
+		// Everything was repainted; per-tile coverage bookkeeping restarts after the glide.
+		previous_coverage.clear();
+		return;
+		}
+
 	std::set<std::pair<int32_t,int32_t>> redraw_coverage=current_coverage;
 	redraw_coverage.insert(previous_coverage.begin(),previous_coverage.end());
-	SDL_Renderer *sdl_renderer=static_cast<SDL_Renderer *>(renderer->sdl_renderer);
 	Uint8 old_r=0,old_g=0,old_b=0,old_a=255;
 	get_render_draw_color(sdl_renderer,&old_r,&old_g,&old_b,&old_a);
 	set_render_draw_color(sdl_renderer,0,0,0,255);
-	const int32_t zoom=renderer->viewport_zoom_factor;
-	const int32_t tile_size=zoom==128?32:std::max(1,zoom*32/128);
 	for(const auto &[x,y]:redraw_coverage)
 		{
 		if(!inside_clip(vp,x,y))continue;
@@ -501,12 +682,15 @@ bool load_sdl(color_ostream &out)
 		LookupPlugin(sdl_handle,"SDL_RenderCopyF"));
 	render_fill_rect=reinterpret_cast<RenderFillRect>(
 		LookupPlugin(sdl_handle,"SDL_RenderFillRect"));
+	render_set_clip_rect=reinterpret_cast<RenderSetClipRect>(
+		LookupPlugin(sdl_handle,"SDL_RenderSetClipRect"));
 	get_render_draw_color=reinterpret_cast<GetRenderDrawColor>(
 		LookupPlugin(sdl_handle,"SDL_GetRenderDrawColor"));
 	set_render_draw_color=reinterpret_cast<SetRenderDrawColor>(
 		LookupPlugin(sdl_handle,"SDL_SetRenderDrawColor"));
 	get_ticks=reinterpret_cast<GetTicks>(LookupPlugin(sdl_handle,"SDL_GetTicks"));
 	if(render_copy_f==nullptr||render_fill_rect==nullptr||
+		render_set_clip_rect==nullptr||
 		get_render_draw_color==nullptr||set_render_draw_color==nullptr||
 		get_ticks==nullptr)
 		{
@@ -529,6 +713,7 @@ void reset_state()
 	previous_pan_x=0;
 	previous_pan_y=0;
 	has_pan_context=false;
+	cancel_camera_glide();
 }
 
 command_result status_command(
