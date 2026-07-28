@@ -2,9 +2,12 @@
 
 ## Unreleased
 
-- Follow the camera during a pan instead of resetting: in-flight movements are translated by the
-  map-scroll delta so sprites track the scrolled world rather than floating, and are dropped only
-  once they scroll off-screen. Zoom, Z-level, resize, and viewport changes still reset.
+- Fix sprites floating while the camera pans. The scroll variables change at input time but the
+  viewport buffers shift on a later render frame, where the shift used to read as a real creature
+  move and started a bogus slide across the screen. The buffer shift is now detected directly
+  (hypothesis-tested against the pending scroll delta): new-movement detection is suppressed while
+  a pan is pending, and in-flight movements are translated on the frame the shift lands so they
+  keep tracking the world. Zoom, Z-level, resize, and viewport changes still reset.
 
 ## 0.2.0 - 2026-07-28
 
