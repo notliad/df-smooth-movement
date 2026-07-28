@@ -27,6 +27,11 @@ struct viewport_visual_animation_inputst
 	uint64_t context_revision=0;
 	std::array<const int32_t *,static_cast<size_t>(viewport_creature_layer::count)> current{};
 	std::array<const int32_t *,static_cast<size_t>(viewport_creature_layer::count)> previous{};
+	// Current map-scroll offset (window_x/window_y). A pure pan does not bump context_revision;
+	// instead in-flight movements are translated by the pan delta so their viewport tiles keep
+	// tracking the scrolled world (otherwise the interpolated sprite floats behind the camera).
+	int32_t pan_x=0;
+	int32_t pan_y=0;
 
 	bool valid() const
 		{
@@ -69,6 +74,9 @@ class visual_animation_managerst
 		bool has_context;
 		bool seen;
 		std::vector<movementst> movements;
+		int32_t pan_x;
+		int32_t pan_y;
+		bool has_pan;
 	};
 
 	uint32_t frame_time_ms;
@@ -85,7 +93,7 @@ class visual_animation_managerst
 			{
 			if(state.viewport==input.viewport)return state;
 			}
-		viewports.push_back({input.viewport,0,0,0,false,false,{}});
+		viewports.push_back({input.viewport,0,0,0,false,false,{},0,0,false});
 		return viewports.back();
 		}
 
@@ -134,14 +142,45 @@ class visual_animation_managerst
 			const bool context_changed=!state.has_context||
 				state.context_revision!=input.context_revision||
 				state.dim_x!=input.dim_x||state.dim_y!=input.dim_y;
+			// A pure map scroll (pan) is followable: instead of dropping in-flight movements we
+			// shift them by the pan delta so their viewport tiles track the scrolled world, and we
+			// skip NEW detection this frame (a pan makes every stationary sprite look like it moved
+			// by the same delta). Only unfollowable changes (zoom, z-level, resize, viewport swap,
+			// via context_revision/dims) clear movements.
+			const bool pan_changed=state.has_pan&&!context_changed&&
+				(state.pan_x!=input.pan_x||state.pan_y!=input.pan_y);
+			const int32_t pan_dx=input.pan_x-state.pan_x;
+			const int32_t pan_dy=input.pan_y-state.pan_y;
 			state.context_revision=input.context_revision;
 			state.dim_x=input.dim_x;
 			state.dim_y=input.dim_y;
 			state.has_context=true;
+			state.pan_x=input.pan_x;
+			state.pan_y=input.pan_y;
+			state.has_pan=true;
 			if(context_changed||!allow_new_movements)
 				{
 				state.movements.clear();
 				return;
+				}
+
+			if(pan_changed)
+				{
+				// Re-anchor to the new viewport frame; drop anything scrolled off-screen.
+				state.movements.erase(
+					std::remove_if(
+						state.movements.begin(),
+						state.movements.end(),
+						[&](movementst &movement)
+							{
+							movement.source_x-=pan_dx;
+							movement.source_y-=pan_dy;
+							movement.target_x-=pan_dx;
+							movement.target_y-=pan_dy;
+							return movement.target_x<0||movement.target_x>=input.dim_x||
+								movement.target_y<0||movement.target_y>=input.dim_y;
+							}),
+					state.movements.end());
 				}
 
 			state.movements.erase(
@@ -157,6 +196,8 @@ class visual_animation_managerst
 						}),
 				state.movements.end());
 
+			if(!pan_changed)
+			{
 			const int32_t tile_count=input.dim_x*input.dim_y;
 			std::vector<uint8_t> claimed_sources(tile_count);
 			for(size_t layer=0;layer<input.current.size();++layer)
@@ -210,6 +251,7 @@ class visual_animation_managerst
 						}
 					}
 				}
+			}
 			if(!state.movements.empty())force_full_redraw=true;
 			}
 

@@ -58,8 +58,14 @@ visual_animation_managerst animation_manager;
 std::set<std::pair<int32_t,int32_t>> previous_coverage;
 uint64_t visual_context_revision=0;
 const void *previous_viewport=nullptr;
-std::array<int32_t,14> previous_view_signature{};
+std::array<int32_t,12> previous_view_signature{};
 bool has_view_signature=false;
+// Map scroll (window_x/window_y) is tracked separately from the reset signature: a pure pan is
+// followed (movements are translated) instead of triggering a full reset, so it must NOT bump the
+// context revision. It only invalidates the viewport-space blackout coverage from the prior frame.
+int32_t previous_pan_x=0;
+int32_t previous_pan_y=0;
+bool has_pan_context=false;
 
 constexpr uint32_t fire_bits=0x70000000U;
 
@@ -67,10 +73,10 @@ void update_visual_context(
 	const df::renderer_2d_base *renderer,
 	const df::graphic_viewportst *vp)
 {
-	const std::array<int32_t,14> signature=
+	// window_x/window_y are deliberately excluded: a horizontal/vertical scroll is followed, not
+	// reset. window_z (z-level) stays, since a z change is not followable.
+	const std::array<int32_t,12> signature=
 		{
-		window_x?*window_x:0,
-		window_y?*window_y:0,
 		window_z?*window_z:0,
 		vp->dim_x,
 		vp->dim_y,
@@ -94,6 +100,16 @@ void update_visual_context(
 	previous_viewport=vp;
 	previous_view_signature=signature;
 	has_view_signature=true;
+
+	// On a pure pan the reset signature is unchanged, but last frame's blackout coverage is in the
+	// old viewport frame, so discard it (the engine repaints the whole scrolled viewport anyway).
+	const int32_t pan_x=window_x?*window_x:0;
+	const int32_t pan_y=window_y?*window_y:0;
+	if(!has_pan_context||previous_pan_x!=pan_x||previous_pan_y!=pan_y)
+		previous_coverage.clear();
+	previous_pan_x=pan_x;
+	previous_pan_y=pan_y;
+	has_pan_context=true;
 }
 
 std::array<int32_t *,6> creature_layers(df::graphic_viewportst *vp)
@@ -130,7 +146,9 @@ viewport_visual_animation_inputst animation_input(df::graphic_viewportst *vp)
 			vp->screentexpos_upright_creature_old,
 			vp->screentexpos_up_creature_old,
 			vp->screentexpos_upleft_creature_old
-			}
+			},
+		window_x?*window_x:0,
+		window_y?*window_y:0
 		};
 }
 
@@ -508,6 +526,9 @@ void reset_state()
 	previous_viewport=nullptr;
 	previous_view_signature={};
 	has_view_signature=false;
+	previous_pan_x=0;
+	previous_pan_y=0;
+	has_pan_context=false;
 }
 
 command_result status_command(
