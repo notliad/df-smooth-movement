@@ -12,7 +12,7 @@ The current prebuilt release supports:
 
 - Dwarf Fortress 53.15
 - DFHack 53.15-r2
-- Linux x86-64
+- Linux or Windows x86-64
 - the SDL 2D renderer
 
 DFHack C++ plugins are ABI-specific. Do not install the prebuilt binary on a
@@ -20,9 +20,12 @@ different DFHack or Dwarf Fortress version. Rebuild from source instead.
 
 ## Install
 
-1. Download the release archive for your exact DFHack version.
-2. Extract it into the DFHack installation directory. The resulting file must
-   be `hack/plugins/smooth-movement.plug.so`.
+1. Download the release archive for your operating system and exact DFHack
+   version.
+2. Extract it into the Dwarf Fortress installation directory. The resulting
+   plugin must be:
+   - Linux: `hack/plugins/smooth-movement.plug.so`
+   - Windows: `hack/plugins/smooth-movement.plug.dll`
 3. Start Dwarf Fortress through DFHack.
 4. Run these commands in the DFHack console:
 
@@ -55,6 +58,10 @@ Configure DFHack normally, then build:
 ```sh
 cmake --build /path/to/dfhack-build --target smooth-movement
 ```
+
+Windows builds require the MSVC 2022 toolchain used by DFHack. From Linux, the
+official DFHack Docker build environment can cross-compile the plugin with
+`build/build-win64-from-linux.sh`.
 
 The plugin uses a vmethod interpose, so its CMake target links to DFHack's Lua
 library as required by the DFHack build system.

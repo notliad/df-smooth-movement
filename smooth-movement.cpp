@@ -33,7 +33,13 @@ REQUIRE_GLOBAL(window_z);
 
 namespace {
 
-constexpr const char *plugin_version="0.1.0";
+constexpr const char *plugin_version="0.2.0";
+
+#ifdef WIN32
+constexpr const char *sdl_library="SDL2.dll";
+#else
+constexpr const char *sdl_library="libSDL2-2.0.so.0";
+#endif
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 DFLibrary *sdl_handle=nullptr;
@@ -467,7 +473,7 @@ void renderer_hook::interpose_fn_update_all()
 
 bool load_sdl(color_ostream &out)
 {
-	sdl_handle=OpenPlugin("libSDL2-2.0.so.0");
+	sdl_handle=OpenPlugin(sdl_library);
 	if(sdl_handle==nullptr)
 		{
 		out.printerr("smooth-movement: could not load SDL2\n");

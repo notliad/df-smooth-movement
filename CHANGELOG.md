@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.0 - 2026-07-28
+
+- Add a Windows x86-64 build for DFHack 53.15-r2.
+- Load SDL2 by its platform-specific library name.
+
 ## 0.1.0 - 2026-07-28
 
 - Add smooth visual interpolation for adjacent creature movement.
