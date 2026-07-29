@@ -3,6 +3,7 @@
 #include "PluginManager.h"
 #include "VTableInterpose.h"
 
+#include "df/enabler.h"
 #include "df/graphic.h"
 #include "df/graphic_viewportst.h"
 #include "df/renderer_2d_base.h"
@@ -18,6 +19,7 @@
 #include <cmath>
 #include <cstdint>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -27,6 +29,7 @@ using namespace DFHack;
 DFHACK_PLUGIN("smooth-movement");
 DFHACK_PLUGIN_IS_ENABLED(is_enabled);
 
+REQUIRE_GLOBAL(enabler);
 REQUIRE_GLOBAL(gps);
 REQUIRE_GLOBAL(window_x);
 REQUIRE_GLOBAL(window_y);
@@ -34,7 +37,7 @@ REQUIRE_GLOBAL(window_z);
 
 namespace {
 
-constexpr const char *plugin_version="0.2.0+smooth-camera";
+constexpr const char *plugin_version="0.2.0+free-camera";
 
 #ifdef WIN32
 constexpr const char *sdl_library="SDL2.dll";
@@ -70,18 +73,40 @@ int32_t previous_pan_x=0;
 int32_t previous_pan_y=0;
 bool has_pan_context=false;
 
-// --- smooth camera glide -----------------------------------------------------------------------
-// The camera is visually unbound from the tile grid: when the map scrolls, the view keeps
-// rendering from the OLD position and exponentially catches up to the new one, drawing the world
-// at sub-tile pixel offsets in between. Pure render-state; the real camera (window_x/window_y)
-// is never touched.
+// --- free camera -------------------------------------------------------------------------------
+// The camera is visually unbound from the tile grid. Two layered offsets:
+//   rest      -- a PERSISTENT sub-tile offset in tiles: the free camera. Set by pixel-perfect
+//                middle-mouse drag panning (the view rests wherever released, mid-tile or not)
+//                and by the `smooth-movement camera <fx> <fy>` console command. Survives zoom
+//                and z-level changes. Kept in [-0.5,0.5] by normalization: whole-tile parts are
+//                folded into window_x/window_y (a plain UI scroll write -- NEVER the viewport
+//                dims, which crash DF; the sub-tile strip this leaves at one screen edge has no
+//                buffer data and stays black).
+//   transient -- the decaying scroll glide from before, in pixels, layered on top.
+// Render offset = transient + rest*tile. window_x/window_y remain the game's own tile camera.
 constexpr int32_t camera_max_glide_tiles=3;   // per-jump: farther than this snaps instantly
-constexpr double camera_tau_ms=35.0;          // catch-up time constant (~95% done after 100ms)
-double camera_offset_x=0.0;                   // remaining visual offset, in pixels
-double camera_offset_y=0.0;
+constexpr double camera_tau_ms=35.0;          // transient catch-up (~95% done after 100ms)
+double transient_x=0.0;                       // decaying glide offset, pixels
+double transient_y=0.0;
+double rest_x=0.0;                            // persistent free-camera offset, tiles
+double rest_y=0.0;                            // (positive = view sits WEST/NORTH of window)
 int32_t camera_pending_dx=0;                  // scroll delta announced but not yet in the buffers
 int32_t camera_pending_dy=0;
 int32_t camera_pending_frames=0;
+int32_t self_scroll_x=0;                      // window deltas WE wrote: visual no-ops when landing
+int32_t self_scroll_y=0;
+bool drag_active=false;
+double drag_anchor_vx=0.0;                    // visual camera at drag start, tiles
+double drag_anchor_vy=0.0;
+int32_t drag_anchor_mx=0;                     // precise mouse at drag start, pixels
+int32_t drag_anchor_my=0;
+bool camera_was_offset=false;                 // edge-detects offset->0 for one cleanup redraw
+
+double tile_px(const df::renderer_2d_base *renderer)
+{
+	const int32_t zoom=renderer->viewport_zoom_factor;
+	return double(zoom==128?32:std::max(1,zoom*32/128));
+}
 
 // Did the viewport buffers apply a scroll of (dwx,dwy) this frame? Tested on the BACKGROUND
 // layer: terrain is dense (nonzero nearly everywhere), so this works with no creatures on
@@ -108,22 +133,46 @@ bool background_shift_matches(const df::graphic_viewportst *vp,int32_t dwx,int32
 	return considered>0&&matches*5>=considered*3;
 }
 
-void cancel_camera_glide()
+// Cancel everything except the persistent rest offset (the camera keeps its sub-tile position
+// across zoom/z/resize; only the in-flight animation state is unfollowable).
+void cancel_camera_transients()
 {
-	camera_offset_x=0.0;
-	camera_offset_y=0.0;
+	transient_x=0.0;
+	transient_y=0.0;
 	camera_pending_dx=0;
 	camera_pending_dy=0;
 	camera_pending_frames=0;
+	self_scroll_x=0;
+	self_scroll_y=0;
+	drag_active=false;
 }
 
-// Track scroll changes, start the glide on the frame the buffers apply them, and decay the
-// offset toward zero. Called once per render frame.
+// Fold whole tiles of rest into window_x/window_y so |rest| <= 0.5 (minimal edge strip). The
+// visual position is unchanged: the window write is attributed via self_scroll when it lands.
+void normalize_rest()
+{
+	const int32_t kx=int32_t(-std::llround(rest_x));
+	const int32_t ky=int32_t(-std::llround(rest_y));
+	if(kx!=0&&window_x!=nullptr&&*window_x+kx>=0)
+		{
+		*window_x+=kx;
+		self_scroll_x+=kx;
+		}
+	if(ky!=0&&window_y!=nullptr&&*window_y+ky>=0)
+		{
+		*window_y+=ky;
+		self_scroll_y+=ky;
+		}
+}
+
+// Per-frame camera bookkeeping: observe window scrolls, attribute them when the buffers apply
+// them (glide vs our own normalization writes), drive the drag, decay the transient.
 void update_camera(
 	df::renderer_2d_base *renderer,
 	const df::graphic_viewportst *vp,
 	uint32_t delta_ms)
 {
+	const double tile=tile_px(renderer);
 	const int32_t wx=window_x?*window_x:0;
 	const int32_t wy=window_y?*window_y:0;
 	static int32_t prev_wx=0,prev_wy=0;
@@ -132,8 +181,9 @@ void update_camera(
 		{
 		const int32_t dx=wx-prev_wx;
 		const int32_t dy=wy-prev_wy;
-		if(std::abs(dx)>camera_max_glide_tiles||std::abs(dy)>camera_max_glide_tiles)
-			cancel_camera_glide();   // teleport-like jump: snap
+		if((std::abs(dx)>camera_max_glide_tiles||std::abs(dy)>camera_max_glide_tiles)&&
+			!drag_active)
+			cancel_camera_transients();   // teleport-like jump (recenter/minimap): snap
 		else
 			{
 			camera_pending_dx+=dx;
@@ -149,40 +199,98 @@ void update_camera(
 		{
 		if(std::abs(camera_pending_dx)>camera_max_glide_tiles||
 			std::abs(camera_pending_dy)>camera_max_glide_tiles)
-			cancel_camera_glide();
+			cancel_camera_transients();
 		else if(background_shift_matches(vp,camera_pending_dx,camera_pending_dy))
 			{
-			// The visual jump landed this frame: put the view back where it was and let the
-			// decay glide it to the new position.
-			const int32_t zoom=renderer->viewport_zoom_factor;
-			const double tile=double(zoom==128?32:std::max(1,zoom*32/128));
-			camera_offset_x+=camera_pending_dx*tile;
-			camera_offset_y+=camera_pending_dy*tile;
-			const double cap=tile*(camera_max_glide_tiles+0.5);
-			camera_offset_x=std::clamp(camera_offset_x,-cap,cap);
-			camera_offset_y=std::clamp(camera_offset_y,-cap,cap);
+			// The visual jump landed. Attribute it: the part WE wrote (normalization) is a
+			// visual no-op -- it moves into rest; the remainder is a real scroll and glides
+			// (unless a drag is driving the position directly, which re-derives rest below).
+			rest_x+=self_scroll_x;
+			rest_y+=self_scroll_y;
+			const int32_t game_dx=camera_pending_dx-self_scroll_x;
+			const int32_t game_dy=camera_pending_dy-self_scroll_y;
+			if(!drag_active)
+				{
+				transient_x+=game_dx*tile;
+				transient_y+=game_dy*tile;
+				const double cap=tile*(camera_max_glide_tiles+0.5);
+				transient_x=std::clamp(transient_x,-cap,cap);
+				transient_y=std::clamp(transient_y,-cap,cap);
+				}
+			else
+				{
+				rest_x+=game_dx;   // drag: content moved under a fixed visual; fold fully
+				rest_y+=game_dy;
+				}
 			camera_pending_dx=0;
 			camera_pending_dy=0;
 			camera_pending_frames=0;
+			self_scroll_x=0;
+			self_scroll_y=0;
 			}
 		else if(++camera_pending_frames>4)
 			{
 			camera_pending_dx=0;
 			camera_pending_dy=0;
 			camera_pending_frames=0;
+			self_scroll_x=0;
+			self_scroll_y=0;
 			}
 		}
 
-	if(camera_offset_x!=0.0||camera_offset_y!=0.0)
+	// --- pixel-perfect middle-mouse drag: the view follows the mouse 1:1 and rests where
+	// released. DF's own drag still moves window in tile steps; rest carries the remainder.
+	// Positions are tracked against the CONTENT window (window minus unlanded jumps) so the
+	// buffer lag never causes a visible stutter.
+	const bool mbut=enabler!=nullptr&&enabler->mouse_mbut;
+	const double content_wx=double(wx-camera_pending_dx);
+	const double content_wy=double(wy-camera_pending_dy);
+	if(mbut&&!drag_active&&gps!=nullptr)
+		{
+		drag_active=true;
+		drag_anchor_vx=content_wx-rest_x-transient_x/tile;
+		drag_anchor_vy=content_wy-rest_y-transient_y/tile;
+		drag_anchor_mx=gps->precise_mouse_x;
+		drag_anchor_my=gps->precise_mouse_y;
+		transient_x=0.0;
+		transient_y=0.0;
+		}
+	if(drag_active)
+		{
+		if(!mbut)
+			{
+			drag_active=false;
+			normalize_rest();
+			}
+		else if(gps!=nullptr)
+			{
+			double vx=drag_anchor_vx-double(gps->precise_mouse_x-drag_anchor_mx)/tile;
+			double vy=drag_anchor_vy-double(gps->precise_mouse_y-drag_anchor_my)/tile;
+			rest_x=content_wx-vx;
+			rest_y=content_wy-vy;
+			// If DF's own drag disagrees by more than a tile and a half, rebase on its view.
+			const double lim=1.5;
+			if(rest_x<-lim||rest_x>lim||rest_y<-lim||rest_y>lim)
+				{
+				rest_x=std::clamp(rest_x,-lim,lim);
+				rest_y=std::clamp(rest_y,-lim,lim);
+				drag_anchor_vx=content_wx-rest_x+
+					double(gps->precise_mouse_x-drag_anchor_mx)/tile;
+				drag_anchor_vy=content_wy-rest_y+
+					double(gps->precise_mouse_y-drag_anchor_my)/tile;
+				}
+			}
+		}
+
+	if(transient_x!=0.0||transient_y!=0.0)
 		{
 		const double k=std::exp(-double(delta_ms)/camera_tau_ms);
-		camera_offset_x*=k;
-		camera_offset_y*=k;
-		if(std::abs(camera_offset_x)<0.5&&std::abs(camera_offset_y)<0.5)
+		transient_x*=k;
+		transient_y*=k;
+		if(std::abs(transient_x)<0.5&&std::abs(transient_y)<0.5)
 			{
-			cancel_camera_glide();
-			// One engine-driven full redraw so the last sub-pixel-shifted frame is replaced.
-			if(gps!=nullptr)++gps->force_full_display_count;
+			transient_x=0.0;
+			transient_y=0.0;
 			}
 		}
 }
@@ -216,7 +324,7 @@ void update_visual_context(
 		{
 		++visual_context_revision;
 		previous_coverage.clear();
-		cancel_camera_glide();
+		cancel_camera_transients();
 		}
 	previous_viewport=vp;
 	previous_view_signature=signature;
@@ -537,9 +645,17 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		return;
 	if(render_set_clip_rect!=nullptr)
 		update_camera(renderer,vp,animation_manager.get_frame_delta_ms());
-	const int32_t glide_x=int32_t(std::lround(camera_offset_x));
-	const int32_t glide_y=int32_t(std::lround(camera_offset_y));
+	const double cam_tile=tile_px(renderer);
+	const int32_t glide_x=int32_t(std::lround(transient_x+rest_x*cam_tile));
+	const int32_t glide_y=int32_t(std::lround(transient_y+rest_y*cam_tile));
 	const bool glide=glide_x!=0||glide_y!=0;
+	if(!glide&&camera_was_offset)
+		{
+		// The camera just re-joined the grid: one engine redraw replaces the last shifted frame.
+		camera_was_offset=false;
+		if(gps!=nullptr)++gps->force_full_display_count;
+		}
+	if(glide)camera_was_offset=true;
 	if(!glide&&!animation_manager.requires_full_redraw())
 		return;
 
@@ -713,19 +829,64 @@ void reset_state()
 	previous_pan_x=0;
 	previous_pan_y=0;
 	has_pan_context=false;
-	cancel_camera_glide();
+	cancel_camera_transients();
+	rest_x=0.0;
+	rest_y=0.0;
+	camera_was_offset=false;
 }
 
 command_result status_command(
 	color_ostream &out,
 	std::vector<std::string> &parameters)
 {
-	if(!parameters.empty())return CR_WRONG_USAGE;
-	out.print(
-		"smooth-movement {}: {}\n",
-		plugin_version,
-		is_enabled?"enabled":"disabled");
-	return CR_OK;
+	if(parameters.empty())
+		{
+		out.print(
+			"smooth-movement {}: {}\n",
+			plugin_version,
+			is_enabled?"enabled":"disabled");
+		out.print("camera offset: {:.3f} {:.3f} (tiles east/south of the grid)\n",
+			-rest_x,-rest_y);
+		return CR_OK;
+		}
+	if(parameters[0]=="camera")
+		{
+		if(parameters.size()==1)
+			{
+			out.print("camera offset: {:.3f} {:.3f}\n",-rest_x,-rest_y);
+			return CR_OK;
+			}
+		if(parameters.size()==2&&parameters[1]=="reset")
+			{
+			rest_x=0.0;
+			rest_y=0.0;
+			return CR_OK;
+			}
+		if(parameters.size()==3)
+			{
+			try
+				{
+				const double fx=std::stod(parameters[1]);
+				const double fy=std::stod(parameters[2]);
+				if(fx<-0.99||fx>0.99||fy<-0.99||fy>0.99)
+					{
+					out.printerr("offsets must be within -0.99..0.99 tiles\n");
+					return CR_FAILURE;
+					}
+				// User-facing: positive = view sits east/south of the grid position.
+				rest_x=-fx;
+				rest_y=-fy;
+				normalize_rest();
+				return CR_OK;
+				}
+			catch(...)
+				{
+				return CR_WRONG_USAGE;
+				}
+			}
+		return CR_WRONG_USAGE;
+		}
+	return CR_WRONG_USAGE;
 }
 
 } // namespace
@@ -735,7 +896,7 @@ plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 {
 	commands.emplace_back(
 		"smooth-movement",
-		"Show smooth movement status.",
+		"Smooth movement status / free-camera offset (camera <fx> <fy> | camera reset).",
 		status_command);
 	return CR_OK;
 }
