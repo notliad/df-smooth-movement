@@ -76,8 +76,10 @@ cmake --build /path/to/dfhack-build --target smooth-movement-test
 ## Behavior
 
 - Movement uses a 100 ms smoothstep interpolation.
-- Camera movement, zoom, Z-level changes, resize, and viewport changes reset
-  interpolation for one frame.
+- Camera panning is followed: in-flight interpolations are translated by the
+  scroll delta so sprites track the world, and drop once they scroll off-screen.
+- Zoom, Z-level changes, resize, and viewport changes reset interpolation for one
+  frame.
 - Ambiguous movements between identical sprites snap to the destination.
 - Main creature sprites crossing fire snap instead of being replayed over an
   unsafe layer reconstruction.
