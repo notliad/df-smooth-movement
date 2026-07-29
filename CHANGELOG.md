@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Optional free camera (`smooth-movement camera on`, off by default): map scrolls
+  glide with an exponential catch-up, middle-mouse drag pans pixel-perfectly and
+  can rest between tiles, and `camera <fx> <fy>` sets a persistent sub-tile
+  offset. Render-only; the game's tile camera is untouched.
 - Fix sprites floating while the camera pans. The scroll variables change at input time but the
   viewport buffers shift on a later render frame, where the shift used to read as a real creature
   move and started a bogus slide across the screen. The buffer shift is now detected directly
