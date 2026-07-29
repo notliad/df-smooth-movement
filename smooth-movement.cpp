@@ -37,7 +37,7 @@ REQUIRE_GLOBAL(window_z);
 
 namespace {
 
-constexpr const char *plugin_version="0.2.0+free-camera";
+constexpr const char *plugin_version="0.2.0+free-camera.2";
 
 #ifdef WIN32
 constexpr const char *sdl_library="SDL2.dll";
@@ -108,11 +108,9 @@ double tile_px(const df::renderer_2d_base *renderer)
 	return double(zoom==128?32:std::max(1,zoom*32/128));
 }
 
-// Did the viewport buffers apply a scroll of (dwx,dwy) this frame? Tested on the BACKGROUND
-// layer: terrain is dense (nonzero nearly everywhere), so this works with no creatures on
-// screen. On a uniform screen the test can fire a frame early, but then a shifted render is
-// pixel-identical to an unshifted one, so the mistiming is invisible by construction.
-bool background_shift_matches(const df::graphic_viewportst *vp,int32_t dwx,int32_t dwy)
+// Match ratio of "buffers shifted by (dwx,dwy)" on the background layer: 0..1, or -1 when there
+// is nothing to compare (empty background).
+double background_match_ratio(const df::graphic_viewportst *vp,int32_t dwx,int32_t dwy)
 {
 	int32_t considered=0;
 	int32_t matches=0;
@@ -130,7 +128,8 @@ bool background_shift_matches(const df::graphic_viewportst *vp,int32_t dwx,int32
 			if(vp->screentexpos_background_old[sx*vp->dim_y+sy]==cur)++matches;
 			}
 		}
-	return considered>0&&matches*5>=considered*3;
+	if(considered==0)return -1.0;
+	return double(matches)/double(considered);
 }
 
 // Cancel everything except the persistent rest offset (the camera keeps its sub-tile position
@@ -162,6 +161,38 @@ void normalize_rest()
 		{
 		*window_y+=ky;
 		self_scroll_y+=ky;
+		}
+}
+
+// A scroll of (ax,ay) tiles has landed in the buffers: our own normalization writes are visual
+// no-ops (they move into rest); the remainder is a real scroll and glides -- unless a drag is
+// driving the position directly, in which case it folds into rest wholesale.
+void attribute_landed(int32_t ax,int32_t ay,double tile)
+{
+	int32_t sx=0;
+	if(self_scroll_x!=0&&(self_scroll_x>0)==(ax>0)&&ax!=0)
+		sx=(std::abs(self_scroll_x)<=std::abs(ax))?self_scroll_x:ax;
+	int32_t sy=0;
+	if(self_scroll_y!=0&&(self_scroll_y>0)==(ay>0)&&ay!=0)
+		sy=(std::abs(self_scroll_y)<=std::abs(ay))?self_scroll_y:ay;
+	self_scroll_x-=sx;
+	self_scroll_y-=sy;
+	rest_x+=sx;
+	rest_y+=sy;
+	const int32_t gx=ax-sx;
+	const int32_t gy=ay-sy;
+	if(drag_active)
+		{
+		rest_x+=gx;
+		rest_y+=gy;
+		}
+	else
+		{
+		transient_x+=gx*tile;
+		transient_y+=gy*tile;
+		const double cap=tile*(camera_max_glide_tiles+0.5);
+		transient_x=std::clamp(transient_x,-cap,cap);
+		transient_y=std::clamp(transient_y,-cap,cap);
 		}
 }
 
@@ -197,44 +228,77 @@ void update_camera(
 
 	if(camera_pending_dx!=0||camera_pending_dy!=0)
 		{
-		if(std::abs(camera_pending_dx)>camera_max_glide_tiles||
-			std::abs(camera_pending_dy)>camera_max_glide_tiles)
-			cancel_camera_transients();
-		else if(background_shift_matches(vp,camera_pending_dx,camera_pending_dy))
+		if(std::abs(camera_pending_dx)>6||std::abs(camera_pending_dy)>6)
 			{
-			// The visual jump landed. Attribute it: the part WE wrote (normalization) is a
-			// visual no-op -- it moves into rest; the remainder is a real scroll and glides
-			// (unless a drag is driving the position directly, which re-derives rest below).
-			rest_x+=self_scroll_x;
-			rest_y+=self_scroll_y;
-			const int32_t game_dx=camera_pending_dx-self_scroll_x;
-			const int32_t game_dy=camera_pending_dy-self_scroll_y;
-			if(!drag_active)
-				{
-				transient_x+=game_dx*tile;
-				transient_y+=game_dy*tile;
-				const double cap=tile*(camera_max_glide_tiles+0.5);
-				transient_x=std::clamp(transient_x,-cap,cap);
-				transient_y=std::clamp(transient_y,-cap,cap);
-				}
-			else
-				{
-				rest_x+=game_dx;   // drag: content moved under a fixed visual; fold fully
-				rest_y+=game_dy;
-				}
+			// Scrolling far outran detection: snap (keep rest, drop the animation debt).
+			transient_x=0.0;
+			transient_y=0.0;
 			camera_pending_dx=0;
 			camera_pending_dy=0;
 			camera_pending_frames=0;
 			self_scroll_x=0;
 			self_scroll_y=0;
 			}
-		else if(++camera_pending_frames>4)
+		else
 			{
-			camera_pending_dx=0;
-			camera_pending_dy=0;
-			camera_pending_frames=0;
-			self_scroll_x=0;
-			self_scroll_y=0;
+			// Fast scrolling applies the pending delta PIECEMEAL: the buffers may hold +1 of a
+			// pending +3 this frame. Testing only the total made landings miss, time out, and
+			// snap -- the fast-scroll jitter. Instead, find the LARGEST applied prefix of the
+			// pending scroll and attribute just that; the rest keeps pending. Ties between
+			// qualifying shifts only happen on uniform terrain, where mistiming is invisible.
+			const int32_t stepx=(camera_pending_dx>0)-(camera_pending_dx<0);
+			const int32_t stepy=(camera_pending_dy>0)-(camera_pending_dy<0);
+			int32_t best_ax=0,best_ay=0,best_mag=-1;
+			double best_score=-1.0;
+			bool no_data=false;
+			for(int32_t ix=0;ix<=std::abs(camera_pending_dx);++ix)
+				{
+				for(int32_t iy=0;iy<=std::abs(camera_pending_dy);++iy)
+					{
+					const double score=background_match_ratio(vp,ix*stepx,iy*stepy);
+					if(score<0.0){no_data=true;break;}
+					const int32_t mag=ix+iy;
+					if(score>=0.6&&(mag>best_mag||(mag==best_mag&&score>best_score)))
+						{
+						best_mag=mag;
+						best_score=score;
+						best_ax=ix*stepx;
+						best_ay=iy*stepy;
+						}
+					}
+				if(no_data)break;
+				}
+			if(no_data)
+				{
+				// Nothing to compare against (empty background): give up on attribution.
+				camera_pending_dx=0;
+				camera_pending_dy=0;
+				camera_pending_frames=0;
+				self_scroll_x=0;
+				self_scroll_y=0;
+				}
+			else if(best_mag>0)
+				{
+				attribute_landed(best_ax,best_ay,tile);
+				camera_pending_dx-=best_ax;
+				camera_pending_dy-=best_ay;
+				camera_pending_frames=0;
+				}
+			else if(best_mag==0)
+				{
+				// Content demonstrably hasn't moved yet: keep waiting, no timeout pressure.
+				camera_pending_frames=0;
+				}
+			else if(++camera_pending_frames>4)
+				{
+				// Neither static nor any prefix recognizable (heavy simultaneous change):
+				// drop the debt without touching the in-flight glide.
+				camera_pending_dx=0;
+				camera_pending_dy=0;
+				camera_pending_frames=0;
+				self_scroll_x=0;
+				self_scroll_y=0;
+				}
 			}
 		}
 
