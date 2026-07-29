@@ -80,10 +80,33 @@ cmake --build /path/to/dfhack-build --target smooth-movement-test
   scroll delta so sprites track the world, and drop once they scroll off-screen.
 - Zoom, Z-level changes, resize, and viewport changes reset interpolation for one
   frame.
+
 - Ambiguous movements between identical sprites snap to the destination.
 - Main creature sprites crossing fire snap instead of being replayed over an
   unsafe layer reconstruction.
 - UI and menus are rendered after interpolated world sprites.
+
+## Free camera (optional, off by default)
+
+`smooth-movement camera on` unbinds the camera from the tile grid — render-only,
+the game's own tile camera (`window_x`/`window_y`) is untouched:
+
+- Map scrolls glide: the view exponentially catches up to the new position
+  (~100 ms) instead of stepping, drawing the world at sub-tile pixel offsets.
+  Jumps larger than 3 tiles (recenter, minimap) snap instantly.
+- Pixel-perfect middle-mouse drag panning: the view follows the mouse 1:1 and
+  rests wherever it is released — including half-way between tiles.
+- `smooth-movement camera <fx> <fy>` sets a persistent sub-tile offset directly
+  (positive = view east/south of the grid, up to ±0.99 tiles);
+  `smooth-movement camera reset` returns to the grid; `smooth-movement camera`
+  prints the state. Setting an offset implies `camera on`.
+- While the view rests off-grid, a sub-tile strip at one screen edge has no
+  viewport data and renders black, and the map rect is repainted every frame.
+  Whole tiles of offset are folded into the game camera automatically so the
+  strip never exceeds half a tile.
+
+Plain `enable smooth-movement` never activates the free camera; the toggle also
+resets to off whenever the plugin is re-enabled.
 
 ## Scope
 

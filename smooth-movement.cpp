@@ -37,7 +37,7 @@ REQUIRE_GLOBAL(window_z);
 
 namespace {
 
-constexpr const char *plugin_version="0.2.0+free-camera.2";
+constexpr const char *plugin_version="0.2.0";
 
 #ifdef WIN32
 constexpr const char *sdl_library="SDL2.dll";
@@ -84,6 +84,9 @@ bool has_pan_context=false;
 //                buffer data and stays black).
 //   transient -- the decaying scroll glide from before, in pixels, layered on top.
 // Render offset = transient + rest*tile. window_x/window_y remain the game's own tile camera.
+bool camera_enabled=false;                    // OFF by default: plain `enable smooth-movement`
+                                              // keeps upstream behavior (creature interpolation
+                                              // only); `smooth-movement camera on` opts in.
 constexpr int32_t camera_max_glide_tiles=3;   // per-jump: farther than this snaps instantly
 constexpr double camera_tau_ms=35.0;          // transient catch-up (~95% done after 100ms)
 double transient_x=0.0;                       // decaying glide offset, pixels
@@ -101,6 +104,9 @@ double drag_anchor_vy=0.0;
 int32_t drag_anchor_mx=0;                     // precise mouse at drag start, pixels
 int32_t drag_anchor_my=0;
 bool camera_was_offset=false;                 // edge-detects offset->0 for one cleanup redraw
+int32_t camera_prev_wx=0;                     // window-scroll observation baseline
+int32_t camera_prev_wy=0;
+bool camera_has_prev=false;
 
 double tile_px(const df::renderer_2d_base *renderer)
 {
@@ -144,6 +150,17 @@ void cancel_camera_transients()
 	self_scroll_x=0;
 	self_scroll_y=0;
 	drag_active=false;
+}
+
+void set_camera_enabled(bool enable)
+{
+	if(camera_enabled==enable)return;
+	camera_enabled=enable;
+	cancel_camera_transients();
+	rest_x=0.0;
+	rest_y=0.0;
+	camera_has_prev=false;   // fresh observation baseline; no phantom scroll on re-enable
+	// camera_was_offset stays: the render path issues one cleanup redraw if we were mid-offset.
 }
 
 // Fold whole tiles of rest into window_x/window_y so |rest| <= 0.5 (minimal edge strip). The
@@ -203,15 +220,14 @@ void update_camera(
 	const df::graphic_viewportst *vp,
 	uint32_t delta_ms)
 {
+	if(!camera_enabled)return;
 	const double tile=tile_px(renderer);
 	const int32_t wx=window_x?*window_x:0;
 	const int32_t wy=window_y?*window_y:0;
-	static int32_t prev_wx=0,prev_wy=0;
-	static bool has_prev=false;
-	if(has_prev&&(wx!=prev_wx||wy!=prev_wy))
+	if(camera_has_prev&&(wx!=camera_prev_wx||wy!=camera_prev_wy))
 		{
-		const int32_t dx=wx-prev_wx;
-		const int32_t dy=wy-prev_wy;
+		const int32_t dx=wx-camera_prev_wx;
+		const int32_t dy=wy-camera_prev_wy;
 		if((std::abs(dx)>camera_max_glide_tiles||std::abs(dy)>camera_max_glide_tiles)&&
 			!drag_active)
 			cancel_camera_transients();   // teleport-like jump (recenter/minimap): snap
@@ -222,9 +238,9 @@ void update_camera(
 			camera_pending_frames=0;
 			}
 		}
-	prev_wx=wx;
-	prev_wy=wy;
-	has_prev=true;
+	camera_prev_wx=wx;
+	camera_prev_wy=wy;
+	camera_has_prev=true;
 
 	if(camera_pending_dx!=0||camera_pending_dy!=0)
 		{
@@ -896,6 +912,8 @@ void reset_state()
 	cancel_camera_transients();
 	rest_x=0.0;
 	rest_y=0.0;
+	camera_enabled=false;
+	camera_has_prev=false;
 	camera_was_offset=false;
 }
 
@@ -909,15 +927,26 @@ command_result status_command(
 			"smooth-movement {}: {}\n",
 			plugin_version,
 			is_enabled?"enabled":"disabled");
-		out.print("camera offset: {:.3f} {:.3f} (tiles east/south of the grid)\n",
-			-rest_x,-rest_y);
+		out.print("free camera: {}, offset {:.3f} {:.3f} (tiles east/south of the grid)\n",
+			camera_enabled?"on":"off",-rest_x,-rest_y);
 		return CR_OK;
 		}
 	if(parameters[0]=="camera")
 		{
 		if(parameters.size()==1)
 			{
-			out.print("camera offset: {:.3f} {:.3f}\n",-rest_x,-rest_y);
+			out.print("free camera: {}, offset {:.3f} {:.3f}\n",
+				camera_enabled?"on":"off",-rest_x,-rest_y);
+			return CR_OK;
+			}
+		if(parameters.size()==2&&parameters[1]=="on")
+			{
+			set_camera_enabled(true);
+			return CR_OK;
+			}
+		if(parameters.size()==2&&parameters[1]=="off")
+			{
+			set_camera_enabled(false);
 			return CR_OK;
 			}
 		if(parameters.size()==2&&parameters[1]=="reset")
@@ -938,6 +967,7 @@ command_result status_command(
 					return CR_FAILURE;
 					}
 				// User-facing: positive = view sits east/south of the grid position.
+				set_camera_enabled(true);
 				rest_x=-fx;
 				rest_y=-fy;
 				normalize_rest();
@@ -960,7 +990,7 @@ plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 {
 	commands.emplace_back(
 		"smooth-movement",
-		"Smooth movement status / free-camera offset (camera <fx> <fy> | camera reset).",
+		"Smooth movement status; free camera: camera on|off|reset|<fx> <fy>.",
 		status_command);
 	return CR_OK;
 }
