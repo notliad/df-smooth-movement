@@ -769,7 +769,9 @@ std::vector<render_proxyst> collect_proxies(
 						}
 					if(!anchored)continue;
 					}
-				if(visual_layer==viewport_creature_layer::item&&movement.inherited)
+				if((visual_layer==viewport_creature_layer::item||
+					visual_layer==viewport_creature_layer::designation)&&
+					movement.inherited)
 					{
 					const int32_t source_x=x-
 						((x>movement.source_x)-(x<movement.source_x));
@@ -779,9 +781,13 @@ std::vector<render_proxyst> collect_proxies(
 						source_y<0||source_y>=vp->dim_y)continue;
 					const int32_t source=
 						source_x*vp->dim_y+source_y;
-					if(vp->screentexpos_item_old[source]==0||
-						vp->screentexpos_item_old[index]!=0||
-						layers[layer][source]!=0)continue;
+					if(!visual_moved_between_tiles(
+						layers[layer],
+						visual_layer==viewport_creature_layer::item?
+							vp->screentexpos_item_old:
+							vp->screentexpos_designation_old,
+						source,
+						index))continue;
 					}
 
 				render_proxyst proxy=

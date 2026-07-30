@@ -256,7 +256,14 @@ int main()
 	companion.end_frame();
 	previous[0*3+1]=42;
 	current[1*3+1]=42;
+	status_previous[0*3+0]=90;
 	status_current[1*3+0]=91;
+	assert(visual_moved_between_tiles(
+		status_current.data(),status_previous.data(),0*3+0,1*3+0));
+	status_previous[1*3+0]=80;
+	assert(!visual_moved_between_tiles(
+		status_current.data(),status_previous.data(),0*3+0,1*3+0));
+	status_previous[1*3+0]=0;
 	companion.begin_frame(9000);
 	companion.synchronize_viewport(input,true);
 	companion.end_frame();

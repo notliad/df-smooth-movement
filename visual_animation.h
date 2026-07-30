@@ -61,6 +61,15 @@ struct visual_movement_renderst
 	bool inherited=false;
 };
 
+inline bool visual_moved_between_tiles(
+	const int32_t *current,
+	const int32_t *previous,
+	int32_t source,
+	int32_t target)
+{
+	return previous[source]!=0&&previous[target]==0&&current[source]==0;
+}
+
 class visual_animation_managerst
 {
 	struct movementst
