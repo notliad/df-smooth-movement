@@ -433,6 +433,22 @@ std::array<int32_t *,6> creature_layers(df::graphic_viewportst *vp)
 		};
 }
 
+std::array<int32_t *,9> visual_layers(df::graphic_viewportst *vp)
+{
+	auto creature=creature_layers(vp);
+	return {
+		creature[0],
+		creature[1],
+		creature[2],
+		creature[3],
+		creature[4],
+		creature[5],
+		vp->screentexpos_vehicle,
+		vp->screentexpos_item,
+		vp->screentexpos_designation
+		};
+}
+
 viewport_visual_animation_inputst animation_input(df::graphic_viewportst *vp)
 {
 	return {
@@ -446,7 +462,10 @@ viewport_visual_animation_inputst animation_input(df::graphic_viewportst *vp)
 			vp->screentexpos_left_creature,
 			vp->screentexpos_upright_creature,
 			vp->screentexpos_up_creature,
-			vp->screentexpos_upleft_creature
+			vp->screentexpos_upleft_creature,
+			vp->screentexpos_vehicle,
+			vp->screentexpos_item,
+			vp->screentexpos_designation
 			},
 		{
 			vp->screentexpos_right_creature_old,
@@ -454,7 +473,10 @@ viewport_visual_animation_inputst animation_input(df::graphic_viewportst *vp)
 			vp->screentexpos_left_creature_old,
 			vp->screentexpos_upright_creature_old,
 			vp->screentexpos_up_creature_old,
-			vp->screentexpos_upleft_creature_old
+			vp->screentexpos_upleft_creature_old,
+			vp->screentexpos_vehicle_old,
+			vp->screentexpos_item_old,
+			vp->screentexpos_designation_old
 			},
 		window_x?*window_x:0,
 		window_y?*window_y:0
@@ -475,6 +497,13 @@ bool inside_clip(const df::graphic_viewportst *vp,int32_t x,int32_t y)
 bool has_fire(const df::graphic_viewportst *vp,int32_t x,int32_t y)
 {
 	return vp->screentexpos_spatter_flag[x*vp->dim_y+y]&fire_bits;
+}
+
+bool is_main_creature(viewport_creature_layer layer)
+{
+	return layer==viewport_creature_layer::right||
+		layer==viewport_creature_layer::center||
+		layer==viewport_creature_layer::left;
 }
 
 template<typename T>
@@ -505,8 +534,8 @@ class scoped_zerost
 struct render_proxyst
 {
 	viewport_creature_layer layer;
-	int32_t source_x;
-	int32_t source_y;
+	float source_x;
+	float source_y;
 	int32_t target_x;
 	int32_t target_y;
 	int32_t texpos;
@@ -520,18 +549,27 @@ void redraw_world_tile(
 	df::graphic_viewportst *vp,
 	int32_t x,
 	int32_t y,
-	const std::unordered_map<int32_t,uint8_t> &selected)
+	const std::unordered_map<int32_t,uint16_t> &selected)
 {
 	const int32_t index=x*vp->dim_y+y;
 	const auto found=selected.find(index);
-	const uint8_t mask=found==selected.end()?0:found->second;
+	const uint16_t mask=found==selected.end()?0:found->second;
 	auto layers=creature_layers(vp);
+	scoped_zerost<int32_t> item(
+		vp->screentexpos_item+index,
+		mask&(1U<<static_cast<uint8_t>(viewport_creature_layer::item)));
+	scoped_zerost<int32_t> vehicle(
+		vp->screentexpos_vehicle+index,
+		mask&(1U<<static_cast<uint8_t>(viewport_creature_layer::vehicle)));
 	scoped_zerost<int32_t> right(layers[0]+index,mask&(1U<<0));
 	scoped_zerost<int32_t> center(layers[1]+index,mask&(1U<<1));
 	scoped_zerost<int32_t> left(layers[2]+index,mask&(1U<<2));
 	scoped_zerost<int32_t> upright(layers[3]+index,mask&(1U<<3));
 	scoped_zerost<int32_t> up(layers[4]+index,mask&(1U<<4));
 	scoped_zerost<int32_t> upleft(layers[5]+index,mask&(1U<<5));
+	scoped_zerost<int32_t> designation(
+		vp->screentexpos_designation+index,
+		mask&(1U<<static_cast<uint8_t>(viewport_creature_layer::designation)));
 
 	for(int32_t lower=7;lower>=0;--lower)
 		{
@@ -542,16 +580,60 @@ void redraw_world_tile(
 	renderer->update_viewport_tile(vp,x,y);
 }
 
+void redraw_above_base(
+	df::renderer_2d_base *renderer,
+	df::graphic_viewportst *vp,
+	int32_t x,
+	int32_t y,
+	viewport_creature_layer layer,
+	const std::unordered_map<int32_t,uint16_t> &selected)
+{
+	const int32_t index=x*vp->dim_y+y;
+	const auto found=selected.find(index);
+	const uint16_t mask=found==selected.end()?0:found->second;
+
+	scoped_zerost<int32_t> background(vp->screentexpos_background+index);
+	scoped_zerost<uint64_t> floor_flag(vp->screentexpos_floor_flag+index);
+	scoped_zerost<int32_t> background_two(vp->screentexpos_background_two+index);
+	scoped_zerost<uint32_t> liquid_flag(vp->screentexpos_liquid_flag+index);
+	scoped_zerost<uint32_t> spatter_flag(vp->screentexpos_spatter_flag+index);
+	scoped_zerost<int32_t> spatter(vp->screentexpos_spatter+index);
+	scoped_zerost<uint64_t> ramp_flag(vp->screentexpos_ramp_flag+index);
+	scoped_zerost<uint32_t> shadow_flag(vp->screentexpos_shadow_flag+index);
+	scoped_zerost<int32_t> building_one(vp->screentexpos_building_one+index);
+	scoped_zerost<int32_t> item(vp->screentexpos_item+index);
+	scoped_zerost<int32_t> vehicle(
+		vp->screentexpos_vehicle+index,
+		layer==viewport_creature_layer::vehicle||
+			mask&(1U<<static_cast<uint8_t>(viewport_creature_layer::vehicle)));
+	scoped_zerost<int32_t> right(
+		vp->screentexpos_right_creature+index,mask&(1U<<0));
+	scoped_zerost<int32_t> center(
+		vp->screentexpos+index,mask&(1U<<1));
+	scoped_zerost<int32_t> left(
+		vp->screentexpos_left_creature+index,mask&(1U<<2));
+	scoped_zerost<int32_t> upright(
+		vp->screentexpos_upright_creature+index,mask&(1U<<3));
+	scoped_zerost<int32_t> up(
+		vp->screentexpos_up_creature+index,mask&(1U<<4));
+	scoped_zerost<int32_t> upleft(
+		vp->screentexpos_upleft_creature+index,mask&(1U<<5));
+	scoped_zerost<int32_t> designation(
+		vp->screentexpos_designation+index,
+		mask&(1U<<static_cast<uint8_t>(viewport_creature_layer::designation)));
+	renderer->update_viewport_tile(vp,x,y);
+}
+
 void redraw_above_main(
 	df::renderer_2d_base *renderer,
 	df::graphic_viewportst *vp,
 	int32_t x,
 	int32_t y,
-	const std::unordered_map<int32_t,uint8_t> &selected)
+	const std::unordered_map<int32_t,uint16_t> &selected)
 {
 	const int32_t index=x*vp->dim_y+y;
 	const auto found=selected.find(index);
-	const uint8_t mask=found==selected.end()?0:found->second;
+	const uint16_t mask=found==selected.end()?0:found->second;
 
 	scoped_zerost<int32_t> background(vp->screentexpos_background+index);
 	scoped_zerost<uint64_t> floor_flag(vp->screentexpos_floor_flag+index);
@@ -574,6 +656,9 @@ void redraw_above_main(
 		vp->screentexpos_up_creature+index,mask&(1U<<4));
 	scoped_zerost<int32_t> upleft(
 		vp->screentexpos_upleft_creature+index,mask&(1U<<5));
+	scoped_zerost<int32_t> designation(
+		vp->screentexpos_designation+index,
+		mask&(1U<<static_cast<uint8_t>(viewport_creature_layer::designation)));
 	renderer->update_viewport_tile(vp,x,y);
 }
 
@@ -581,9 +666,12 @@ void redraw_above_upper(
 	df::renderer_2d_base *renderer,
 	df::graphic_viewportst *vp,
 	int32_t x,
-	int32_t y)
+	int32_t y,
+	const std::unordered_map<int32_t,uint16_t> &selected)
 {
 	const int32_t index=x*vp->dim_y+y;
+	const auto found=selected.find(index);
+	const uint16_t mask=found==selected.end()?0:found->second;
 	scoped_zerost<int32_t> background(vp->screentexpos_background+index);
 	scoped_zerost<uint64_t> floor_flag(vp->screentexpos_floor_flag+index);
 	scoped_zerost<int32_t> background_two(vp->screentexpos_background_two+index);
@@ -607,6 +695,9 @@ void redraw_above_upper(
 	scoped_zerost<int32_t> upright(vp->screentexpos_upright_creature+index);
 	scoped_zerost<int32_t> up(vp->screentexpos_up_creature+index);
 	scoped_zerost<int32_t> upleft(vp->screentexpos_upleft_creature+index);
+	scoped_zerost<int32_t> designation(
+		vp->screentexpos_designation+index,
+		mask&(1U<<static_cast<uint8_t>(viewport_creature_layer::designation)));
 	renderer->update_viewport_tile(vp,x,y);
 }
 
@@ -615,9 +706,9 @@ void draw_proxy(df::renderer_2d_base *renderer,const render_proxyst &proxy)
 	const int32_t zoom=renderer->viewport_zoom_factor;
 	const int32_t target_x=tile_pixel(proxy.target_x,renderer->origin_x,zoom);
 	const int32_t target_y=tile_pixel(proxy.target_y,renderer->origin_y,zoom);
-	const int32_t source_x=tile_pixel(proxy.source_x,renderer->origin_x,zoom);
-	const int32_t source_y=tile_pixel(proxy.source_y,renderer->origin_y,zoom);
 	const float tile_size=float(zoom==128?32:std::max(1,zoom*32/128));
+	const float source_x=target_x+(proxy.source_x-proxy.target_x)*tile_size;
+	const float source_y=target_y+(proxy.source_y-proxy.target_y)*tile_size;
 	const SDL_FRect destination=
 		{
 		source_x+(target_x-source_x)*proxy.progress,
@@ -637,19 +728,61 @@ std::vector<render_proxyst> collect_proxies(
 	df::graphic_viewportst *vp)
 {
 	std::vector<render_proxyst> proxies;
-	auto layers=creature_layers(vp);
-	for(int32_t y=0;y<vp->dim_y;++y)
+	auto layers=visual_layers(vp);
+	const std::array order={
+		viewport_creature_layer::center,
+		viewport_creature_layer::item,
+		viewport_creature_layer::vehicle,
+		viewport_creature_layer::right,
+		viewport_creature_layer::left,
+		viewport_creature_layer::upright,
+		viewport_creature_layer::up,
+		viewport_creature_layer::upleft,
+		viewport_creature_layer::designation
+		};
+	for(viewport_creature_layer visual_layer:order)
 		{
-		for(int32_t x=0;x<vp->dim_x;++x)
+		const size_t layer=static_cast<size_t>(visual_layer);
+		for(int32_t y=0;y<vp->dim_y;++y)
 			{
-			const int32_t index=x*vp->dim_y+y;
-			for(size_t layer=0;layer<layers.size();++layer)
+			for(int32_t x=0;x<vp->dim_x;++x)
 				{
+				const int32_t index=x*vp->dim_y+y;
 				const int32_t texpos=layers[layer][index];
 				if(texpos==0)continue;
 				const auto movement=animation_manager.get_movement(
 					vp,static_cast<viewport_creature_layer>(layer),x,y);
 				if(!movement.active)continue;
+				if(layer!=static_cast<size_t>(viewport_creature_layer::center)&&
+					layer!=static_cast<size_t>(viewport_creature_layer::vehicle)&&
+					layer!=static_cast<size_t>(viewport_creature_layer::item))
+					{
+					bool anchored=false;
+					for(const render_proxyst &anchor:proxies)
+						{
+						if(anchor.layer==viewport_creature_layer::center&&
+							std::abs(anchor.target_x-x)<=1&&
+							std::abs(anchor.target_y-y)<=1&&
+							anchor.source_x-anchor.target_x==movement.source_x-x&&
+							anchor.source_y-anchor.target_y==movement.source_y-y&&
+							anchor.progress==movement.progress)anchored=true;
+						}
+					if(!anchored)continue;
+					}
+				if(visual_layer==viewport_creature_layer::item&&movement.inherited)
+					{
+					const int32_t source_x=x-
+						((x>movement.source_x)-(x<movement.source_x));
+					const int32_t source_y=y-
+						((y>movement.source_y)-(y<movement.source_y));
+					if(source_x<0||source_x>=vp->dim_x||
+						source_y<0||source_y>=vp->dim_y)continue;
+					const int32_t source=
+						source_x*vp->dim_y+source_y;
+					if(vp->screentexpos_item_old[source]==0||
+						vp->screentexpos_item_old[index]!=0||
+						layers[layer][source]!=0)continue;
+					}
 
 				render_proxyst proxy=
 					{
@@ -664,18 +797,23 @@ std::vector<render_proxyst> collect_proxies(
 					{}
 					};
 				bool blocked=false;
-				for(int32_t coverage_x=std::min(proxy.source_x,x);
-					coverage_x<=std::max(proxy.source_x,x);++coverage_x)
+				for(int32_t coverage_x=int32_t(std::floor(
+						std::min(proxy.source_x,float(x))));
+					coverage_x<=int32_t(std::ceil(
+						std::max(proxy.source_x,float(x))));++coverage_x)
 					{
-					for(int32_t coverage_y=std::min(proxy.source_y,y);
-						coverage_y<=std::max(proxy.source_y,y);++coverage_y)
+					for(int32_t coverage_y=int32_t(std::floor(
+							std::min(proxy.source_y,float(y))));
+						coverage_y<=int32_t(std::ceil(
+							std::max(proxy.source_y,float(y))));++coverage_y)
 						{
 						if(!inside_clip(vp,coverage_x,coverage_y))
 							{
 							blocked=true;
 							break;
 							}
-						if(layer<3&&has_fire(vp,coverage_x,coverage_y))
+						if(is_main_creature(proxy.layer)&&
+							has_fire(vp,coverage_x,coverage_y))
 							{
 							blocked=true;
 							break;
@@ -741,17 +879,23 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 
 	std::vector<render_proxyst> proxies=collect_proxies(renderer,vp);
 	std::set<std::pair<int32_t,int32_t>> current_coverage;
+	std::set<std::pair<int32_t,int32_t>> item_coverage;
+	std::set<std::pair<int32_t,int32_t>> vehicle_coverage;
 	std::set<std::pair<int32_t,int32_t>> main_coverage;
 	std::set<std::pair<int32_t,int32_t>> upper_coverage;
-	std::unordered_map<int32_t,uint8_t> selected;
+	std::unordered_map<int32_t,uint16_t> selected;
 	for(const render_proxyst &proxy:proxies)
 		{
 		current_coverage.insert(proxy.coverage.begin(),proxy.coverage.end());
 		auto &layer_mask=selected[proxy.target_x*vp->dim_y+proxy.target_y];
-		layer_mask|=uint8_t(1U<<static_cast<uint8_t>(proxy.layer));
-		if(static_cast<uint8_t>(proxy.layer)<3)
+		layer_mask|=uint16_t(1U<<static_cast<uint8_t>(proxy.layer));
+		if(proxy.layer==viewport_creature_layer::item)
+			item_coverage.insert(proxy.coverage.begin(),proxy.coverage.end());
+		else if(proxy.layer==viewport_creature_layer::vehicle)
+			vehicle_coverage.insert(proxy.coverage.begin(),proxy.coverage.end());
+		else if(is_main_creature(proxy.layer))
 			main_coverage.insert(proxy.coverage.begin(),proxy.coverage.end());
-		else
+		else if(proxy.layer!=viewport_creature_layer::designation)
 			upper_coverage.insert(proxy.coverage.begin(),proxy.coverage.end());
 		}
 
@@ -793,16 +937,37 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 			}
 		for(const render_proxyst &proxy:proxies)
 			{
-			if(static_cast<uint8_t>(proxy.layer)<3)draw_proxy(renderer,proxy);
+			if(proxy.layer==viewport_creature_layer::item)draw_proxy(renderer,proxy);
+			}
+		for(const auto &[x,y]:item_coverage)
+			redraw_above_base(
+				renderer,vp,x,y,viewport_creature_layer::item,selected);
+		for(const render_proxyst &proxy:proxies)
+			{
+			if(proxy.layer==viewport_creature_layer::vehicle)draw_proxy(renderer,proxy);
+			}
+		for(const auto &[x,y]:vehicle_coverage)
+			redraw_above_base(
+				renderer,vp,x,y,viewport_creature_layer::vehicle,selected);
+		for(const render_proxyst &proxy:proxies)
+			{
+			if(is_main_creature(proxy.layer))draw_proxy(renderer,proxy);
 			}
 		for(const auto &[x,y]:main_coverage)
 			redraw_above_main(renderer,vp,x,y,selected);
 		for(const render_proxyst &proxy:proxies)
 			{
-			if(static_cast<uint8_t>(proxy.layer)>=3)draw_proxy(renderer,proxy);
+			if(proxy.layer!=viewport_creature_layer::item&&
+				proxy.layer!=viewport_creature_layer::vehicle&&
+				proxy.layer!=viewport_creature_layer::designation&&
+				!is_main_creature(proxy.layer))draw_proxy(renderer,proxy);
 			}
 		for(const auto &[x,y]:upper_coverage)
-			redraw_above_upper(renderer,vp,x,y);
+			redraw_above_upper(renderer,vp,x,y,selected);
+		for(const render_proxyst &proxy:proxies)
+			{
+			if(proxy.layer==viewport_creature_layer::designation)draw_proxy(renderer,proxy);
+			}
 		renderer->origin_x=saved_origin_x;
 		renderer->origin_y=saved_origin_y;
 		render_set_clip_rect(sdl_renderer,nullptr);
@@ -837,16 +1002,35 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		}
 	for(const render_proxyst &proxy:proxies)
 		{
-		if(static_cast<uint8_t>(proxy.layer)<3)draw_proxy(renderer,proxy);
+		if(proxy.layer==viewport_creature_layer::item)draw_proxy(renderer,proxy);
+		}
+	for(const auto &[x,y]:item_coverage)
+		redraw_above_base(renderer,vp,x,y,viewport_creature_layer::item,selected);
+	for(const render_proxyst &proxy:proxies)
+		{
+		if(proxy.layer==viewport_creature_layer::vehicle)draw_proxy(renderer,proxy);
+		}
+	for(const auto &[x,y]:vehicle_coverage)
+		redraw_above_base(renderer,vp,x,y,viewport_creature_layer::vehicle,selected);
+	for(const render_proxyst &proxy:proxies)
+		{
+		if(is_main_creature(proxy.layer))draw_proxy(renderer,proxy);
 		}
 	for(const auto &[x,y]:main_coverage)
 		redraw_above_main(renderer,vp,x,y,selected);
 	for(const render_proxyst &proxy:proxies)
 		{
-		if(static_cast<uint8_t>(proxy.layer)>=3)draw_proxy(renderer,proxy);
+		if(proxy.layer!=viewport_creature_layer::item&&
+			proxy.layer!=viewport_creature_layer::vehicle&&
+			proxy.layer!=viewport_creature_layer::designation&&
+			!is_main_creature(proxy.layer))draw_proxy(renderer,proxy);
 		}
 	for(const auto &[x,y]:upper_coverage)
-		redraw_above_upper(renderer,vp,x,y);
+		redraw_above_upper(renderer,vp,x,y,selected);
+	for(const render_proxyst &proxy:proxies)
+		{
+		if(proxy.layer==viewport_creature_layer::designation)draw_proxy(renderer,proxy);
+		}
 
 	previous_coverage=std::move(current_coverage);
 }

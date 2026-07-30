@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 enum class viewport_creature_layer : uint8_t
@@ -16,6 +17,9 @@ enum class viewport_creature_layer : uint8_t
 	upright,
 	up,
 	upleft,
+	vehicle,
+	item,
+	designation,
 	count
 };
 
@@ -51,9 +55,10 @@ struct viewport_visual_animation_inputst
 struct visual_movement_renderst
 {
 	bool active=false;
-	int32_t source_x=0;
-	int32_t source_y=0;
+	float source_x=0.0f;
+	float source_y=0.0f;
 	float progress=1.0f;
+	bool inherited=false;
 };
 
 class visual_animation_managerst
@@ -62,8 +67,8 @@ class visual_animation_managerst
 	{
 		viewport_creature_layer layer;
 		int32_t texpos;
-		int32_t source_x;
-		int32_t source_y;
+		float source_x;
+		float source_y;
 		int32_t target_x;
 		int32_t target_y;
 		uint32_t start_time_ms;
@@ -96,6 +101,23 @@ class visual_animation_managerst
 	std::vector<viewport_animationst> viewports;
 
 	static constexpr uint32_t movement_duration_ms=100;
+
+	static bool independently_moving(viewport_creature_layer layer)
+		{
+		return layer==viewport_creature_layer::center||
+			layer==viewport_creature_layer::vehicle||
+			layer==viewport_creature_layer::item;
+		}
+
+	static bool same_visual(
+		viewport_creature_layer layer,
+		int32_t current,
+		int32_t previous)
+		{
+		return layer==viewport_creature_layer::vehicle?
+			previous!=0:
+			previous==current;
+		}
 
 	viewport_animationst &get_viewport(const viewport_visual_animation_inputst &input)
 		{
@@ -196,6 +218,8 @@ class visual_animation_managerst
 				int32_t matches=0;
 				for(size_t layer=0;layer<input.current.size();++layer)
 					{
+					if(!independently_moving(
+						static_cast<viewport_creature_layer>(layer)))continue;
 					const int32_t *current=input.current[layer];
 					const int32_t *previous=input.previous[layer];
 					for(int32_t x=0;x<input.dim_x;++x)
@@ -209,7 +233,10 @@ class visual_animation_managerst
 							const int32_t sy=y+dwy;
 							if(sy<0||sy>=input.dim_y)continue;
 							++considered;
-							if(previous[sx*input.dim_y+sy]==texpos)++matches;
+							if(same_visual(
+								static_cast<viewport_creature_layer>(layer),
+								texpos,
+								previous[sx*input.dim_y+sy]))++matches;
 							}
 						}
 					}
@@ -255,19 +282,6 @@ class visual_animation_managerst
 					}
 				}
 
-			state.movements.erase(
-				std::remove_if(
-					state.movements.begin(),
-					state.movements.end(),
-					[&](const movementst &movement)
-						{
-						const size_t layer=static_cast<size_t>(movement.layer);
-						const int32_t target=movement.target_x*input.dim_y+movement.target_y;
-						return frame_time_ms-movement.start_time_ms>=movement_duration_ms||
-							input.current[layer][target]!=movement.texpos;
-						}),
-				state.movements.end());
-
 			const bool suppress=translated||
 				state.pending_dx!=0||state.pending_dy!=0||state.suppress_frames>0;
 			if(state.suppress_frames>0)--state.suppress_frames;
@@ -277,6 +291,8 @@ class visual_animation_managerst
 				std::vector<uint8_t> claimed_sources(tile_count);
 				for(size_t layer=0;layer<input.current.size();++layer)
 					{
+					if(!independently_moving(
+						static_cast<viewport_creature_layer>(layer)))continue;
 					std::fill(claimed_sources.begin(),claimed_sources.end(),0);
 					const int32_t *current=input.current[layer];
 					const int32_t *previous=input.previous[layer];
@@ -302,8 +318,12 @@ class visual_animation_managerst
 									if(source_x<0||source_x>=input.dim_x||
 										source_y<0||source_y>=input.dim_y)continue;
 									const int32_t candidate=source_x*input.dim_y+source_y;
-									if(!claimed_sources[candidate]&&previous[candidate]==texpos&&
-										current[candidate]==0)
+								if(!claimed_sources[candidate]&&
+									same_visual(
+										static_cast<viewport_creature_layer>(layer),
+										texpos,
+										previous[candidate])&&
+									current[candidate]==0)
 										{
 										source=candidate;
 										++candidate_count;
@@ -313,20 +333,50 @@ class visual_animation_managerst
 							if(candidate_count!=1)continue;
 
 							claimed_sources[source]=1;
+							float visual_source_x=float(source/input.dim_y);
+							float visual_source_y=float(source%input.dim_y);
+							for(const movementst &movement:state.movements)
+								{
+								if(movement.layer!=
+										static_cast<viewport_creature_layer>(layer)||
+									movement.target_x!=visual_source_x||
+									movement.target_y!=visual_source_y)continue;
+								const float progress=
+									movement_progress(movement.start_time_ms);
+								visual_source_x=movement.source_x+
+									(movement.target_x-movement.source_x)*progress;
+								visual_source_y=movement.source_y+
+									(movement.target_y-movement.source_y)*progress;
+								break;
+								}
 							state.movements.push_back(
 								{
 								static_cast<viewport_creature_layer>(layer),
 								texpos,
-								source/input.dim_y,
-								source%input.dim_y,
+								visual_source_x,
+								visual_source_y,
 								x,
 								y,
 								frame_time_ms
 								});
 							}
 						}
+						}
 					}
-				}
+			state.movements.erase(
+				std::remove_if(
+					state.movements.begin(),
+					state.movements.end(),
+					[&](const movementst &movement)
+						{
+						const size_t layer=static_cast<size_t>(movement.layer);
+						const int32_t target=movement.target_x*input.dim_y+movement.target_y;
+						const int32_t current=input.current[layer][target];
+						return frame_time_ms-movement.start_time_ms>=movement_duration_ms||
+							current==0||
+							!same_visual(movement.layer,current,movement.texpos);
+						}),
+				state.movements.end());
 			if(!state.movements.empty())force_full_redraw=true;
 			}
 
@@ -368,6 +418,7 @@ class visual_animation_managerst
 			for(const viewport_animationst &state:viewports)
 				{
 				if(state.viewport!=viewport)continue;
+				const movementst *companion=nullptr;
 				for(const movementst &movement:state.movements)
 					{
 					if(movement.layer==layer&&movement.target_x==target_x&&
@@ -380,7 +431,28 @@ class visual_animation_managerst
 							movement_progress(movement.start_time_ms)
 							};
 						}
+					if(layer==viewport_creature_layer::vehicle||
+						layer==viewport_creature_layer::center||
+						movement.layer!=viewport_creature_layer::center||
+						std::abs(movement.target_x-target_x)>1||
+						std::abs(movement.target_y-target_y)>1)continue;
+					if(companion!=nullptr&&
+						(companion->source_x-companion->target_x!=
+							movement.source_x-movement.target_x||
+						companion->source_y-companion->target_y!=
+							movement.source_y-movement.target_y||
+						companion->start_time_ms!=movement.start_time_ms))
+						return {};
+					companion=&movement;
 					}
+				if(companion!=nullptr)
+					return {
+						true,
+						target_x+companion->source_x-companion->target_x,
+						target_y+companion->source_y-companion->target_y,
+						movement_progress(companion->start_time_ms),
+						true
+						};
 				break;
 				}
 			return {};
