@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Animate creature status icons with their creature instead of letting their
+  flashing texture fragments jump between tiles.
+- Animate item-layer wheelbarrows and the vehicle layer used by minecarts;
+  minecart sprite changes no longer interrupt interpolation, and consecutive
+  steps retarget from the current fractional position instead of snapping back
+  to the previous tile center.
 - Optional free camera (`smooth-movement camera on`, off by default): map scrolls
   glide with an exponential catch-up, middle-mouse drag pans pixel-perfectly and
   can rest between tiles, and `camera <fx> <fy>` sets a persistent sub-tile

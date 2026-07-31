@@ -1,10 +1,11 @@
 # DF Smooth Movement
 
-Smooth, render-only creature movement for Dwarf Fortress through DFHack.
+Smooth, render-only creature, hauled-item, and vehicle movement for Dwarf Fortress through DFHack.
 
-The plugin interpolates matching creature sprites between adjacent tiles. It
-does not change unit positions, pathfinding, simulation ticks, saves, or
-gameplay state.
+The plugin interpolates matching creature, moving-item, and vehicle sprites
+between adjacent tiles. Creature status icons follow the same interpolation as
+their creature. It does not change unit positions, pathfinding, simulation
+ticks, saves, or gameplay state.
 
 ## Compatibility
 
@@ -76,6 +77,8 @@ cmake --build /path/to/dfhack-build --target smooth-movement-test
 ## Behavior
 
 - Movement uses a 100 ms smoothstep interpolation.
+- Creature status icons move with their creature, including while flashing.
+- Item-layer wheelbarrows and vehicle-layer minecarts are interpolated.
 - Camera panning is followed: in-flight interpolations are translated by the
   scroll delta so sprites track the world, and drop once they scroll off-screen.
 - Zoom, Z-level changes, resize, and viewport changes reset interpolation for one
