@@ -414,6 +414,7 @@ using viewport_layer_memberst=int32_t *df::graphic_viewportst::*;
 
 struct visual_layer_bufferst
 {
+	viewport_visual_layer layer;
 	viewport_layer_memberst current;
 	viewport_layer_memberst previous;
 };
@@ -421,26 +422,48 @@ struct visual_layer_bufferst
 constexpr size_t visual_layer_count=static_cast<size_t>(viewport_visual_layer::count);
 constexpr std::array visual_layer_buffers=
 	{
-	visual_layer_bufferst{&df::graphic_viewportst::screentexpos_right_creature,
+	visual_layer_bufferst{viewport_visual_layer::right,
+		&df::graphic_viewportst::screentexpos_right_creature,
 		&df::graphic_viewportst::screentexpos_right_creature_old},
-	visual_layer_bufferst{&df::graphic_viewportst::screentexpos,
+	visual_layer_bufferst{viewport_visual_layer::center,
+		&df::graphic_viewportst::screentexpos,
 		&df::graphic_viewportst::screentexpos_old},
-	visual_layer_bufferst{&df::graphic_viewportst::screentexpos_left_creature,
+	visual_layer_bufferst{viewport_visual_layer::left,
+		&df::graphic_viewportst::screentexpos_left_creature,
 		&df::graphic_viewportst::screentexpos_left_creature_old},
-	visual_layer_bufferst{&df::graphic_viewportst::screentexpos_upright_creature,
+	visual_layer_bufferst{viewport_visual_layer::upright,
+		&df::graphic_viewportst::screentexpos_upright_creature,
 		&df::graphic_viewportst::screentexpos_upright_creature_old},
-	visual_layer_bufferst{&df::graphic_viewportst::screentexpos_up_creature,
+	visual_layer_bufferst{viewport_visual_layer::up,
+		&df::graphic_viewportst::screentexpos_up_creature,
 		&df::graphic_viewportst::screentexpos_up_creature_old},
-	visual_layer_bufferst{&df::graphic_viewportst::screentexpos_upleft_creature,
+	visual_layer_bufferst{viewport_visual_layer::upleft,
+		&df::graphic_viewportst::screentexpos_upleft_creature,
 		&df::graphic_viewportst::screentexpos_upleft_creature_old},
-	visual_layer_bufferst{&df::graphic_viewportst::screentexpos_vehicle,
+	visual_layer_bufferst{viewport_visual_layer::vehicle,
+		&df::graphic_viewportst::screentexpos_vehicle,
 		&df::graphic_viewportst::screentexpos_vehicle_old},
-	visual_layer_bufferst{&df::graphic_viewportst::screentexpos_item,
+	visual_layer_bufferst{viewport_visual_layer::item,
+		&df::graphic_viewportst::screentexpos_item,
 		&df::graphic_viewportst::screentexpos_item_old},
-	visual_layer_bufferst{&df::graphic_viewportst::screentexpos_designation,
+	visual_layer_bufferst{viewport_visual_layer::designation,
+		&df::graphic_viewportst::screentexpos_designation,
 		&df::graphic_viewportst::screentexpos_designation_old}
 	};
-static_assert(visual_layer_buffers.size()==visual_layer_count);
+
+constexpr bool valid_visual_layer_buffers()
+{
+	uint16_t layers=0;
+	for(const auto &buffer:visual_layer_buffers)
+		{
+		const uint16_t layer=uint16_t(1U<<static_cast<uint8_t>(buffer.layer));
+		if(layers&layer)return false;
+		layers|=layer;
+		}
+	return layers==uint16_t((1U<<visual_layer_count)-1);
+}
+
+static_assert(valid_visual_layer_buffers());
 
 template<typename Viewport>
 auto visual_layers(Viewport *vp,bool previous=false)
@@ -448,10 +471,9 @@ auto visual_layers(Viewport *vp,bool previous=false)
 	using layer_pointer=std::conditional_t<
 		std::is_const_v<Viewport>,const int32_t *,int32_t *>;
 	std::array<layer_pointer,visual_layer_count> layers{};
-	for(size_t i=0;i<layers.size();++i)
-		layers[i]=vp->*(previous?
-			visual_layer_buffers[i].previous:
-			visual_layer_buffers[i].current);
+	for(const auto &buffer:visual_layer_buffers)
+		layers[static_cast<size_t>(buffer.layer)]=vp->*(previous?
+			buffer.previous:buffer.current);
 	return layers;
 }
 
@@ -486,48 +508,43 @@ bool has_fire(const df::graphic_viewportst *vp,int32_t x,int32_t y)
 	return vp->screentexpos_spatter_flag[x*vp->dim_y+y]&fire_bits;
 }
 
-enum class visual_render_groupst
+template<typename T>
+class scoped_value_restorest
 {
-	item,
-	vehicle,
-	main,
-	upper,
-	designation
-};
-
-constexpr visual_render_groupst visual_render_group(viewport_visual_layer layer)
-{
-	if(layer==viewport_visual_layer::item)return visual_render_groupst::item;
-	if(layer==viewport_visual_layer::vehicle)return visual_render_groupst::vehicle;
-	if(layer==viewport_visual_layer::designation)
-		return visual_render_groupst::designation;
-	if(layer==viewport_visual_layer::right||
-		layer==viewport_visual_layer::center||
-		layer==viewport_visual_layer::left)return visual_render_groupst::main;
-	return visual_render_groupst::upper;
-}
-
-template<typename T,T default_value=T{}>
-class scoped_zerost
-{
-	T *value_ptr;
-	T saved{};
+	T &value;
+	T saved;
 
 	public:
-		explicit scoped_zerost(T &value):value_ptr(&value)
+		explicit scoped_value_restorest(T &value,T replacement=T{}):
+			value(value),
+			saved(std::exchange(value,std::move(replacement)))
 			{
-			saved=std::move(value);
-			value=default_value;
+			static_assert(std::is_nothrow_move_assignable_v<T>);
 			}
 
-		~scoped_zerost()
+		~scoped_value_restorest() noexcept
 			{
-			*value_ptr=std::move(saved);
+			value=std::move(saved);
 			}
 
-		scoped_zerost(const scoped_zerost &)=delete;
-		scoped_zerost &operator=(const scoped_zerost &)=delete;
+		scoped_value_restorest(const scoped_value_restorest &)=delete;
+		scoped_value_restorest &operator=(const scoped_value_restorest &)=delete;
+		scoped_value_restorest(scoped_value_restorest &&)=delete;
+		scoped_value_restorest &operator=(scoped_value_restorest &&)=delete;
 };
+
+template<typename Callback>
+void with_zeroed_values(const Callback &callback)
+{
+	callback();
+}
+
+template<typename Callback,typename T,typename... Values>
+void with_zeroed_values(const Callback &callback,T &value,Values &...values)
+{
+	scoped_value_restorest<T> zero(value);
+	with_zeroed_values(callback,values...);
+}
 
 struct render_proxyst
 {
@@ -566,7 +583,7 @@ void with_suppressed_visual_layers(
 		callback();
 	else if(mask&(1U<<Layer))
 		{
-		scoped_zerost<int32_t> zero(layers[Layer][index]);
+		scoped_value_restorest<int32_t> zero(layers[Layer][index]);
 		with_suppressed_visual_layers<Layer+1>(layers,index,mask,callback);
 		}
 	else
@@ -579,16 +596,17 @@ void with_base_suppressed(
 	int32_t index,
 	const Callback &callback)
 {
-	scoped_zerost<int32_t> background(vp->screentexpos_background[index]);
-	scoped_zerost<uint64_t> floor_flag(vp->screentexpos_floor_flag[index]);
-	scoped_zerost<int32_t> background_two(vp->screentexpos_background_two[index]);
-	scoped_zerost<uint32_t> liquid_flag(vp->screentexpos_liquid_flag[index]);
-	scoped_zerost<uint32_t> spatter_flag(vp->screentexpos_spatter_flag[index]);
-	scoped_zerost<int32_t> spatter(vp->screentexpos_spatter[index]);
-	scoped_zerost<uint64_t> ramp_flag(vp->screentexpos_ramp_flag[index]);
-	scoped_zerost<uint32_t> shadow_flag(vp->screentexpos_shadow_flag[index]);
-	scoped_zerost<int32_t> building_one(vp->screentexpos_building_one[index]);
-	callback();
+	with_zeroed_values(
+		callback,
+		vp->screentexpos_background[index],
+		vp->screentexpos_floor_flag[index],
+		vp->screentexpos_background_two[index],
+		vp->screentexpos_liquid_flag[index],
+		vp->screentexpos_spatter_flag[index],
+		vp->screentexpos_spatter[index],
+		vp->screentexpos_ramp_flag[index],
+		vp->screentexpos_shadow_flag[index],
+		vp->screentexpos_building_one[index]);
 }
 
 template<typename Callback>
@@ -599,8 +617,7 @@ void with_main_suppressed(
 {
 	with_base_suppressed(vp,index,[&]
 		{
-		scoped_zerost<int32_t> vermin(vp->screentexpos_vermin[index]);
-		callback();
+		with_zeroed_values(callback,vp->screentexpos_vermin[index]);
 		});
 }
 
@@ -612,12 +629,13 @@ void with_upper_suppressed(
 {
 	with_main_suppressed(vp,index,[&]
 		{
-		scoped_zerost<int32_t> building_two(vp->screentexpos_building_two[index]);
-		scoped_zerost<int32_t> projectile(vp->screentexpos_projectile[index]);
-		scoped_zerost<int32_t> high_flow(vp->screentexpos_high_flow[index]);
-		scoped_zerost<int32_t> top_shadow(vp->screentexpos_top_shadow[index]);
-		scoped_zerost<int32_t> signpost(vp->screentexpos_signpost[index]);
-		callback();
+		with_zeroed_values(
+			callback,
+			vp->screentexpos_building_two[index],
+			vp->screentexpos_projectile[index],
+			vp->screentexpos_high_flow[index],
+			vp->screentexpos_top_shadow[index],
+			vp->screentexpos_signpost[index]);
 		});
 }
 
@@ -643,47 +661,37 @@ void redraw_world_tile(
 		visual_layers(vp),index,selected_mask(selected,index),redraw);
 }
 
-enum class redraw_stagest
+constexpr uint16_t visual_layers_through_group(visual_render_groupst group)
 {
-	item,
-	vehicle,
-	main,
-	upper
-};
+	uint16_t mask=0;
+	for(const auto &descriptor:visual_layer_descriptors)
+		if(descriptor.render_group!=visual_render_groupst::designation&&
+			static_cast<uint8_t>(descriptor.render_group)<=static_cast<uint8_t>(group))
+			mask|=visual_layer_bit(descriptor.layer);
+	return mask;
+}
 
 void redraw_above(
 	df::renderer_2d_base *renderer,
 	df::graphic_viewportst *vp,
 	int32_t x,
 	int32_t y,
-	redraw_stagest stage,
+	visual_render_groupst group,
 	const std::unordered_map<int32_t,uint16_t> &selected)
 {
 	const int32_t index=x*vp->dim_y+y;
-	constexpr uint16_t item_mask=visual_layer_bit(viewport_visual_layer::item);
-	constexpr uint16_t vehicle_mask=
-		item_mask|visual_layer_bit(viewport_visual_layer::vehicle);
-	constexpr uint16_t main_mask=vehicle_mask|
-		visual_layer_bit(viewport_visual_layer::right)|
-		visual_layer_bit(viewport_visual_layer::center)|
-		visual_layer_bit(viewport_visual_layer::left);
-	constexpr uint16_t upper_mask=main_mask|
-		visual_layer_bit(viewport_visual_layer::upright)|
-		visual_layer_bit(viewport_visual_layer::up)|
-		visual_layer_bit(viewport_visual_layer::upleft);
-	const std::array masks={item_mask,vehicle_mask,main_mask,upper_mask};
 	const auto redraw=[&]{renderer->update_viewport_tile(vp,x,y);};
 	const auto suppress_visuals=[&]
 		{
 		with_suppressed_visual_layers(
 			visual_layers(vp),
 			index,
-			selected_mask(selected,index)|masks[static_cast<size_t>(stage)],
+			selected_mask(selected,index)|visual_layers_through_group(group),
 			redraw);
 		};
-	if(stage==redraw_stagest::item||stage==redraw_stagest::vehicle)
+	if(group==visual_render_groupst::item||group==visual_render_groupst::vehicle)
 		with_base_suppressed(vp,index,suppress_visuals);
-	else if(stage==redraw_stagest::main)
+	else if(group==visual_render_groupst::main)
 		with_main_suppressed(vp,index,suppress_visuals);
 	else
 		with_upper_suppressed(vp,index,suppress_visuals);
@@ -717,19 +725,10 @@ std::vector<render_proxyst> collect_proxies(
 {
 	std::vector<render_proxyst> proxies;
 	auto layers=visual_layers(vp);
-	const std::array order={
-		viewport_visual_layer::center,
-		viewport_visual_layer::item,
-		viewport_visual_layer::vehicle,
-		viewport_visual_layer::right,
-		viewport_visual_layer::left,
-		viewport_visual_layer::upright,
-		viewport_visual_layer::up,
-		viewport_visual_layer::upleft,
-		viewport_visual_layer::designation
-		};
-	for(viewport_visual_layer visual_layer:order)
+	auto previous_layers=visual_layers(vp,true);
+	for(uint8_t draw_order=0;draw_order<visual_layer_count;++draw_order)
 		{
+		const viewport_visual_layer visual_layer=visual_layer_at_draw_order(draw_order);
 		const size_t layer=static_cast<size_t>(visual_layer);
 		for(int32_t y=0;y<vp->dim_y;++y)
 			{
@@ -770,9 +769,7 @@ std::vector<render_proxyst> collect_proxies(
 					if(!visual_moved_between_tiles(
 						visual_layer,
 						layers[layer],
-						visual_layer==viewport_visual_layer::item?
-							vp->screentexpos_item_old:
-							vp->screentexpos_designation_old,
+						previous_layers[layer],
 						source,
 						index))continue;
 					}
@@ -841,10 +838,7 @@ using tile_coveragest=std::set<std::pair<int32_t,int32_t>>;
 struct render_coveragest
 {
 	tile_coveragest all;
-	tile_coveragest item;
-	tile_coveragest vehicle;
-	tile_coveragest main;
-	tile_coveragest upper;
+	std::array<tile_coveragest,static_cast<size_t>(visual_render_groupst::count)> groups;
 	std::unordered_map<int32_t,uint16_t> selected;
 };
 
@@ -858,26 +852,8 @@ render_coveragest collect_coverage(
 		coverage.all.insert(proxy.coverage.begin(),proxy.coverage.end());
 		coverage.selected[proxy.target_x*dim_y+proxy.target_y]|=
 			visual_layer_bit(proxy.layer);
-		tile_coveragest *layer_coverage=nullptr;
-		switch(visual_render_group(proxy.layer))
-			{
-			case visual_render_groupst::item:
-			layer_coverage=&coverage.item;
-			break;
-			case visual_render_groupst::vehicle:
-			layer_coverage=&coverage.vehicle;
-			break;
-			case visual_render_groupst::main:
-			layer_coverage=&coverage.main;
-			break;
-			case visual_render_groupst::upper:
-			layer_coverage=&coverage.upper;
-			break;
-			case visual_render_groupst::designation:
-			break;
-			}
-		if(layer_coverage!=nullptr)
-			layer_coverage->insert(proxy.coverage.begin(),proxy.coverage.end());
+		auto &group=coverage.groups[static_cast<size_t>(visual_render_group(proxy.layer))];
+		group.insert(proxy.coverage.begin(),proxy.coverage.end());
 		}
 	return coverage;
 }
@@ -888,33 +864,15 @@ void draw_interpolation_stages(
 	const std::vector<render_proxyst> &proxies,
 	const render_coveragest &coverage)
 {
-	const auto draw_matching=[&](const auto &predicate)
+	for(size_t index=0;index<coverage.groups.size();++index)
 		{
+		const auto group=static_cast<visual_render_groupst>(index);
 		for(const render_proxyst &proxy:proxies)
-			if(predicate(proxy.layer))draw_proxy(renderer,proxy);
-		};
-	const auto redraw=[&](const tile_coveragest &tiles,redraw_stagest stage)
-		{
-		for(const auto &[x,y]:tiles)
-			redraw_above(renderer,vp,x,y,stage,coverage.selected);
-		};
-
-	draw_matching([](viewport_visual_layer layer)
-		{return visual_render_group(layer)==visual_render_groupst::item;});
-	redraw(coverage.item,redraw_stagest::item);
-	draw_matching([](viewport_visual_layer layer)
-		{return visual_render_group(layer)==visual_render_groupst::vehicle;});
-	redraw(coverage.vehicle,redraw_stagest::vehicle);
-	draw_matching([](viewport_visual_layer layer)
-		{return visual_render_group(layer)==visual_render_groupst::main;});
-	redraw(coverage.main,redraw_stagest::main);
-	draw_matching([](viewport_visual_layer layer)
-		{
-		return visual_render_group(layer)==visual_render_groupst::upper;
-		});
-	redraw(coverage.upper,redraw_stagest::upper);
-	draw_matching([](viewport_visual_layer layer)
-		{return visual_render_group(layer)==visual_render_groupst::designation;});
+			if(visual_render_group(proxy.layer)==group)draw_proxy(renderer,proxy);
+		if(group==visual_render_groupst::designation)continue;
+		for(const auto &[x,y]:coverage.groups[index])
+			redraw_above(renderer,vp,x,y,group,coverage.selected);
+		}
 }
 
 void render_interpolated_world(df::renderer_2d_base *renderer)

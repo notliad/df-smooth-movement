@@ -23,17 +23,91 @@ enum class viewport_visual_layer : uint8_t
 	count
 };
 
+enum class visual_render_groupst : uint8_t
+{
+	item,
+	vehicle,
+	main,
+	upper,
+	designation,
+	count
+};
+
+struct visual_layer_descriptorst
+{
+	viewport_visual_layer layer;
+	visual_render_groupst render_group;
+	bool moves_independently;
+	bool matches_any_previous;
+	uint8_t draw_order;
+};
+
+constexpr std::array visual_layer_descriptors=
+	{
+	visual_layer_descriptorst{viewport_visual_layer::right,
+		visual_render_groupst::main,false,false,3},
+	visual_layer_descriptorst{viewport_visual_layer::center,
+		visual_render_groupst::main,true,false,0},
+	visual_layer_descriptorst{viewport_visual_layer::left,
+		visual_render_groupst::main,false,false,4},
+	visual_layer_descriptorst{viewport_visual_layer::upright,
+		visual_render_groupst::upper,false,false,5},
+	visual_layer_descriptorst{viewport_visual_layer::up,
+		visual_render_groupst::upper,false,false,6},
+	visual_layer_descriptorst{viewport_visual_layer::upleft,
+		visual_render_groupst::upper,false,false,7},
+	visual_layer_descriptorst{viewport_visual_layer::vehicle,
+		visual_render_groupst::vehicle,true,true,2},
+	visual_layer_descriptorst{viewport_visual_layer::item,
+		visual_render_groupst::item,true,false,1},
+	visual_layer_descriptorst{viewport_visual_layer::designation,
+		visual_render_groupst::designation,false,true,8}
+	};
+
+constexpr bool valid_visual_layer_descriptors()
+{
+	uint16_t draw_orders=0;
+	for(size_t i=0;i<visual_layer_descriptors.size();++i)
+		{
+		const auto &descriptor=visual_layer_descriptors[i];
+		if(static_cast<size_t>(descriptor.layer)!=i||
+			descriptor.draw_order>=visual_layer_descriptors.size()||
+			(draw_orders&(1U<<descriptor.draw_order)))return false;
+		draw_orders|=uint16_t(1U<<descriptor.draw_order);
+		}
+	return true;
+}
+
+static_assert(valid_visual_layer_descriptors());
+
+constexpr const visual_layer_descriptorst &visual_layer_descriptor(
+	viewport_visual_layer layer)
+{
+	return visual_layer_descriptors[static_cast<size_t>(layer)];
+}
+
+constexpr viewport_visual_layer visual_layer_at_draw_order(uint8_t draw_order)
+{
+	for(const auto &descriptor:visual_layer_descriptors)
+		if(descriptor.draw_order==draw_order)return descriptor.layer;
+	return viewport_visual_layer::count;
+}
+
+constexpr visual_render_groupst visual_render_group(viewport_visual_layer layer)
+{
+	return visual_layer_descriptor(layer).render_group;
+}
+
 constexpr bool visual_layer_moves_independently(viewport_visual_layer layer)
 {
-	return layer==viewport_visual_layer::center||
-		layer==viewport_visual_layer::vehicle||
-		layer==viewport_visual_layer::item;
+	return visual_layer_descriptor(layer).moves_independently;
 }
 
 constexpr bool visual_layer_tracks_own_movement(viewport_visual_layer layer)
 {
-	return visual_layer_moves_independently(layer)||
-		layer==viewport_visual_layer::designation;
+	const auto &descriptor=visual_layer_descriptor(layer);
+	return descriptor.moves_independently||
+		descriptor.render_group==visual_render_groupst::designation;
 }
 
 constexpr bool visual_layer_matches(
@@ -41,8 +115,7 @@ constexpr bool visual_layer_matches(
 	int32_t current,
 	int32_t previous)
 {
-	return layer==viewport_visual_layer::vehicle||
-		layer==viewport_visual_layer::designation?
+	return visual_layer_descriptor(layer).matches_any_previous?
 		previous!=0:
 		previous==current;
 }
