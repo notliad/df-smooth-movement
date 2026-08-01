@@ -41,9 +41,15 @@ REQUIRE_GLOBAL(window_z);
 
 namespace {
 
-constexpr const char *plugin_version="0.2.0";
+constexpr const char *plugin_version="0.3.0";
+#ifdef WIN32
+constexpr const char *sdl_library="SDL2.dll";
+#else
+constexpr const char *sdl_library="libSDL2-2.0.so.0";
+#endif
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
+DFLibrary *sdl_handle=nullptr;
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
 decltype(&SDL_RenderFillRect) render_fill_rect=nullptr;
 decltype(&SDL_RenderSetClipRect) render_set_clip_rect=nullptr;
@@ -762,6 +768,7 @@ std::vector<render_proxyst> collect_proxies(
 					const int32_t source=
 						source_x*vp->dim_y+source_y;
 					if(!visual_moved_between_tiles(
+						visual_layer,
 						layers[layer],
 						visual_layer==viewport_visual_layer::item?
 							vp->screentexpos_item_old:
@@ -1036,6 +1043,8 @@ void renderer_hook::interpose_fn_update_all()
 
 void clear_sdl_bindings()
 {
+	if(sdl_handle!=nullptr)ClosePlugin(sdl_handle);
+	sdl_handle=nullptr;
 	render_copy_f=nullptr;
 	render_fill_rect=nullptr;
 	render_set_clip_rect=nullptr;
@@ -1046,14 +1055,14 @@ void clear_sdl_bindings()
 bool load_sdl(color_ostream &out)
 {
 	clear_sdl_bindings();
-	DFLibrary *handle=DFSDL::obtain_library_handle();
-	if(handle==nullptr)
+	sdl_handle=OpenPlugin(sdl_library);
+	if(sdl_handle==nullptr)
 		{
-		out.printerr("smooth-movement: DFHack has no SDL2 library handle\n");
+		out.printerr("smooth-movement: could not load SDL2\n");
 		return false;
 		}
 	#define bind(name,target) \
-		target=reinterpret_cast<decltype(target)>(LookupPlugin(handle,#name)); \
+		target=reinterpret_cast<decltype(target)>(LookupPlugin(sdl_handle,#name)); \
 		if(target==nullptr) { \
 			out.printerr("smooth-movement: SDL2 function unavailable: " #name "\n"); \
 			clear_sdl_bindings(); \

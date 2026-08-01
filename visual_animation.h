@@ -30,12 +30,19 @@ constexpr bool visual_layer_moves_independently(viewport_visual_layer layer)
 		layer==viewport_visual_layer::item;
 }
 
+constexpr bool visual_layer_tracks_own_movement(viewport_visual_layer layer)
+{
+	return visual_layer_moves_independently(layer)||
+		layer==viewport_visual_layer::designation;
+}
+
 constexpr bool visual_layer_matches(
 	viewport_visual_layer layer,
 	int32_t current,
 	int32_t previous)
 {
-	return layer==viewport_visual_layer::vehicle?
+	return layer==viewport_visual_layer::vehicle||
+		layer==viewport_visual_layer::designation?
 		previous!=0:
 		previous==current;
 }
@@ -79,12 +86,14 @@ struct visual_movement_renderst
 };
 
 inline bool visual_moved_between_tiles(
+	viewport_visual_layer layer,
 	const int32_t *current,
 	const int32_t *previous,
 	int32_t source,
 	int32_t target)
 {
-	return previous[source]!=0&&previous[target]==0&&current[source]==0;
+	return previous[target]==0&&current[source]==0&&
+		(layer==viewport_visual_layer::designation||previous[source]!=0);
 }
 
 class visual_animation_managerst
@@ -153,7 +162,8 @@ class visual_animation_managerst
 			{
 			if(state.viewport==input.viewport)return state;
 			}
-		viewports.push_back({input.viewport});
+		viewports.emplace_back();
+		viewports.back().viewport=input.viewport;
 		return viewports.back();
 		}
 
@@ -236,7 +246,7 @@ class visual_animation_managerst
 				int32_t matches=0;
 				for(size_t layer=0;layer<input.current.size();++layer)
 					{
-					if(!visual_layer_moves_independently(
+					if(!visual_layer_tracks_own_movement(
 						static_cast<viewport_visual_layer>(layer)))continue;
 					const int32_t *current=input.current[layer];
 					const int32_t *previous=input.previous[layer];
@@ -301,7 +311,7 @@ class visual_animation_managerst
 				std::vector<uint8_t> claimed_sources(tile_count);
 				for(size_t layer=0;layer<input.current.size();++layer)
 					{
-					if(!visual_layer_moves_independently(
+					if(!visual_layer_tracks_own_movement(
 						static_cast<viewport_visual_layer>(layer)))continue;
 					std::fill(claimed_sources.begin(),claimed_sources.end(),0);
 					const int32_t *current=input.current[layer];
@@ -429,6 +439,7 @@ class visual_animation_managerst
 				{
 				if(state.viewport!=viewport)continue;
 				const movementst *companion=nullptr;
+				bool ambiguous=false;
 				for(const movementst &movement:state.movements)
 					{
 					if(movement.layer==layer&&movement.target_x==target_x&&
@@ -452,9 +463,11 @@ class visual_animation_managerst
 						companion->source_y-companion->target_y!=
 							movement.source_y-movement.target_y||
 						companion->start_time_ms!=movement.start_time_ms))
-						return {};
-					companion=&movement;
+						ambiguous=true;
+					else if(companion==nullptr)
+						companion=&movement;
 					}
+				if(ambiguous)return {};
 				if(companion!=nullptr)
 					return {
 						true,

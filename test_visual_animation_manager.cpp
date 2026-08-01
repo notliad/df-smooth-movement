@@ -240,14 +240,24 @@ int main()
 	status_previous[0*3+0]=90;
 	status_current[1*3+0]=91;
 	assert(visual_moved_between_tiles(
+		viewport_visual_layer::designation,
+		status_current.data(),status_previous.data(),0*3+0,1*3+0));
+	status_previous[0*3+0]=0;
+	assert(visual_moved_between_tiles(
+		viewport_visual_layer::designation,
+		status_current.data(),status_previous.data(),0*3+0,1*3+0));
+	assert(!visual_moved_between_tiles(
+		viewport_visual_layer::item,
 		status_current.data(),status_previous.data(),0*3+0,1*3+0));
 	status_previous[1*3+0]=80;
 	assert(!visual_moved_between_tiles(
+		viewport_visual_layer::designation,
 		status_current.data(),status_previous.data(),0*3+0,1*3+0));
+	status_previous[0*3+0]=90;
 	status_previous[1*3+0]=0;
 	run_frame(companion,input,9000);
 	auto status=companion.get_movement(viewport,viewport_visual_layer::designation,1,0);
-	assert(status.active&&status.source_x==0&&status.source_y==0);
+	assert(status.active&&!status.inherited&&status.source_x==0&&status.source_y==0);
 	const auto carried_item=companion.get_movement(
 		viewport,viewport_visual_layer::item,1,0);
 	assert(carried_item.active&&carried_item.inherited);
@@ -261,6 +271,7 @@ int main()
 	current.fill(0);
 	previous.fill(0);
 	status_current.fill(0);
+	status_previous.fill(0);
 	visual_animation_managerst crowd;
 	run_frame(crowd,input,9990);
 	previous[0*3+0]=41;
@@ -271,6 +282,13 @@ int main()
 	run_frame(crowd,input,10000);
 	assert(!crowd.get_movement(
 		viewport,viewport_visual_layer::designation,1,1).active);
+	status_previous[1*3+0]=90;
+	status_current[1*3+1]=91;
+	run_frame(crowd,input,10010);
+	status=crowd.get_movement(viewport,viewport_visual_layer::designation,1,1);
+	assert(status.active);
+	assert(!status.inherited);
+	assert(status.source_x==1&&status.source_y==0);
 
 	// Wheelbarrows use the item layer and the same independent adjacent-movement detection.
 	current.fill(0);
