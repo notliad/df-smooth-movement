@@ -41,7 +41,7 @@ REQUIRE_GLOBAL(window_z);
 
 namespace {
 
-constexpr const char *plugin_version="0.3.0";
+constexpr const char *plugin_version="0.3.1";
 #ifdef WIN32
 constexpr const char *sdl_library="SDL2.dll";
 #else

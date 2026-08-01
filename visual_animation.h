@@ -156,6 +156,47 @@ class visual_animation_managerst
 		state.suppress_frames=0;
 		}
 
+	static std::array<int32_t,2> shared_movement_delta(
+		const int32_t *current,
+		const int32_t *previous,
+		int32_t dim_x,
+		int32_t dim_y)
+		{
+		std::array<int32_t,2> best{};
+		int32_t best_count=1;
+		bool ambiguous=false;
+		for(int32_t dx=-1;dx<=1;++dx)
+			{
+			for(int32_t dy=-1;dy<=1;++dy)
+				{
+				if(dx==0&&dy==0)continue;
+				int32_t count=0;
+				for(int32_t x=0;x<dim_x;++x)
+					{
+					const int32_t source_x=x+dx;
+					if(source_x<0||source_x>=dim_x)continue;
+					for(int32_t y=0;y<dim_y;++y)
+						{
+						const int32_t source_y=y+dy;
+						if(source_y<0||source_y>=dim_y)continue;
+						const int32_t target=x*dim_y+y;
+						const int32_t texpos=current[target];
+						if(texpos!=0&&previous[target]!=texpos&&
+							previous[source_x*dim_y+source_y]==texpos)++count;
+						}
+					}
+				if(count>best_count)
+					{
+					best_count=count;
+					best={dx,dy};
+					ambiguous=false;
+					}
+				else if(count==best_count&&count>1)ambiguous=true;
+				}
+			}
+		return ambiguous?std::array<int32_t,2>{}:best;
+		}
+
 	viewport_animationst &get_viewport(const viewport_visual_animation_inputst &input)
 		{
 		for(viewport_animationst &state:viewports)
@@ -309,6 +350,7 @@ class visual_animation_managerst
 				{
 				const int32_t tile_count=input.dim_x*input.dim_y;
 				std::vector<uint8_t> claimed_sources(tile_count);
+				const size_t existing_movement_count=state.movements.size();
 				for(size_t layer=0;layer<input.current.size();++layer)
 					{
 					if(!visual_layer_tracks_own_movement(
@@ -316,37 +358,60 @@ class visual_animation_managerst
 					std::fill(claimed_sources.begin(),claimed_sources.end(),0);
 					const int32_t *current=input.current[layer];
 					const int32_t *previous=input.previous[layer];
+					const auto shared_delta=
+						static_cast<viewport_visual_layer>(layer)==viewport_visual_layer::center?
+						shared_movement_delta(
+							current,previous,input.dim_x,input.dim_y):
+						std::array<int32_t,2>{};
 					for(int32_t x=0;x<input.dim_x;++x)
 						{
 						for(int32_t y=0;y<input.dim_y;++y)
 							{
 							const int32_t target=x*input.dim_y+y;
 							const int32_t texpos=current[target];
-							// Entity ids are unavailable, so only accept a unique
-							// same-sprite move between empty cells in one layer.
-							if(texpos==0||previous[target]!=0)continue;
+							if(texpos==0)continue;
 
 							int32_t source=-1;
 							int32_t candidate_count=0;
-							for(int32_t dx=-1;dx<=1;++dx)
+							if(shared_delta[0]!=0||shared_delta[1]!=0)
 								{
-								for(int32_t dy=-1;dy<=1;++dy)
+								const int32_t source_x=x+shared_delta[0];
+								const int32_t source_y=y+shared_delta[1];
+								if(source_x>=0&&source_x<input.dim_x&&
+									source_y>=0&&source_y<input.dim_y)
 									{
-									if(dx==0&&dy==0)continue;
-									const int32_t source_x=x+dx;
-									const int32_t source_y=y+dy;
-									if(source_x<0||source_x>=input.dim_x||
-										source_y<0||source_y>=input.dim_y)continue;
 									const int32_t candidate=source_x*input.dim_y+source_y;
-								if(!claimed_sources[candidate]&&
-									visual_layer_matches(
-										static_cast<viewport_visual_layer>(layer),
-										texpos,
-										previous[candidate])&&
-									current[candidate]==0)
+									if(!claimed_sources[candidate]&&previous[target]!=texpos&&
+										previous[candidate]==texpos)
 										{
 										source=candidate;
-										++candidate_count;
+										candidate_count=1;
+										}
+									}
+								}
+							// Otherwise require a unique same-sprite move between empty cells.
+							if(candidate_count==0&&previous[target]==0)
+								{
+								for(int32_t dx=-1;dx<=1;++dx)
+									{
+									for(int32_t dy=-1;dy<=1;++dy)
+										{
+										if(dx==0&&dy==0)continue;
+										const int32_t source_x=x+dx;
+										const int32_t source_y=y+dy;
+										if(source_x<0||source_x>=input.dim_x||
+											source_y<0||source_y>=input.dim_y)continue;
+										const int32_t candidate=source_x*input.dim_y+source_y;
+										if(!claimed_sources[candidate]&&
+											visual_layer_matches(
+												static_cast<viewport_visual_layer>(layer),
+												texpos,
+												previous[candidate])&&
+											current[candidate]==0)
+											{
+											source=candidate;
+											++candidate_count;
+											}
 										}
 									}
 								}
@@ -355,8 +420,9 @@ class visual_animation_managerst
 							claimed_sources[source]=1;
 							float visual_source_x=float(source/input.dim_y);
 							float visual_source_y=float(source%input.dim_y);
-							for(const movementst &movement:state.movements)
+							for(size_t i=0;i<existing_movement_count;++i)
 								{
+								const movementst &movement=state.movements[i];
 								if(movement.layer!=
 										static_cast<viewport_visual_layer>(layer)||
 									movement.target_x!=visual_source_x||

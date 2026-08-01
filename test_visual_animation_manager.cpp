@@ -114,6 +114,23 @@ int main()
 	assert(!ambiguous.get_movement(
 		viewport,viewport_visual_layer::center,1,1).active);
 
+	// A handler and led animal form an occupied chain: each enters the other's old space.
+	visual_animation_managerst convoy;
+	current.fill(0);
+	previous.fill(0);
+	run_frame(convoy,input,3490);
+	previous[0*3+1]=41;
+	previous[1*3+1]=42;
+	current[1*3+1]=41;
+	current[2*3+1]=42;
+	run_frame(convoy,input,3500);
+	const auto animal=convoy.get_movement(
+		viewport,viewport_visual_layer::center,1,1);
+	const auto handler=convoy.get_movement(
+		viewport,viewport_visual_layer::center,2,1);
+	assert(animal.active&&animal.source_x==0&&animal.source_y==1);
+	assert(handler.active&&handler.source_x==1&&handler.source_y==1);
+
 	visual_animation_managerst context;
 	current.fill(0);
 	previous.fill(0);
