@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Target DFHack `develop` and reuse DFHack's SDL library handle instead of
+  independently opening and closing SDL.
+- Centralize viewport layer metadata, redraw stages, SDL bindings, and pending
+  state cleanup to remove duplicated rendering policy.
 - Animate creature status icons with their creature instead of letting their
   flashing texture fragments jump between tiles.
 - Animate item-layer wheelbarrows and the vehicle layer used by minecarts;

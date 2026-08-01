@@ -9,15 +9,9 @@ ticks, saves, or gameplay state.
 
 ## Compatibility
 
-The current prebuilt release supports:
-
-- Dwarf Fortress 53.15
-- DFHack 53.15-r2
-- Linux or Windows x86-64
-- the SDL 2D renderer
-
-DFHack C++ plugins are ABI-specific. Do not install the prebuilt binary on a
-different DFHack or Dwarf Fortress version. Rebuild from source instead.
+Development currently targets the DFHack `develop` branch and the SDL 2D
+renderer. DFHack C++ plugins are ABI-specific, so rebuild the plugin whenever
+the DFHack or Dwarf Fortress version changes.
 
 ## Install
 
@@ -46,7 +40,7 @@ The status command prints the plugin version and whether it is enabled.
 
 ## Build
 
-Check out the matching DFHack source release and clone this repository under
+Check out DFHack's `develop` branch and clone this repository under
 `plugins/external/df-smooth-movement`. Add this line to
 `plugins/external/CMakeLists.txt`:
 
