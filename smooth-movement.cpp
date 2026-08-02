@@ -6,6 +6,7 @@
 #include "VTableInterpose.h"
 
 #include "modules/DFSDL.h"
+#include "modules/Maps.h"
 
 #include "df/enabler.h"
 #include "df/graphic.h"
@@ -13,6 +14,7 @@
 #include "df/renderer_2d_base.h"
 #include "df/texture_fullid.h"
 
+#include "TileTypes.h"
 #include "visual_animation.h"
 
 #include <SDL_render.h>
@@ -55,6 +57,10 @@ decltype(&SDL_RenderFillRect) render_fill_rect=nullptr;
 decltype(&SDL_RenderSetClipRect) render_set_clip_rect=nullptr;
 decltype(&SDL_GetRenderDrawColor) get_render_draw_color=nullptr;
 decltype(&SDL_SetRenderDrawColor) set_render_draw_color=nullptr;
+decltype(&SDL_GetTextureAlphaMod) get_texture_alpha_mod=nullptr;
+decltype(&SDL_SetTextureAlphaMod) set_texture_alpha_mod=nullptr;
+decltype(&SDL_GetTextureBlendMode) get_texture_blend_mode=nullptr;
+decltype(&SDL_SetTextureBlendMode) set_texture_blend_mode=nullptr;
 
 visual_animation_managerst animation_manager;
 std::set<std::pair<int32_t,int32_t>> previous_coverage;
@@ -68,6 +74,7 @@ bool has_view_signature=false;
 int32_t previous_pan_x=0;
 int32_t previous_pan_y=0;
 bool has_pan_context=false;
+bool construction_transitions_enabled=false;
 
 // --- free camera -------------------------------------------------------------------------------
 // The camera is visually unbound from the tile grid. Two layered offsets:
@@ -492,6 +499,183 @@ viewport_visual_animation_inputst animation_input(df::graphic_viewportst *vp)
 		};
 }
 
+struct tile_transitionst
+{
+	tile_transition_layer layer;
+	int32_t previous_texpos;
+	int32_t current_texpos;
+	uint32_t start_time_ms;
+};
+
+bool is_tile_construction_or_destruction(
+	df::tiletype previous,
+	df::tiletype current)
+{
+	if(previous==current)return false;
+	if(tileMaterial(previous)==df::tiletype_material::CONSTRUCTION||
+		tileMaterial(current)==df::tiletype_material::CONSTRUCTION)
+		return true;
+	if(!isGroundMaterial(previous)||
+		tileShape(previous)==tileShape(current))return false;
+	return isWallTerrain(previous)||
+		isFloorTerrain(previous)||
+		isRampTerrain(previous)||
+		isStairTerrain(previous);
+}
+
+class tile_transition_managerst
+{
+	const void *viewport=nullptr;
+	int32_t dim_x=0;
+	int32_t dim_y=0;
+	uint64_t context_revision=0;
+	int32_t pan_x=0;
+	int32_t pan_y=0;
+	bool has_context=false;
+	std::unordered_map<int32_t,tile_transitionst> transitions;
+	std::vector<df::tiletype> previous_tiletypes;
+	std::vector<uint8_t> has_previous_tiletype;
+
+	static constexpr uint32_t transition_duration_ms=120;
+
+	void snapshot_tiletypes(df::graphic_viewportst *vp)
+		{
+		const int32_t tile_count=vp->dim_x*vp->dim_y;
+		previous_tiletypes.resize(tile_count);
+		has_previous_tiletype.assign(tile_count,0);
+		const int32_t map_x=window_x?*window_x:0;
+		const int32_t map_y=window_y?*window_y:0;
+		const int32_t map_z=window_z?*window_z:0;
+		for(int32_t x=0;x<vp->dim_x;++x)
+			{
+			for(int32_t y=0;y<vp->dim_y;++y)
+				{
+				const int32_t index=x*vp->dim_y+y;
+				const df::tiletype *tiletype=
+					Maps::getTileType(map_x+x,map_y+y,map_z);
+				if(tiletype==nullptr)continue;
+				previous_tiletypes[index]=*tiletype;
+				has_previous_tiletype[index]=1;
+				}
+			}
+		}
+
+	public:
+		void clear()
+			{
+			transitions.clear();
+			previous_tiletypes.clear();
+			has_previous_tiletype.clear();
+			has_context=false;
+			}
+
+		void reset()
+			{
+			clear();
+			}
+
+		void synchronize(df::graphic_viewportst *vp,uint32_t now_ms)
+			{
+			const int32_t current_pan_x=window_x?*window_x:0;
+			const int32_t current_pan_y=window_y?*window_y:0;
+			const bool context_changed=!has_context||viewport!=vp||
+				dim_x!=vp->dim_x||dim_y!=vp->dim_y||
+				context_revision!=visual_context_revision||
+				pan_x!=current_pan_x||pan_y!=current_pan_y;
+			viewport=vp;
+			dim_x=vp->dim_x;
+			dim_y=vp->dim_y;
+			context_revision=visual_context_revision;
+			pan_x=current_pan_x;
+			pan_y=current_pan_y;
+			has_context=true;
+			if(context_changed)
+				{
+				transitions.clear();
+				snapshot_tiletypes(vp);
+				return;
+				}
+
+			const int32_t map_x=window_x?*window_x:0;
+			const int32_t map_y=window_y?*window_y:0;
+			const int32_t map_z=window_z?*window_z:0;
+			for(int32_t x=0;x<dim_x;++x)
+				{
+				for(int32_t y=0;y<dim_y;++y)
+					{
+					const int32_t index=x*dim_y+y;
+					const df::tiletype *tiletype=
+						Maps::getTileType(map_x+x,map_y+y,map_z);
+					const bool gameplay_change=tiletype!=nullptr&&
+						has_previous_tiletype[index]&&
+						is_tile_construction_or_destruction(
+							previous_tiletypes[index],*tiletype);
+					if(tiletype!=nullptr)
+						{
+						previous_tiletypes[index]=*tiletype;
+						has_previous_tiletype[index]=1;
+						}
+					else
+						has_previous_tiletype[index]=0;
+					if(!gameplay_change)continue;
+					const auto candidate=select_tile_transition(
+						vp->screentexpos_background[index],
+						vp->screentexpos_background_old[index],
+						vp->screentexpos_building_one[index],
+						vp->screentexpos_building_one_old[index]);
+					if(candidate.layer!=tile_transition_layer::none)
+						{
+						const auto existing=transitions.find(index);
+						if(existing==transitions.end()||
+							existing->second.layer!=candidate.layer||
+							existing->second.previous_texpos!=candidate.previous_texpos||
+							existing->second.current_texpos!=candidate.current_texpos)
+							{
+							transitions[index]={
+								candidate.layer,
+								candidate.previous_texpos,
+								candidate.current_texpos,
+								now_ms
+								};
+							}
+						}
+					}
+				}
+			for(auto it=transitions.begin();it!=transitions.end();)
+				{
+				if(now_ms-it->second.start_time_ms>=transition_duration_ms)
+					it=transitions.erase(it);
+				else
+					++it;
+				}
+			}
+
+		bool active() const
+			{
+			return !transitions.empty();
+			}
+
+		const tile_transitionst *get(int32_t index) const
+			{
+			const auto found=transitions.find(index);
+			return found==transitions.end()?nullptr:&found->second;
+			}
+
+		float progress(const tile_transitionst &transition,uint32_t now_ms) const
+			{
+			return animation_progress(
+				now_ms,transition.start_time_ms,transition_duration_ms);
+			}
+
+		const std::unordered_map<int32_t,tile_transitionst> &entries() const
+			{
+			return transitions;
+			}
+
+};
+
+tile_transition_managerst tile_transition_manager;
+
 int32_t tile_pixel(int32_t tile,int32_t origin,int32_t zoom)
 {
 	return zoom==128?32*tile+origin:(zoom*32*tile)/128+origin;
@@ -639,6 +823,24 @@ void with_upper_suppressed(
 		});
 }
 
+template<typename Callback>
+void with_incoming_tile_suppressed(
+	df::graphic_viewportst *vp,
+	int32_t index,
+	const Callback &callback)
+{
+	const tile_transitionst *transition=tile_transition_manager.get(index);
+	if(transition==nullptr||transition->current_texpos==0)
+		{
+		callback();
+		return;
+		}
+	if(transition->layer==tile_transition_layer::background)
+		with_zeroed_values(callback,vp->screentexpos_background[index]);
+	else
+		with_zeroed_values(callback,vp->screentexpos_building_one[index]);
+}
+
 void redraw_world_tile(
 	df::renderer_2d_base *renderer,
 	df::graphic_viewportst *vp,
@@ -657,8 +859,11 @@ void redraw_world_tile(
 			}
 		renderer->update_viewport_tile(vp,x,y);
 		};
-	with_suppressed_visual_layers(
-		visual_layers(vp),index,selected_mask(selected,index),redraw);
+	with_incoming_tile_suppressed(vp,index,[&]
+		{
+		with_suppressed_visual_layers(
+			visual_layers(vp),index,selected_mask(selected,index),redraw);
+		});
 }
 
 constexpr uint16_t visual_layers_through_group(visual_render_groupst group)
@@ -695,6 +900,55 @@ void redraw_above(
 		with_main_suppressed(vp,index,suppress_visuals);
 	else
 		with_upper_suppressed(vp,index,suppress_visuals);
+}
+
+SDL_Texture *cached_texture(
+	df::renderer_2d_base *renderer,
+	int32_t texpos,
+	bool transparent_background=true)
+{
+	if(texpos==0)return nullptr;
+	df::texture_fullid texture_id;
+	texture_id.texpos=texpos;
+	texture_id.r=texture_id.g=texture_id.b=1.0f;
+	texture_id.br=texture_id.bg=texture_id.bb=0.0f;
+	texture_id.flag=transparent_background?
+		df::texture_fullid_flag::mask_transparent_background:
+		0;
+	const auto texture=renderer->tile_cache.tile_cache.find(texture_id);
+	return texture==renderer->tile_cache.tile_cache.end()?
+		nullptr:
+		static_cast<SDL_Texture *>(texture->second);
+}
+
+SDL_Texture *cached_tile_texture(
+	df::renderer_2d_base *renderer,
+	int32_t texpos)
+{
+	SDL_Texture *texture=cached_texture(renderer,texpos,false);
+	return texture!=nullptr?texture:cached_texture(renderer,texpos);
+}
+
+void draw_texture_with_alpha(
+	SDL_Renderer *renderer,
+	SDL_Texture *texture,
+	const SDL_FRect &destination,
+	float opacity)
+{
+	if(opacity<=0.0f)return;
+	Uint8 saved_alpha=255;
+	SDL_BlendMode saved_blend=SDL_BLENDMODE_NONE;
+	if(get_texture_alpha_mod(texture,&saved_alpha)!=0||
+		get_texture_blend_mode(texture,&saved_blend)!=0)
+		{
+		render_copy_f(renderer,texture,nullptr,&destination);
+		return;
+		}
+	set_texture_blend_mode(texture,SDL_BLENDMODE_BLEND);
+	set_texture_alpha_mod(texture,Uint8(std::lround(saved_alpha*opacity)));
+	render_copy_f(renderer,texture,nullptr,&destination);
+	set_texture_alpha_mod(texture,saved_alpha);
+	set_texture_blend_mode(texture,saved_blend);
 }
 
 void draw_proxy(df::renderer_2d_base *renderer,const render_proxyst &proxy)
@@ -754,14 +1008,14 @@ std::vector<render_proxyst> collect_proxies(
 						}
 					if(!anchored)continue;
 					}
-				if((visual_layer==viewport_visual_layer::item||
-					visual_layer==viewport_visual_layer::designation)&&
-					movement.inherited)
+					if((visual_layer==viewport_visual_layer::item||
+						visual_layer==viewport_visual_layer::designation)&&
+						movement.inherited)
 					{
-					const int32_t source_x=x-
-						((x>movement.source_x)-(x<movement.source_x));
-					const int32_t source_y=y-
-						((y>movement.source_y)-(y<movement.source_y));
+					const int32_t source_x=inherited_visual_source_tile(
+						x,movement.source_x,x);
+					const int32_t source_y=inherited_visual_source_tile(
+						y,movement.source_y,y);
 					if(source_x<0||source_x>=vp->dim_x||
 						source_y<0||source_y>=vp->dim_y)continue;
 					const int32_t source=
@@ -814,18 +1068,8 @@ std::vector<render_proxyst> collect_proxies(
 					}
 				if(blocked)continue;
 
-				df::texture_fullid texture_id;
-				texture_id.texpos=texpos;
-				texture_id.r=texture_id.g=texture_id.b=1.0f;
-				texture_id.br=texture_id.bg=texture_id.bb=0.0f;
-				texture_id.flag=
-					df::texture_fullid_flag::mask_transparent_background;
-				const auto texture=renderer->tile_cache.tile_cache.find(texture_id);
-				if(texture==renderer->tile_cache.tile_cache.end())
-					{
-					continue;
-					}
-				proxy.texture=static_cast<SDL_Texture *>(texture->second);
+				proxy.texture=cached_texture(renderer,texpos);
+				if(proxy.texture==nullptr)continue;
 				proxies.push_back(std::move(proxy));
 				}
 			}
@@ -858,6 +1102,50 @@ render_coveragest collect_coverage(
 	return coverage;
 }
 
+void add_tile_transition_coverage(
+	render_coveragest &coverage,
+	int32_t dim_y)
+{
+	for(const auto &entry:tile_transition_manager.entries())
+		coverage.all.emplace(entry.first/dim_y,entry.first%dim_y);
+}
+
+void draw_tile_transitions(
+	df::renderer_2d_base *renderer,
+	df::graphic_viewportst *vp)
+{
+	SDL_Renderer *sdl_renderer=static_cast<SDL_Renderer *>(renderer->sdl_renderer);
+	const int32_t zoom=renderer->viewport_zoom_factor;
+	const int32_t tile_size=zoom==128?32:std::max(1,zoom*32/128);
+	const uint32_t now_ms=animation_manager.get_frame_time_ms();
+	for(const auto &[index,transition]:tile_transition_manager.entries())
+		{
+		const int32_t x=index/vp->dim_y;
+		const int32_t y=index%vp->dim_y;
+		if(!inside_clip(vp,x,y))continue;
+		const int32_t target_x=tile_pixel(x,renderer->origin_x,zoom);
+		const int32_t target_y=tile_pixel(y,renderer->origin_y,zoom);
+		const float progress=tile_transition_manager.progress(transition,now_ms);
+		const SDL_FRect destination=
+			{
+			float(target_x),
+			float(target_y),
+			float(tile_size),
+			float(tile_size)
+			};
+		SDL_Texture *previous=cached_tile_texture(renderer,transition.previous_texpos);
+		SDL_Texture *current=cached_tile_texture(renderer,transition.current_texpos);
+		if(previous==nullptr&&current==nullptr)
+			{
+			continue;
+			}
+		if(previous!=nullptr)
+			draw_texture_with_alpha(sdl_renderer,previous,destination,1.0f-progress);
+		if(current!=nullptr)
+			draw_texture_with_alpha(sdl_renderer,current,destination,progress);
+		}
+}
+
 void draw_interpolation_stages(
 	df::renderer_2d_base *renderer,
 	df::graphic_viewportst *vp,
@@ -880,14 +1168,21 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	df::graphic_viewportst *vp=gps?gps->main_viewport:nullptr;
 
 	if(vp!=nullptr)update_visual_context(renderer,vp);
-	animation_manager.begin_frame(Core::getInstance().p->getTickCount());
+	const uint32_t now_ms=Core::getInstance().p->getTickCount();
+	animation_manager.begin_frame(now_ms);
 	if(vp!=nullptr)
 		{
 		const auto input=animation_input(vp);
 		animation_manager.synchronize_viewport(
 			input,
 			vp->flag.bits.active);
+		if(vp->flag.bits.active&&construction_transitions_enabled)
+			tile_transition_manager.synchronize(vp,now_ms);
+		else
+			tile_transition_manager.clear();
 		}
+	else
+		tile_transition_manager.clear();
 	animation_manager.end_frame();
 
 	if(vp==nullptr||!vp->flag.bits.active||renderer->sdl_renderer==nullptr)
@@ -904,11 +1199,13 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		if(gps!=nullptr)++gps->force_full_display_count;
 		}
 	if(glide)camera_was_offset=true;
-	if(!glide&&!animation_manager.requires_full_redraw())
+	if(!glide&&!animation_manager.requires_full_redraw()&&
+		!tile_transition_manager.active())
 		return;
 
 	std::vector<render_proxyst> proxies=collect_proxies(renderer,vp);
 	render_coveragest coverage=collect_coverage(proxies,vp->dim_y);
+	add_tile_transition_coverage(coverage,vp->dim_y);
 
 	SDL_Renderer *sdl_renderer=static_cast<SDL_Renderer *>(renderer->sdl_renderer);
 	const int32_t zoom=renderer->viewport_zoom_factor;
@@ -946,6 +1243,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 			for(int32_t y=vp->clipy[0];y<=vp->clipy[1];++y)
 				redraw_world_tile(renderer,vp,x,y,coverage.selected);
 			}
+		draw_tile_transitions(renderer,vp);
 		draw_interpolation_stages(renderer,vp,proxies,coverage);
 		renderer->origin_x=saved_origin_x;
 		renderer->origin_y=saved_origin_y;
@@ -979,6 +1277,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		{
 		if(inside_clip(vp,x,y))redraw_world_tile(renderer,vp,x,y,coverage.selected);
 		}
+	draw_tile_transitions(renderer,vp);
 	draw_interpolation_stages(renderer,vp,proxies,coverage);
 
 	previous_coverage=std::move(coverage.all);
@@ -1008,6 +1307,10 @@ void clear_sdl_bindings()
 	render_set_clip_rect=nullptr;
 	get_render_draw_color=nullptr;
 	set_render_draw_color=nullptr;
+	get_texture_alpha_mod=nullptr;
+	set_texture_alpha_mod=nullptr;
+	get_texture_blend_mode=nullptr;
+	set_texture_blend_mode=nullptr;
 }
 
 bool load_sdl(color_ostream &out)
@@ -1031,6 +1334,10 @@ bool load_sdl(color_ostream &out)
 	bind(SDL_RenderSetClipRect,render_set_clip_rect);
 	bind(SDL_GetRenderDrawColor,get_render_draw_color);
 	bind(SDL_SetRenderDrawColor,set_render_draw_color);
+	bind(SDL_GetTextureAlphaMod,get_texture_alpha_mod);
+	bind(SDL_SetTextureAlphaMod,set_texture_alpha_mod);
+	bind(SDL_GetTextureBlendMode,get_texture_blend_mode);
+	bind(SDL_SetTextureBlendMode,set_texture_blend_mode);
 	#undef bind
 	return true;
 }
@@ -1038,6 +1345,7 @@ bool load_sdl(color_ostream &out)
 void reset_state()
 {
 	animation_manager=visual_animation_managerst();
+	tile_transition_manager.reset();
 	previous_coverage.clear();
 	visual_context_revision=0;
 	previous_viewport=nullptr;
@@ -1052,6 +1360,7 @@ void reset_state()
 	camera_enabled=false;
 	camera_has_prev=false;
 	camera_was_offset=false;
+	construction_transitions_enabled=false;
 }
 
 command_result status_command(
@@ -1066,7 +1375,30 @@ command_result status_command(
 			is_enabled?"enabled":"disabled");
 		out.print("free camera: {}, offset {:.3f} {:.3f} (tiles east/south of the grid)\n",
 			camera_enabled?"on":"off",-rest_x,-rest_y);
+		out.print("construction transitions: {}\n",
+			construction_transitions_enabled?"on":"off");
 		return CR_OK;
+		}
+	if(parameters[0]=="construction")
+		{
+		if(parameters.size()==1)
+			{
+			out.print("construction transitions: {}\n",
+				construction_transitions_enabled?"on":"off");
+			return CR_OK;
+			}
+		if(parameters.size()==2&&parameters[1]=="on")
+			{
+			construction_transitions_enabled=true;
+			return CR_OK;
+			}
+		if(parameters.size()==2&&parameters[1]=="off")
+			{
+			construction_transitions_enabled=false;
+			tile_transition_manager.clear();
+			return CR_OK;
+			}
+		return CR_WRONG_USAGE;
 		}
 	if(parameters[0]=="camera")
 		{

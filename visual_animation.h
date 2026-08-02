@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <vector>
@@ -158,6 +159,51 @@ struct visual_movement_renderst
 	bool inherited=false;
 };
 
+enum class tile_transition_layer : uint8_t
+{
+	none,
+	background,
+	building_one
+};
+
+struct tile_transition_candidatest
+{
+	tile_transition_layer layer=tile_transition_layer::none;
+	int32_t previous_texpos=0;
+	int32_t current_texpos=0;
+};
+
+inline tile_transition_candidatest select_tile_transition(
+	int32_t current_background,
+	int32_t previous_background,
+	int32_t current_building_one,
+	int32_t previous_building_one)
+{
+	if(current_building_one!=previous_building_one)
+		return {
+			tile_transition_layer::building_one,
+			previous_building_one,
+			current_building_one
+			};
+	if(current_background!=previous_background)
+		return {
+			tile_transition_layer::background,
+			previous_background,
+			current_background
+			};
+	return {};
+}
+
+inline float animation_progress(
+	uint32_t now_ms,
+	uint32_t start_time_ms,
+	uint32_t duration_ms)
+{
+	const float linear=std::min(
+		1.0f,float(now_ms-start_time_ms)/duration_ms);
+	return linear*linear*(3.0f-2.0f*linear);
+}
+
 inline bool visual_moved_between_tiles(
 	viewport_visual_layer layer,
 	const int32_t *current,
@@ -167,6 +213,14 @@ inline bool visual_moved_between_tiles(
 {
 	return previous[target]==0&&current[source]==0&&
 		(layer==viewport_visual_layer::designation||previous[source]!=0);
+}
+
+inline int32_t inherited_visual_source_tile(
+	int32_t overlay_target,
+	float center_source,
+	float center_target)
+{
+	return overlay_target+int32_t(std::lround(center_source-center_target));
 }
 
 class visual_animation_managerst
@@ -283,8 +337,8 @@ class visual_animation_managerst
 
 	float movement_progress(uint32_t start_time_ms) const
 		{
-		const float linear=std::min(1.0f,float(frame_time_ms-start_time_ms)/movement_duration_ms);
-		return linear*linear*(3.0f-2.0f*linear);
+		return animation_progress(
+			frame_time_ms,start_time_ms,movement_duration_ms);
 		}
 
 	public:
