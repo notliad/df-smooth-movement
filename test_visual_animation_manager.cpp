@@ -83,6 +83,14 @@ int main()
 	assert(animation_progress(100,0,100)==1.0f);
 	assert(inherited_visual_source_tile(0,0,1)==-1);
 	assert(inherited_visual_source_tile(2,0,1)==1);
+	assert(visual_layer_descriptor(viewport_visual_layer::right).center_x==-1);
+	assert(visual_layer_descriptor(viewport_visual_layer::left).center_x==1);
+	assert(visual_layer_descriptor(viewport_visual_layer::upright).center_x==-1&&
+		visual_layer_descriptor(viewport_visual_layer::upright).center_y==1);
+	assert(visual_layer_descriptor(viewport_visual_layer::up).center_x==0&&
+		visual_layer_descriptor(viewport_visual_layer::up).center_y==1);
+	assert(visual_layer_descriptor(viewport_visual_layer::upleft).center_x==1&&
+		visual_layer_descriptor(viewport_visual_layer::upleft).center_y==1);
 
 	std::array<int32_t,9> empty{};
 	std::array<int32_t,9> current{};
@@ -145,6 +153,22 @@ int main()
 		viewport,viewport_visual_layer::center,2,1);
 	assert(animal.active&&animal.source_x==0&&animal.source_y==1);
 	assert(handler.active&&handler.source_x==1&&handler.source_y==1);
+
+	// A multi-tile fragment can use its own movement or its mapped center tile as proof of ownership.
+	for(const auto layer:{viewport_visual_layer::right,viewport_visual_layer::left,
+		viewport_visual_layer::upright,viewport_visual_layer::up,
+		viewport_visual_layer::upleft})
+		{
+		current.fill(0);
+		previous.fill(0);
+		previous[0*3+1]=50;
+		current[1*3+1]=50;
+		assert(visual_moved_between_tiles(
+			layer,current.data(),previous.data(),0*3+1,1*3+1));
+		previous[1*3+1]=50;
+		assert(!visual_moved_between_tiles(
+			layer,current.data(),previous.data(),0*3+1,1*3+1));
+		}
 
 	visual_animation_managerst context;
 	current.fill(0);

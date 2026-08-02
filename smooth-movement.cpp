@@ -994,6 +994,13 @@ std::vector<render_proxyst> collect_proxies(
 				const auto movement=animation_manager.get_movement(
 					vp,static_cast<viewport_visual_layer>(layer),x,y);
 				if(!movement.active)continue;
+				const int32_t inherited_source_x=inherited_visual_source_tile(
+					x,movement.source_x,x);
+				const int32_t inherited_source_y=inherited_visual_source_tile(
+					y,movement.source_y,y);
+				const bool inherited_source_in_bounds=
+					inherited_source_x>=0&&inherited_source_x<vp->dim_x&&
+					inherited_source_y>=0&&inherited_source_y<vp->dim_y;
 				if(!visual_layer_moves_independently(visual_layer))
 					{
 					bool anchored=false;
@@ -1012,20 +1019,38 @@ std::vector<render_proxyst> collect_proxies(
 						visual_layer==viewport_visual_layer::designation)&&
 						movement.inherited)
 					{
-					const int32_t source_x=inherited_visual_source_tile(
-						x,movement.source_x,x);
-					const int32_t source_y=inherited_visual_source_tile(
-						y,movement.source_y,y);
-					if(source_x<0||source_x>=vp->dim_x||
-						source_y<0||source_y>=vp->dim_y)continue;
+					if(visual_layer==viewport_visual_layer::item&&
+						vp->screentexpos_old[index]!=0)continue;
+					if(!inherited_source_in_bounds)continue;
 					const int32_t source=
-						source_x*vp->dim_y+source_y;
+						inherited_source_x*vp->dim_y+inherited_source_y;
 					if(!visual_moved_between_tiles(
 						visual_layer,
-						layers[layer],
-						previous_layers[layer],
-						source,
-						index))continue;
+							layers[layer],
+							previous_layers[layer],
+							source,
+							index))continue;
+					}
+				if(!visual_layer_moves_independently(visual_layer)&&
+					visual_layer!=viewport_visual_layer::designation&&movement.inherited)
+					{
+					const bool fragment_moved=inherited_source_in_bounds&&
+						visual_moved_between_tiles(
+							visual_layer,layers[layer],previous_layers[layer],
+							inherited_source_x*vp->dim_y+inherited_source_y,index);
+					if(!fragment_moved)
+						{
+					const auto &descriptor=visual_layer_descriptor(visual_layer);
+					bool owns_fragment=false;
+					for(const render_proxyst &anchor:proxies)
+						if(anchor.layer==viewport_visual_layer::center&&
+							anchor.target_x==x+descriptor.center_x&&
+							anchor.target_y==y+descriptor.center_y&&
+							anchor.source_x-anchor.target_x==movement.source_x-x&&
+							anchor.source_y-anchor.target_y==movement.source_y-y&&
+							anchor.progress==movement.progress)owns_fragment=true;
+					if(!owns_fragment)continue;
+						}
 					}
 
 				render_proxyst proxy=

@@ -41,28 +41,30 @@ struct visual_layer_descriptorst
 	bool moves_independently;
 	bool matches_any_previous;
 	uint8_t draw_order;
+	int8_t center_x;
+	int8_t center_y;
 };
 
 constexpr std::array visual_layer_descriptors=
 	{
 	visual_layer_descriptorst{viewport_visual_layer::right,
-		visual_render_groupst::main,false,false,3},
+		visual_render_groupst::main,false,false,3,-1,0},
 	visual_layer_descriptorst{viewport_visual_layer::center,
-		visual_render_groupst::main,true,false,0},
+		visual_render_groupst::main,true,false,0,0,0},
 	visual_layer_descriptorst{viewport_visual_layer::left,
-		visual_render_groupst::main,false,false,4},
+		visual_render_groupst::main,false,false,4,1,0},
 	visual_layer_descriptorst{viewport_visual_layer::upright,
-		visual_render_groupst::upper,false,false,5},
+		visual_render_groupst::upper,false,false,5,-1,1},
 	visual_layer_descriptorst{viewport_visual_layer::up,
-		visual_render_groupst::upper,false,false,6},
+		visual_render_groupst::upper,false,false,6,0,1},
 	visual_layer_descriptorst{viewport_visual_layer::upleft,
-		visual_render_groupst::upper,false,false,7},
+		visual_render_groupst::upper,false,false,7,1,1},
 	visual_layer_descriptorst{viewport_visual_layer::vehicle,
-		visual_render_groupst::vehicle,true,true,2},
+		visual_render_groupst::vehicle,true,true,2,0,0},
 	visual_layer_descriptorst{viewport_visual_layer::item,
-		visual_render_groupst::item,true,false,1},
+		visual_render_groupst::item,true,false,1,0,0},
 	visual_layer_descriptorst{viewport_visual_layer::designation,
-		visual_render_groupst::designation,false,true,8}
+		visual_render_groupst::designation,false,true,8,0,0}
 	};
 
 constexpr bool valid_visual_layer_descriptors()
@@ -497,6 +499,10 @@ class visual_animation_managerst
 							const int32_t target=x*input.dim_y+y;
 							const int32_t texpos=current[target];
 							if(texpos==0)continue;
+							if(static_cast<viewport_visual_layer>(layer)==
+								viewport_visual_layer::item&&
+								input.previous[static_cast<size_t>(
+									viewport_visual_layer::center)][target]!=0)continue;
 
 							int32_t source=-1;
 							int32_t candidate_count=0;
