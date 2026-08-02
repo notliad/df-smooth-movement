@@ -114,7 +114,7 @@ bool has_pan_context=false;
 // writes: purely a per-landing render animation, eased with the same 100 ms smoothstep as creature
 // movement so world-anchored creatures and terrain stay in lockstep.
 constexpr double slide_max_tiles=4.0;         // beyond this the view just steps (fast scrolling)
-constexpr uint32_t slide_duration_ms=100;
+uint32_t slide_duration_ms=100;               // debug-tunable: `smooth-movement slidems <n>`
 double slide_from_x=0.0;                      // pixel offset at slide start
 double slide_from_y=0.0;
 uint32_t slide_start_ms=0;
@@ -1347,6 +1347,19 @@ command_result status_command(
 			animation_manager.stats.last_pending_dx,
 			animation_manager.stats.last_pending_dy);
 		return CR_OK;
+		}
+	if(parameters[0]=="slidems"&&parameters.size()==2)
+		{
+		// Debug: stretch the slide to make its rendering inspectable by eye/screenshot.
+		try
+			{
+			slide_duration_ms=uint32_t(std::stoul(parameters[1]));
+			return CR_OK;
+			}
+		catch(...)
+			{
+			return CR_WRONG_USAGE;
+			}
 		}
 	if(parameters[0]=="trace")
 		{
