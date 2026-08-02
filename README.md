@@ -77,6 +77,19 @@ cmake --build /path/to/dfhack-build --target smooth-movement-test
 ## Behavior
 
 - Movement uses a 100 ms smoothstep interpolation.
+- Adventure mode: the camera follows the player, so every step is a map scroll.
+  Scroll landings are attributed on the background layer, and creatures moving
+  during a scroll animate relative to the world (shift-aware detection). The
+  player is deliberately NOT interpolated: it is screen-static across each
+  landing ("pinned"), and instead the WORLD TILES slide -- the whole map glides
+  to its new position with the same 100 ms smoothstep, moving beneath the
+  pinned player. One-frame window excursions (combat camera flicks) are ridden
+  out without resets, and scrolls that never render as a buffer diff are
+  absorbed instead of poisoning later attribution.
+- While the world slides, mouse clicks and the hover highlight dispatch to the
+  tile displayed under the cursor (the map screens' input runs with the pixel
+  mouse shifted into the displayed frame; the interface-grid mouse and UI
+  widgets are unaffected).
 - Creature status icons move with their creature, including while flashing.
 - Item-layer wheelbarrows and vehicle-layer minecarts are interpolated.
 - Camera panning is followed: in-flight interpolations are translated by the

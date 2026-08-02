@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Adventure mode support, world-slide style. Scroll landings are attributed on the
+  background layer (largest applied prefix), so creatures moving during a
+  camera-follow scroll animate relative to the world. The player is not interpolated:
+  sprites that stay screen-static across a landing are "pinned" and the WORLD TILES
+  slide instead -- the map glides to its new position with the same 100 ms smoothstep
+  as creature movement, passing beneath the pinned player. No camera state, no
+  persistent offsets, no window writes.
+- One-frame window excursions (combat/announcement camera flicks, common near
+  loaded-chunk borders) are ridden out with animations and the slide intact; scrolls
+  masked by untrusted frames are absorbed after a grace period; teleports still snap.
+- Mouse clicks and the hover highlight dispatch to the displayed tile while the world
+  slides (scoped precise_mouse shift around the map screens' input; UI grid untouched).
+- Diagnostic counters and a per-frame trace (`smooth-movement trace`), including a
+  visual-continuity jump detector.
+
 - Animate creature status icons with their creature instead of letting their
   flashing texture fragments jump between tiles.
 - Animate item-layer wheelbarrows and the vehicle layer used by minecarts;
