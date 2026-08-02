@@ -691,6 +691,10 @@ std::vector<render_proxyst> collect_proxies(
 					visual_layer==viewport_creature_layer::designation)&&
 					movement.inherited)
 					{
+					// A sprite that reappeared exactly where a creature stood last frame
+					// was UN-OCCLUDED as it walked away, not carried along: never ride it
+					// on the walker's motion (dense item scatter otherwise hitches rides).
+					if(vp->screentexpos_old[index]!=0)continue;
 					const int32_t source_x=x-
 						((x>movement.source_x)-(x<movement.source_x));
 					const int32_t source_y=y-

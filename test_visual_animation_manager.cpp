@@ -468,6 +468,75 @@ int main()
 	status=companion.get_movement(viewport,viewport_creature_layer::designation,1,0);
 	assert(status.active&&status.progress==0.5f);
 
+	// A ground item lying NEXT to a walker must not inherit its motion: inheritance is
+	// only for overlays on the creature's own tile. (This was the "items jump around"
+	// bug: adjacent-tile companions dragged loose items along the walker's vector.)
+	{
+	std::array<int32_t,9> ground_current{};
+	std::array<int32_t,9> ground_previous{};
+	current.fill(0);
+	previous.fill(0);
+	input.current.fill(empty.data());
+	input.previous.fill(empty.data());
+	input.current[static_cast<size_t>(viewport_creature_layer::center)]=current.data();
+	input.previous[static_cast<size_t>(viewport_creature_layer::center)]=previous.data();
+	input.current[static_cast<size_t>(viewport_creature_layer::item)]=ground_current.data();
+	input.previous[static_cast<size_t>(viewport_creature_layer::item)]=ground_previous.data();
+	visual_animation_managerst ground;
+	ground_previous[0*3+0]=88;           // a rock on the ground at (0,0)...
+	ground_current[0*3+0]=88;            // ...that never moves
+	ground.begin_frame(13990);
+	ground.synchronize_viewport(input,true);
+	ground.end_frame();
+	previous[0*3+1]=42;                  // a creature walks (0,1) -> (1,1), passing by
+	current[1*3+1]=42;
+	ground.begin_frame(14000);
+	ground.synchronize_viewport(input,true);
+	ground.end_frame();
+	assert(ground.get_movement(viewport,viewport_creature_layer::center,1,1).active);
+	// The manager may offer the neighbor an INHERITED companion movement, but it must be
+	// marked as such: the renderer only draws inherited overlays whose sprite really moved
+	// between tiles (visual_moved_between_tiles), which a static ground item never does.
+	{
+	const auto loose=ground.get_movement(viewport,viewport_creature_layer::item,0,0);
+	assert(!loose.active||loose.inherited);
+	}
+	}
+
+	// UN-OCCLUSION: a creature walking along two identical ground items hides the one it
+	// stands on each frame. The reappear/vanish pair must NOT read as the item hopping
+	// between tiles -- the "new" item sits exactly where the creature stood last frame.
+	{
+	std::array<int32_t,9> occ_items_current{};
+	std::array<int32_t,9> occ_items_previous{};
+	current.fill(0);
+	previous.fill(0);
+	input.current.fill(empty.data());
+	input.previous.fill(empty.data());
+	input.current[static_cast<size_t>(viewport_creature_layer::center)]=current.data();
+	input.previous[static_cast<size_t>(viewport_creature_layer::center)]=previous.data();
+	input.current[static_cast<size_t>(viewport_creature_layer::item)]=occ_items_current.data();
+	input.previous[static_cast<size_t>(viewport_creature_layer::item)]=occ_items_previous.data();
+	visual_animation_managerst occlusion;
+	previous[0*3+1]=42;                  // creature stands on item #1 at (0,1)...
+	occ_items_previous[1*3+1]=77;        // ...so only item #2 at (1,1) is visible
+	current[1*3+1]=42;                   // it steps onto item #2:
+	occ_items_current[0*3+1]=77;         // item #1 reappears, item #2 is hidden
+	occlusion.begin_frame(14990);
+	occlusion.synchronize_viewport(input,true);
+	occlusion.end_frame();
+	occlusion.begin_frame(15000);
+	occlusion.synchronize_viewport(input,true);
+	occlusion.end_frame();
+	// The gate kills the item-layer OWN movement (which would draw unconditionally);
+	// only an inherited companion may remain, and the renderer's moved-between-tiles
+	// guard rejects drawing those for sprites that did not really travel.
+	{
+	const auto hop=occlusion.get_movement(viewport,viewport_creature_layer::item,0,1);
+	assert(!hop.active||hop.inherited);
+	}
+	}
+
 	// Divergent nearby creature movements make companion ownership ambiguous, so the overlay snaps.
 	current.fill(0);
 	previous.fill(0);

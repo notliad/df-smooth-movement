@@ -610,6 +610,16 @@ class visual_animation_managerst
 							if(prev_x<0||prev_x>=input.dim_x||
 								prev_y<0||prev_y>=input.dim_y)continue;
 							if(previous[prev_x*input.dim_y+prev_y]!=0)continue;
+							// An item "appearing" where a creature stood last frame is
+							// the creature UN-OCCLUDING it as it walks away, not an item
+							// move -- otherwise walking along a line of similar items
+							// reads as the items hopping from tile to tile behind the
+							// walker.
+							if(static_cast<viewport_creature_layer>(layer)==
+								viewport_creature_layer::item&&
+								input.previous[static_cast<size_t>(
+									viewport_creature_layer::center)]
+									[prev_x*input.dim_y+prev_y]!=0)continue;
 
 							int32_t source=-1;
 							int32_t candidate_count=0;
