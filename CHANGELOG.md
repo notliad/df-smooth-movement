@@ -14,6 +14,9 @@
   masked by untrusted frames are absorbed after a grace period; teleports still snap.
 - Mouse clicks and the hover highlight dispatch to the displayed tile while the world
   slides (scoped precise_mouse shift around the map screens' input; UI grid untouched).
+- Middle-mouse drag pans stay direct: world-slide animation is suspended while the
+  button is held and for a few frames after release (the drag's final window steps
+  land late and would otherwise bounce the view back).
 - Diagnostic counters and a per-frame trace (`smooth-movement trace`), including a
   visual-continuity jump detector.
 

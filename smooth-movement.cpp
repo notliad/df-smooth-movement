@@ -122,6 +122,7 @@ bool slide_active=false;
 bool slide_was_offset=false;                  // edge-detects offset->0 for one cleanup redraw
 uint64_t slide_resets_seen=0;                 // manager resets cancel the slide
 uint64_t slide_revision_seen=0;               // context changes cancel the slide
+int32_t slide_drag_cooldown=0;                // frames after a drag whose landings don't slide
 
 double slide_offset_now(uint32_t now_ms,double from)
 {
@@ -650,6 +651,17 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		slide_active=false;   // unfollowable change: the world snaps to the grid
 	slide_resets_seen=animation_manager.stats.resets;
 	slide_revision_seen=visual_context_revision;
+	// A middle-mouse drag is a direct manipulation: the view must track the mouse
+	// crisply, so the slide sits out while the button is held -- and for a few frames
+	// after release, since the drag's final window steps land in the buffers late and
+	// would otherwise bounce the view back as a parting slide.
+	const bool dragging=enabler!=nullptr&&enabler->mouse_mbut;
+	if(dragging)
+		{
+		slide_active=false;
+		slide_drag_cooldown=3;
+		}
+	else if(slide_drag_cooldown>0)--slide_drag_cooldown;
 	double slide_now_x=slide_offset_now(now_ms,slide_from_x);
 	double slide_now_y=slide_offset_now(now_ms,slide_from_y);
 	if(slide_active&&now_ms-slide_start_ms>=slide_duration_ms)
@@ -658,7 +670,8 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		slide_now_x=0.0;
 		slide_now_y=0.0;
 		}
-	if(animation_manager.stats.last_shift_x!=0||animation_manager.stats.last_shift_y!=0)
+	if((animation_manager.stats.last_shift_x!=0||animation_manager.stats.last_shift_y!=0)&&
+		!dragging&&slide_drag_cooldown==0)
 		{
 		// A scroll landed this frame: the content jumped by -shift tiles on screen. Start
 		// (or retarget from the current fractional offset) a slide back to the grid.
@@ -1114,6 +1127,7 @@ void reset_state()
 	slide_was_offset=false;
 	slide_resets_seen=0;
 	slide_revision_seen=0;
+	slide_drag_cooldown=0;
 }
 
 command_result status_command(
