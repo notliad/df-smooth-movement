@@ -146,6 +146,11 @@ strip_cachest strip_caches[2];
 int strip_cache_front=0;
 uint64_t stat_strip_draws=0;    // cached strip tiles drawn under the slide's trailing edge
 uint64_t stat_strip_misses=0;   // cached texpos with no tile-cache texture (stays black)
+// The engine's tile cache is keyed by (texpos, tint colors, flags) and terrain tints vary per
+// tile, so an exact-recipe lookup misses. Departed tiles were just on screen, so SOME recipe for
+// their texpos is cached: remember which full key worked per texpos and re-find it fresh each
+// draw (never holding the SDL texture across frames). Flushed on context changes.
+std::unordered_map<int32_t,df::texture_fullid> strip_recipe_memo;
 
 int32_t strip_index(const strip_cachest &cache,int32_t x,int32_t y)
 {
@@ -222,14 +227,27 @@ void draw_strip_tile(
 		{
 		const int32_t texpos=cache.layers[layer][index];
 		if(texpos==0)continue;
-		df::texture_fullid texture_id;
-		texture_id.texpos=texpos;
-		texture_id.r=texture_id.g=texture_id.b=1.0f;
-		texture_id.br=texture_id.bg=texture_id.bb=0.0f;
-		if(layer!=0)
-			texture_id.flag=df::texture_fullid_flag::mask_transparent_background;
-		const auto texture=renderer->tile_cache.tile_cache.find(texture_id);
-		if(texture==renderer->tile_cache.tile_cache.end())
+		auto &tiles=renderer->tile_cache.tile_cache;
+		auto texture=tiles.end();
+		const auto memo=strip_recipe_memo.find(texpos);
+		if(memo!=strip_recipe_memo.end())
+			{
+			texture=tiles.find(memo->second);
+			if(texture==tiles.end())strip_recipe_memo.erase(texpos);
+			}
+		if(texture==tiles.end())
+			{
+			for(auto it=tiles.begin();it!=tiles.end();++it)
+				{
+				if(it->first.texpos==texpos)
+					{
+					texture=it;
+					strip_recipe_memo[texpos]=it->first;
+					break;
+					}
+				}
+			}
+		if(texture==tiles.end())
 			{
 			++stat_strip_misses;
 			continue;
@@ -777,6 +795,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		{
 		slide_active=false;   // unfollowable change: the world snaps to the grid
 		strip_cache_invalidate();
+		strip_recipe_memo.clear();
 		}
 	slide_resets_seen=animation_manager.stats.resets;
 	slide_revision_seen=visual_context_revision;
@@ -828,7 +847,8 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	const double visual_y=-double(window_y?*window_y:0)*cam_tile+slide_now_y;
 	last_jump_x=0.0f;
 	last_jump_y=0.0f;
-	if(has_prev_visual&&prev_visual_revision==visual_context_revision)
+	if(has_prev_visual&&prev_visual_revision==visual_context_revision&&
+		!dragging&&slide_drag_cooldown==0)
 		{
 		const double dvx=visual_x-prev_visual_x;
 		const double dvy=visual_y-prev_visual_y;
@@ -1287,6 +1307,7 @@ void reset_state()
 	slide_revision_seen=0;
 	slide_drag_cooldown=0;
 	strip_cache_invalidate();
+	strip_recipe_memo.clear();
 	stat_strip_draws=0;
 	stat_strip_misses=0;
 }
