@@ -124,6 +124,132 @@ uint64_t slide_resets_seen=0;                 // manager resets cancel the slide
 uint64_t slide_revision_seen=0;               // context changes cancel the slide
 int32_t slide_drag_cooldown=0;                // frames after a drag whose landings don't slide
 
+// --- outgoing-tile cache -------------------------------------------------------------------------
+// While the world slides, the trailing screen edge shows tiles that have already scrolled OUT of
+// the viewport buffers; without help they render black until the slide lands. At each landing the
+// pre-scroll frame still sits in the engine's *_old buffers, so a padded cache in the CURRENT
+// window's coordinate frame is rebuilt from them -- chaining the previous cache so stacked
+// landings keep up to `strip_pad` tiles of departed world alive -- and the renderer draws the
+// trailing band from it.
+int32_t tile_pixel(int32_t tile,int32_t origin,int32_t zoom);
+
+constexpr int32_t strip_pad=int32_t(slide_max_tiles);
+constexpr size_t strip_layer_count=10;
+struct strip_cachest
+{
+	int32_t dim_x=0;
+	int32_t dim_y=0;
+	bool valid=false;
+	std::array<std::vector<int32_t>,strip_layer_count> layers;
+};
+strip_cachest strip_caches[2];
+int strip_cache_front=0;
+uint64_t stat_strip_draws=0;    // cached strip tiles drawn under the slide's trailing edge
+uint64_t stat_strip_misses=0;   // cached texpos with no tile-cache texture (stays black)
+
+int32_t strip_index(const strip_cachest &cache,int32_t x,int32_t y)
+{
+	return (x+strip_pad)*(cache.dim_y+2*strip_pad)+(y+strip_pad);
+}
+
+std::array<const int32_t *,strip_layer_count> strip_old_layers(df::graphic_viewportst *vp)
+{
+	return {
+		vp->screentexpos_background_old,
+		vp->screentexpos_background_two_old,
+		vp->screentexpos_building_one_old,
+		vp->screentexpos_item_old,
+		vp->screentexpos_vehicle_old,
+		vp->screentexpos_vermin_old,
+		vp->screentexpos_right_creature_old,
+		vp->screentexpos_old,
+		vp->screentexpos_left_creature_old,
+		vp->screentexpos_building_two_old
+		};
+}
+
+void strip_cache_invalidate()
+{
+	strip_caches[0].valid=false;
+	strip_caches[1].valid=false;
+}
+
+// Rebuild the cache in the new window's coordinate frame: the freshly departed strip comes from
+// the *_old buffers (the pre-landing frame), older strips ride over from the previous cache.
+void strip_cache_update(df::graphic_viewportst *vp,int32_t shift_x,int32_t shift_y)
+{
+	strip_cachest &prev=strip_caches[strip_cache_front];
+	strip_cachest &next=strip_caches[1-strip_cache_front];
+	next.dim_x=vp->dim_x;
+	next.dim_y=vp->dim_y;
+	const size_t cells=size_t(vp->dim_x+2*strip_pad)*size_t(vp->dim_y+2*strip_pad);
+	const bool chain=prev.valid&&prev.dim_x==vp->dim_x&&prev.dim_y==vp->dim_y;
+	const auto old_layers=strip_old_layers(vp);
+	for(size_t layer=0;layer<strip_layer_count;++layer)
+		{
+		next.layers[layer].assign(cells,0);
+		for(int32_t x=-strip_pad;x<vp->dim_x+strip_pad;++x)
+			{
+			for(int32_t y=-strip_pad;y<vp->dim_y+strip_pad;++y)
+				{
+				const int32_t sx=x+shift_x;
+				const int32_t sy=y+shift_y;
+				int32_t value=0;
+				if(sx>=0&&sx<vp->dim_x&&sy>=0&&sy<vp->dim_y)
+					value=old_layers[layer][sx*vp->dim_y+sy];
+				else if(chain&&sx>=-strip_pad&&sx<vp->dim_x+strip_pad&&
+					sy>=-strip_pad&&sy<vp->dim_y+strip_pad)
+					value=prev.layers[layer][strip_index(prev,sx,sy)];
+				next.layers[layer][strip_index(next,x,y)]=value;
+				}
+			}
+		}
+	next.valid=true;
+	strip_cache_front=1-strip_cache_front;
+}
+
+void draw_strip_tile(
+	df::renderer_2d_base *renderer,
+	SDL_Renderer *sdl_renderer,
+	const strip_cachest &cache,
+	int32_t x,
+	int32_t y,
+	int32_t zoom,
+	int32_t tile_size)
+{
+	const int32_t index=strip_index(cache,x,y);
+	for(size_t layer=0;layer<strip_layer_count;++layer)
+		{
+		const int32_t texpos=cache.layers[layer][index];
+		if(texpos==0)continue;
+		df::texture_fullid texture_id;
+		texture_id.texpos=texpos;
+		texture_id.r=texture_id.g=texture_id.b=1.0f;
+		texture_id.br=texture_id.bg=texture_id.bb=0.0f;
+		if(layer!=0)
+			texture_id.flag=df::texture_fullid_flag::mask_transparent_background;
+		const auto texture=renderer->tile_cache.tile_cache.find(texture_id);
+		if(texture==renderer->tile_cache.tile_cache.end())
+			{
+			++stat_strip_misses;
+			continue;
+			}
+		const SDL_FRect destination=
+			{
+			float(tile_pixel(x,renderer->origin_x,zoom)),
+			float(tile_pixel(y,renderer->origin_y,zoom)),
+			float(tile_size),
+			float(tile_size)
+			};
+		render_copy_f(
+			sdl_renderer,
+			static_cast<SDL_Texture *>(texture->second),
+			nullptr,
+			&destination);
+		++stat_strip_draws;
+		}
+}
+
 double slide_offset_now(uint32_t now_ms,double from)
 {
 	if(!slide_active)return 0.0;
@@ -648,7 +774,10 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	const uint32_t now_ms=animation_manager.get_frame_time_ms();
 	if(animation_manager.stats.resets!=slide_resets_seen||
 		visual_context_revision!=slide_revision_seen)
+		{
 		slide_active=false;   // unfollowable change: the world snaps to the grid
+		strip_cache_invalidate();
+		}
 	slide_resets_seen=animation_manager.stats.resets;
 	slide_revision_seen=visual_context_revision;
 	// A middle-mouse drag is a direct manipulation: the view must track the mouse
@@ -670,6 +799,11 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		slide_now_x=0.0;
 		slide_now_y=0.0;
 		}
+	if(animation_manager.stats.last_shift_x!=0||animation_manager.stats.last_shift_y!=0)
+		strip_cache_update(
+			vp,
+			animation_manager.stats.last_shift_x,
+			animation_manager.stats.last_shift_y);
 	if((animation_manager.stats.last_shift_x!=0||animation_manager.stats.last_shift_y!=0)&&
 		!dragging&&slide_drag_cooldown==0)
 		{
@@ -788,6 +922,30 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 			for(int32_t y=vp->clipy[0];y<=vp->clipy[1];++y)
 				redraw_world_tile(renderer,vp,x,y,selected);
 			}
+		// Trailing edge: the band uncovered by the slide has no viewport data any more --
+		// draw it from the outgoing-tile cache so departed world stays visible while the
+		// slide lands (the clip rect confines any overdraw to the map).
+		{
+		const strip_cachest &strip=strip_caches[strip_cache_front];
+		if(strip.valid&&strip.dim_x==vp->dim_x&&strip.dim_y==vp->dim_y)
+			{
+			const int32_t band_w=std::min(strip_pad,glide_x>0?(glide_x+tile_size-1)/tile_size:0);
+			const int32_t band_e=std::min(strip_pad,glide_x<0?(-glide_x+tile_size-1)/tile_size:0);
+			const int32_t band_n=std::min(strip_pad,glide_y>0?(glide_y+tile_size-1)/tile_size:0);
+			const int32_t band_s=std::min(strip_pad,glide_y<0?(-glide_y+tile_size-1)/tile_size:0);
+			for(int32_t x=vp->clipx[0]-band_w;x<=vp->clipx[1]+band_e;++x)
+				{
+				for(int32_t y=vp->clipy[0]-band_n;y<=vp->clipy[1]+band_s;++y)
+					{
+					if(x>=vp->clipx[0]&&x<=vp->clipx[1]&&
+						y>=vp->clipy[0]&&y<=vp->clipy[1])continue;
+					if(x<-strip_pad||x>=vp->dim_x+strip_pad||
+						y<-strip_pad||y>=vp->dim_y+strip_pad)continue;
+					draw_strip_tile(renderer,sdl_renderer,strip,x,y,zoom,tile_size);
+					}
+				}
+			}
+		}
 		for(const render_proxyst &proxy:proxies)
 			{
 			if(proxy.layer==viewport_creature_layer::item)draw_proxy(renderer,proxy);
@@ -1128,6 +1286,9 @@ void reset_state()
 	slide_resets_seen=0;
 	slide_revision_seen=0;
 	slide_drag_cooldown=0;
+	strip_cache_invalidate();
+	stat_strip_draws=0;
+	stat_strip_misses=0;
 }
 
 command_result status_command(
@@ -1154,6 +1315,7 @@ command_result status_command(
 			stat_cache_misses);
 		out.print("glide frames: {}, shifted input dispatches: {}, visual jumps: {}\n",
 			stat_glide_frames,stat_mouse_shifts,stat_visual_jumps);
+		out.print("strip: draws {} cache-misses {}\n",stat_strip_draws,stat_strip_misses);
 		out.print(
 			"scroll: pans {} static {} identical {} unrecognized {} absorbed {} pending {} {}\n",
 			animation_manager.stats.pan_frames,

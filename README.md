@@ -88,6 +88,10 @@ cmake --build /path/to/dfhack-build --target smooth-movement-test
   absorbed instead of poisoning later attribution.
 - Middle-mouse drag panning is direct: the slide sits out while the button is
   held (and briefly after), so the view tracks the mouse crisply.
+- The slide's trailing edge stays visible: tiles that scroll out of the
+  viewport buffers are kept in a small world-anchored cache (rebuilt from the
+  engine's previous-frame buffers at each landing) and drawn under the
+  uncovered band until the slide lands, instead of flashing black.
 - While the world slides, mouse clicks and the hover highlight dispatch to the
   tile displayed under the cursor (the map screens' input runs with the pixel
   mouse shifted into the displayed frame; the interface-grid mouse and UI
