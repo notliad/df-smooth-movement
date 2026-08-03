@@ -1,28 +1,29 @@
 # Changelog
 
-## Unreleased
+## Unreleased (adventure-slide)
 
 - Adventure mode support, world-slide style. Scroll landings are attributed on the
   background layer (largest applied prefix), so creatures moving during a
   camera-follow scroll animate relative to the world. The player is not interpolated:
   sprites that stay screen-static across a landing are "pinned" and the WORLD TILES
-  slide instead -- the map glides to its new position with the same 100 ms smoothstep
-  as creature movement, passing beneath the pinned player. No camera state, no
-  persistent offsets, no window writes.
-- One-frame window excursions (combat/announcement camera flicks, common near
-  loaded-chunk borders) are ridden out with animations and the slide intact; scrolls
-  masked by untrusted frames are absorbed after a grace period; teleports still snap.
-- Mouse clicks and the hover highlight dispatch to the displayed tile while the world
-  slides (scoped precise_mouse shift around the map screens' input; UI grid untouched).
-- The slide's trailing edge draws departed tiles from an outgoing-tile cache (padded,
-  world-anchored, chained across stacked landings) instead of rendering black while
-  the world catches up.
-- Middle-mouse drag pans stay direct: world-slide animation is suspended while the
-  button is held and for a few frames after release (the drag's final window steps
-  land late and would otherwise bounce the view back).
-- Diagnostic counters and a per-frame trace (`smooth-movement trace`), including a
-  visual-continuity jump detector.
+  slide instead -- the map glides to its new position with the creature-movement
+  smoothstep, passing beneath the pinned player.
+- The slide's trailing edge draws departed tiles from an outgoing-tile cache instead
+  of rendering black; middle-mouse drag pans suspend the slide; ground items no
+  longer hop behind walkers (un-occlusion gating at both detection and inheritance).
+- One-frame window excursions are ridden out; masked/phantom scrolls are absorbed;
+  clicks dispatch to the displayed tile mid-slide; diagnostics (`trace`, visual-jump
+  detector, `slidems`).
+- The fortress-mode free camera (`camera on|off|reset|<fx> <fy>|speed <ms>`) is
+  available again: glide + pixel-perfect middle-drag + sub-tile rest, fortress mode
+  only (adventure mode uses the world slide).
 
+## Unreleased
+
+- Target DFHack `develop` and reuse DFHack's SDL library handle instead of
+  independently opening and closing SDL.
+- Centralize viewport layer metadata, redraw stages, SDL bindings, and pending
+  state cleanup to remove duplicated rendering policy.
 - Animate creature status icons with their creature instead of letting their
   flashing texture fragments jump between tiles.
 - Animate item-layer wheelbarrows and the vehicle layer used by minecarts;

@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: MIT
 
+#include "Core.h"
+#include "MemAccess.h"
 #include "PluginManager.h"
 #include "VTableInterpose.h"
 
+#include "modules/DFSDL.h"
+#include "modules/Maps.h"
+
 #include "df/enabler.h"
+#include "df/game_mode.h"
 #include "df/graphic.h"
 #include "df/graphic_viewportst.h"
 #include "df/interface_key.h"
@@ -12,10 +18,10 @@
 #include "df/viewscreen_dungeonmodest.h"
 #include "df/viewscreen_dwarfmodest.h"
 
+#include "TileTypes.h"
 #include "visual_animation.h"
 
 #include <SDL_render.h>
-#include <SDL_timer.h>
 
 #include <algorithm>
 #include <array>
@@ -23,6 +29,7 @@
 #include <cstdint>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -33,6 +40,7 @@ DFHACK_PLUGIN("smooth-movement");
 DFHACK_PLUGIN_IS_ENABLED(is_enabled);
 
 REQUIRE_GLOBAL(enabler);
+REQUIRE_GLOBAL(gamemode);
 REQUIRE_GLOBAL(gps);
 REQUIRE_GLOBAL(window_x);
 REQUIRE_GLOBAL(window_y);
@@ -41,7 +49,6 @@ REQUIRE_GLOBAL(window_z);
 namespace {
 
 constexpr const char *plugin_version="0.4.0-dev";
-
 #ifdef WIN32
 constexpr const char *sdl_library="SDL2.dll";
 #else
@@ -50,35 +57,107 @@ constexpr const char *sdl_library="libSDL2-2.0.so.0";
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 DFLibrary *sdl_handle=nullptr;
-using RenderCopyF=int (*)(SDL_Renderer *,SDL_Texture *,const SDL_Rect *,const SDL_FRect *);
-using RenderFillRect=int (*)(SDL_Renderer *,const SDL_Rect *);
-using RenderSetClipRect=int (*)(SDL_Renderer *,const SDL_Rect *);
-using GetRenderDrawColor=int (*)(SDL_Renderer *,Uint8 *,Uint8 *,Uint8 *,Uint8 *);
-using SetRenderDrawColor=int (*)(SDL_Renderer *,Uint8,Uint8,Uint8,Uint8);
-using GetTicks=Uint32 (*)();
-RenderCopyF render_copy_f=nullptr;
-RenderFillRect render_fill_rect=nullptr;
-RenderSetClipRect render_set_clip_rect=nullptr;
-GetRenderDrawColor get_render_draw_color=nullptr;
-SetRenderDrawColor set_render_draw_color=nullptr;
-GetTicks get_ticks=nullptr;
+decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
+decltype(&SDL_RenderFillRect) render_fill_rect=nullptr;
+decltype(&SDL_RenderSetClipRect) render_set_clip_rect=nullptr;
+decltype(&SDL_GetRenderDrawColor) get_render_draw_color=nullptr;
+decltype(&SDL_SetRenderDrawColor) set_render_draw_color=nullptr;
+decltype(&SDL_GetTextureAlphaMod) get_texture_alpha_mod=nullptr;
+decltype(&SDL_SetTextureAlphaMod) set_texture_alpha_mod=nullptr;
+decltype(&SDL_GetTextureBlendMode) get_texture_blend_mode=nullptr;
+decltype(&SDL_SetTextureBlendMode) set_texture_blend_mode=nullptr;
 
 visual_animation_managerst animation_manager;
-uint64_t stat_proxies=0;        // interpolated sprites actually drawn
-uint64_t stat_cache_misses=0;   // active movements dropped: texture not in the tile cache
-uint64_t stat_glide_frames=0;   // frames the world was drawn at a sub-tile camera offset
-uint64_t stat_mouse_shifts=0;   // input dispatches corrected for the visual camera offset
-uint32_t last_sig_diff=0;       // bitmask: which context-signature fields changed this frame
-uint64_t stat_visual_jumps=0;   // frames the drawn world position moved > 0.6 tile at once
-double prev_visual_x=0.0;       // drawn world offset last frame, pixels
+std::set<std::pair<int32_t,int32_t>> previous_coverage;
+uint64_t visual_context_revision=0;
+const void *previous_viewport=nullptr;
+std::array<int32_t,12> previous_view_signature{};
+bool has_view_signature=false;
+// Map scroll (window_x/window_y) is tracked separately from the reset signature: a pure pan is
+// followed (movements are translated) instead of triggering a full reset, so it must NOT bump the
+// context revision. It only invalidates the viewport-space blackout coverage from the prior frame.
+int32_t previous_pan_x=0;
+int32_t previous_pan_y=0;
+bool has_pan_context=false;
+bool construction_transitions_enabled=false;
+
+// --- free camera -------------------------------------------------------------------------------
+// The camera is visually unbound from the tile grid. Two layered offsets:
+//   rest      -- a PERSISTENT sub-tile offset in tiles: the free camera. Set by pixel-perfect
+//                middle-mouse drag panning (the view rests wherever released, mid-tile or not)
+//                and by the `smooth-movement camera <fx> <fy>` console command. Survives zoom
+//                and z-level changes. Kept in [-0.5,0.5] by normalization: whole-tile parts are
+//                folded into window_x/window_y (a plain UI scroll write -- NEVER the viewport
+//                dims, which crash DF; the sub-tile strip this leaves at one screen edge has no
+//                buffer data and stays black).
+//   transient -- the decaying scroll glide from before, in pixels, layered on top.
+// Render offset = transient + rest*tile. window_x/window_y remain the game's own tile camera.
+bool camera_enabled=false;                    // OFF by default: plain `enable smooth-movement`
+                                              // keeps upstream behavior (creature interpolation
+                                              // only); `smooth-movement camera on` opts in.
+constexpr int32_t camera_max_glide_tiles=3;   // per-jump: farther than this snaps instantly
+constexpr double camera_tau_ms=35.0;          // transient catch-up (~95% done after 100ms)
+double transient_x=0.0;                       // decaying glide offset, pixels
+double transient_y=0.0;
+double rest_x=0.0;                            // persistent free-camera offset, tiles
+double rest_y=0.0;                            // (positive = view sits WEST/NORTH of window)
+int32_t camera_pending_dx=0;                  // scroll delta announced but not yet in the buffers
+int32_t camera_pending_dy=0;
+int32_t camera_pending_frames=0;
+int32_t self_scroll_x=0;                      // window deltas WE wrote: visual no-ops when landing
+int32_t self_scroll_y=0;
+bool drag_active=false;
+double drag_anchor_vx=0.0;                    // visual camera at drag start, tiles
+double drag_anchor_vy=0.0;
+int32_t drag_anchor_mx=0;                     // precise mouse at drag start, pixels
+int32_t drag_anchor_my=0;
+bool camera_was_offset=false;                 // edge-detects offset->0 for one cleanup redraw
+int32_t camera_prev_wx=0;                     // window-scroll observation baseline
+int32_t camera_prev_wy=0;
+bool camera_has_prev=false;
+
+bool adventure_mode()
+{
+	return gamemode!=nullptr&&*gamemode==df::game_mode::ADVENTURE;
+}
+
+// --- world-tile slide ---------------------------------------------------------------------------
+// Adventure mode's smoothing: the camera stays locked to the character and the WORLD TILES glide.
+// When a scroll lands, the content jumped by -shift tiles on screen; the slide draws the world at
+// a decaying pixel offset (same 100 ms smoothstep as creature movement, so world-anchored sprites
+// and terrain stay in lockstep) while camera-carried sprites -- the player, screen-static across
+// the landing, reported by the manager as "pinned" -- draw WITHOUT the offset. Active whenever the
+// fortress free camera is not (the camera owns fort-mode smoothing when enabled).
+constexpr double slide_max_tiles=4.0;         // beyond this the view just steps (fast scrolling)
+uint32_t slide_duration_ms=100;               // debug-tunable: `smooth-movement slidems <n>`
+double slide_from_x=0.0;                      // pixel offset at slide start
+double slide_from_y=0.0;
+uint32_t slide_start_ms=0;
+bool slide_active=false;
+uint64_t slide_resets_seen=0;                 // manager resets cancel the slide
+uint64_t slide_revision_seen=0;               // context changes cancel the slide
+int32_t slide_drag_cooldown=0;                // frames after a drag whose landings don't slide
+
+uint64_t stat_glide_frames=0;   // frames the world was drawn at a sub-tile offset
+uint64_t stat_mouse_shifts=0;   // input dispatches corrected for the visual offset
+uint64_t stat_visual_jumps=0;   // frames the drawn world moved > 0.6 tile at once
+double prev_visual_x=0.0;
 double prev_visual_y=0.0;
 bool has_prev_visual=false;
 uint64_t prev_visual_revision=0;
-float last_jump_x=0.0f;         // this frame's discontinuity, for the trace row
+float last_jump_x=0.0f;
 float last_jump_y=0.0f;
+uint32_t last_sig_diff=0;       // bitmask: context-signature fields changed this frame
 
-// Per-frame diagnostic trace (dump with `smooth-movement trace`): enough to reconstruct what
-// the window, the context signature, the manager and the camera did around a glitch.
+double slide_offset_now(uint32_t now_ms,double from)
+{
+	if(!slide_active)return 0.0;
+	const double t=std::min(1.0,double(now_ms-slide_start_ms)/double(slide_duration_ms));
+	const double ease=1.0-t*t*(3.0-2.0*t);
+	return from*ease;
+}
+
+// Per-frame diagnostic trace (dump with `smooth-movement trace`).
 struct trace_framest
 {
 	uint32_t frame;
@@ -93,46 +172,15 @@ struct trace_framest
 constexpr size_t trace_capacity=2700;
 std::array<trace_framest,trace_capacity> trace_ring{};
 uint32_t trace_frames=0;
-std::set<std::pair<int32_t,int32_t>> previous_coverage;
-uint64_t visual_context_revision=0;
-const void *previous_viewport=nullptr;
-std::array<int32_t,12> previous_view_signature{};
-bool has_view_signature=false;
-// Map scroll (window_x/window_y) is tracked separately from the reset signature: a pure pan is
-// followed (movements are translated) instead of triggering a full reset, so it must NOT bump the
-// context revision. It only invalidates the viewport-space blackout coverage from the prior frame.
-int32_t previous_pan_x=0;
-int32_t previous_pan_y=0;
-bool has_pan_context=false;
 
-// --- world-tile slide ---------------------------------------------------------------------------
-// When a map scroll lands, the world content jumps by -shift tiles on screen. The slide draws the
-// world (terrain and everything world-anchored) at a decaying pixel offset so it visibly GLIDES to
-// its new position instead of stepping -- while sprites the camera carries (the adventure-mode
-// player: screen-static across the landing, reported by the manager as "pinned") are drawn WITHOUT
-// the offset, so the world moves under them. No camera state, no persistent offsets, no window
-// writes: purely a per-landing render animation, eased with the same 100 ms smoothstep as creature
-// movement so world-anchored creatures and terrain stay in lockstep.
-constexpr double slide_max_tiles=4.0;         // beyond this the view just steps (fast scrolling)
-uint32_t slide_duration_ms=100;               // debug-tunable: `smooth-movement slidems <n>`
-double slide_from_x=0.0;                      // pixel offset at slide start
-double slide_from_y=0.0;
-uint32_t slide_start_ms=0;
-bool slide_active=false;
-bool slide_was_offset=false;                  // edge-detects offset->0 for one cleanup redraw
-uint64_t slide_resets_seen=0;                 // manager resets cancel the slide
-uint64_t slide_revision_seen=0;               // context changes cancel the slide
-int32_t slide_drag_cooldown=0;                // frames after a drag whose landings don't slide
-
-// --- outgoing-tile cache -------------------------------------------------------------------------
-// While the world slides, the trailing screen edge shows tiles that have already scrolled OUT of
-// the viewport buffers; without help they render black until the slide lands. At each landing the
-// pre-scroll frame still sits in the engine's *_old buffers, so a padded cache in the CURRENT
-// window's coordinate frame is rebuilt from them -- chaining the previous cache so stacked
-// landings keep up to `strip_pad` tiles of departed world alive -- and the renderer draws the
-// trailing band from it.
 int32_t tile_pixel(int32_t tile,int32_t origin,int32_t zoom);
 
+// --- outgoing-tile cache -------------------------------------------------------------------------
+// While the world (or the fort camera) glides, the trailing screen edge shows tiles that already
+// scrolled OUT of the viewport buffers; without help they render black until the glide lands. At
+// each landing the pre-scroll frame still sits in the engine's *_old buffers, so a padded cache in
+// the CURRENT window's coordinate frame is rebuilt from them, chaining the previous cache so
+// stacked landings keep up to `strip_pad` tiles of departed world alive.
 constexpr int32_t strip_pad=int32_t(slide_max_tiles);
 constexpr size_t strip_layer_count=10;
 struct strip_cachest
@@ -144,8 +192,8 @@ struct strip_cachest
 };
 strip_cachest strip_caches[2];
 int strip_cache_front=0;
-uint64_t stat_strip_draws=0;    // cached strip tiles drawn under the slide's trailing edge
-uint64_t stat_strip_misses=0;   // cached texpos with no tile-cache texture (stays black)
+uint64_t stat_strip_draws=0;
+uint64_t stat_strip_misses=0;
 // The engine's tile cache is keyed by (texpos, tint colors, flags) and terrain tints vary per
 // tile, so an exact-recipe lookup misses. Departed tiles were just on screen, so SOME recipe for
 // their texpos is cached: remember which full key worked per texpos and re-find it fresh each
@@ -179,8 +227,6 @@ void strip_cache_invalidate()
 	strip_caches[1].valid=false;
 }
 
-// Rebuild the cache in the new window's coordinate frame: the freshly departed strip comes from
-// the *_old buffers (the pre-landing frame), older strips ride over from the previous cache.
 void strip_cache_update(df::graphic_viewportst *vp,int32_t shift_x,int32_t shift_y)
 {
 	strip_cachest &prev=strip_caches[strip_cache_front];
@@ -268,18 +314,281 @@ void draw_strip_tile(
 		}
 }
 
-double slide_offset_now(uint32_t now_ms,double from)
-{
-	if(!slide_active)return 0.0;
-	const double t=std::min(1.0,double(now_ms-slide_start_ms)/double(slide_duration_ms));
-	const double ease=1.0-t*t*(3.0-2.0*t);
-	return from*ease;
-}
-
 double tile_px(const df::renderer_2d_base *renderer)
 {
 	const int32_t zoom=renderer->viewport_zoom_factor;
 	return double(zoom==128?32:std::max(1,zoom*32/128));
+}
+
+// Match ratio of "buffers shifted by (dwx,dwy)" on the background layer: 0..1, or -1 when there
+// is nothing to compare (empty background).
+double background_match_ratio(const df::graphic_viewportst *vp,int32_t dwx,int32_t dwy)
+{
+	int32_t considered=0;
+	int32_t matches=0;
+	for(int32_t x=0;x<vp->dim_x;++x)
+		{
+		const int32_t sx=x+dwx;
+		if(sx<0||sx>=vp->dim_x)continue;
+		for(int32_t y=0;y<vp->dim_y;++y)
+			{
+			const int32_t sy=y+dwy;
+			if(sy<0||sy>=vp->dim_y)continue;
+			const int32_t cur=vp->screentexpos_background[x*vp->dim_y+y];
+			if(cur==0)continue;
+			++considered;
+			if(vp->screentexpos_background_old[sx*vp->dim_y+sy]==cur)++matches;
+			}
+		}
+	if(considered==0)return -1.0;
+	return double(matches)/double(considered);
+}
+
+// Cancel everything except the persistent rest offset (the camera keeps its sub-tile position
+// across zoom/z/resize; only the in-flight animation state is unfollowable).
+void clear_camera_pending()
+{
+	camera_pending_dx=0;
+	camera_pending_dy=0;
+	camera_pending_frames=0;
+	self_scroll_x=0;
+	self_scroll_y=0;
+}
+
+void cancel_camera_transients()
+{
+	transient_x=0.0;
+	transient_y=0.0;
+	clear_camera_pending();
+	drag_active=false;
+}
+
+void set_camera_enabled(bool enable)
+{
+	if(camera_enabled==enable)return;
+	camera_enabled=enable;
+	cancel_camera_transients();
+	rest_x=0.0;
+	rest_y=0.0;
+	camera_has_prev=false;   // fresh observation baseline; no phantom scroll on re-enable
+	// camera_was_offset stays: the render path issues one cleanup redraw if we were mid-offset.
+}
+
+// Fold whole tiles of rest into window_x/window_y so |rest| <= 0.5 (minimal edge strip). The
+// visual position is unchanged: the window write is attributed via self_scroll when it lands.
+void normalize_rest()
+{
+	const int32_t kx=int32_t(-std::llround(rest_x));
+	const int32_t ky=int32_t(-std::llround(rest_y));
+	if(kx!=0&&window_x!=nullptr&&*window_x+kx>=0)
+		{
+		*window_x+=kx;
+		self_scroll_x+=kx;
+		}
+	if(ky!=0&&window_y!=nullptr&&*window_y+ky>=0)
+		{
+		*window_y+=ky;
+		self_scroll_y+=ky;
+		}
+}
+
+// A scroll of (ax,ay) tiles has landed in the buffers: our own normalization writes are visual
+// no-ops (they move into rest); the remainder is a real scroll and glides -- unless a drag is
+// driving the position directly, in which case it folds into rest wholesale.
+void attribute_landed(int32_t ax,int32_t ay,double tile)
+{
+	int32_t sx=0;
+	if(self_scroll_x!=0&&(self_scroll_x>0)==(ax>0)&&ax!=0)
+		sx=(std::abs(self_scroll_x)<=std::abs(ax))?self_scroll_x:ax;
+	int32_t sy=0;
+	if(self_scroll_y!=0&&(self_scroll_y>0)==(ay>0)&&ay!=0)
+		sy=(std::abs(self_scroll_y)<=std::abs(ay))?self_scroll_y:ay;
+	self_scroll_x-=sx;
+	self_scroll_y-=sy;
+	rest_x+=sx;
+	rest_y+=sy;
+	const int32_t gx=ax-sx;
+	const int32_t gy=ay-sy;
+	if(drag_active)
+		{
+		rest_x+=gx;
+		rest_y+=gy;
+		}
+	else
+		{
+		transient_x+=gx*tile;
+		transient_y+=gy*tile;
+		const double cap=tile*(camera_max_glide_tiles+0.5);
+		transient_x=std::clamp(transient_x,-cap,cap);
+		transient_y=std::clamp(transient_y,-cap,cap);
+		}
+}
+
+// Per-frame camera bookkeeping: observe window scrolls, attribute them when the buffers apply
+// them (glide vs our own normalization writes), drive the drag, decay the transient.
+void update_camera(
+	df::renderer_2d_base *renderer,
+	const df::graphic_viewportst *vp,
+	uint32_t delta_ms)
+{
+	if(!camera_enabled||adventure_mode())return;   // adventure smoothing = the world slide
+	const double tile=tile_px(renderer);
+	const int32_t wx=window_x?*window_x:0;
+	const int32_t wy=window_y?*window_y:0;
+	if(camera_has_prev&&(wx!=camera_prev_wx||wy!=camera_prev_wy))
+		{
+		const int32_t dx=wx-camera_prev_wx;
+		const int32_t dy=wy-camera_prev_wy;
+		if(std::abs(dx)>6||std::abs(dy)>6)
+			{
+			// Almost certainly a one-frame window excursion (combat/announcement camera
+			// flick) whose reversal arrives a frame or two later: park it for the wait
+			// below instead of cancelling.
+			camera_pending_dx+=dx;
+			camera_pending_dy+=dy;
+			camera_pending_frames=0;
+			}
+		else if((std::abs(dx)>camera_max_glide_tiles||std::abs(dy)>camera_max_glide_tiles)&&
+			!drag_active)
+			cancel_camera_transients();   // teleport-like jump (recenter/minimap): snap
+		else
+			{
+			camera_pending_dx+=dx;
+			camera_pending_dy+=dy;
+			camera_pending_frames=0;
+			}
+		}
+	camera_prev_wx=wx;
+	camera_prev_wy=wy;
+	camera_has_prev=true;
+
+	if(camera_pending_dx!=0||camera_pending_dy!=0)
+		{
+		if(std::abs(camera_pending_dx)>6||std::abs(camera_pending_dy)>6)
+			{
+			// One-frame window excursion: the reversal usually collapses the delta on
+			// its own -- attribute nothing meanwhile so the glide keeps decaying
+			// untouched. A delta that never collapses is a genuine teleport: snap
+			// (keep rest, drop the animation debt).
+			if(++camera_pending_frames>4)
+				{
+				transient_x=0.0;
+				transient_y=0.0;
+				clear_camera_pending();
+				}
+			}
+		else
+			{
+			// Fast scrolling applies the pending delta PIECEMEAL: the buffers may hold +1 of a
+			// pending +3 this frame. Testing only the total made landings miss, time out, and
+			// snap -- the fast-scroll jitter. Instead, find the LARGEST applied prefix of the
+			// pending scroll and attribute just that; the rest keeps pending. Ties between
+			// qualifying shifts only happen on uniform terrain, where mistiming is invisible.
+			const int32_t stepx=(camera_pending_dx>0)-(camera_pending_dx<0);
+			const int32_t stepy=(camera_pending_dy>0)-(camera_pending_dy<0);
+			int32_t best_ax=0,best_ay=0,best_mag=-1;
+			double best_score=-1.0;
+			bool no_data=false;
+			for(int32_t ix=0;ix<=std::abs(camera_pending_dx);++ix)
+				{
+				for(int32_t iy=0;iy<=std::abs(camera_pending_dy);++iy)
+					{
+					const double score=background_match_ratio(vp,ix*stepx,iy*stepy);
+					if(score<0.0){no_data=true;break;}
+					const int32_t mag=ix+iy;
+					if(score>=0.6&&(mag>best_mag||(mag==best_mag&&score>best_score)))
+						{
+						best_mag=mag;
+						best_score=score;
+						best_ax=ix*stepx;
+						best_ay=iy*stepy;
+						}
+					}
+				if(no_data)break;
+				}
+			if(no_data)
+				{
+				// Nothing to compare against (empty background): give up on attribution.
+				clear_camera_pending();
+				}
+			else if(best_mag>0)
+				{
+				attribute_landed(best_ax,best_ay,tile);
+				camera_pending_dx-=best_ax;
+				camera_pending_dy-=best_ay;
+				camera_pending_frames=0;
+				}
+			else if(best_mag==0)
+				{
+				// Content demonstrably hasn't moved yet -- but a scroll masked by an
+				// excursion frame never diffs, and a phantom delta never renders at all.
+				// Absorb either after a grace period instead of poisoning attribution.
+				if(++camera_pending_frames>6)clear_camera_pending();
+				}
+			else if(++camera_pending_frames>4)
+				{
+				// Neither static nor any prefix recognizable (heavy simultaneous change):
+				// drop the debt without touching the in-flight glide.
+				clear_camera_pending();
+				}
+			}
+		}
+
+	// --- pixel-perfect middle-mouse drag: the view follows the mouse 1:1 and rests where
+	// released. DF's own drag still moves window in tile steps; rest carries the remainder.
+	// Positions are tracked against the CONTENT window (window minus unlanded jumps) so the
+	// buffer lag never causes a visible stutter.
+	const bool mbut=enabler!=nullptr&&enabler->mouse_mbut;
+	const double content_wx=double(wx-camera_pending_dx);
+	const double content_wy=double(wy-camera_pending_dy);
+	if(mbut&&!drag_active&&gps!=nullptr)
+		{
+		drag_active=true;
+		drag_anchor_vx=content_wx-rest_x-transient_x/tile;
+		drag_anchor_vy=content_wy-rest_y-transient_y/tile;
+		drag_anchor_mx=gps->precise_mouse_x;
+		drag_anchor_my=gps->precise_mouse_y;
+		transient_x=0.0;
+		transient_y=0.0;
+		}
+	if(drag_active)
+		{
+		if(!mbut)
+			{
+			drag_active=false;
+			normalize_rest();
+			}
+		else if(gps!=nullptr)
+			{
+			double vx=drag_anchor_vx-double(gps->precise_mouse_x-drag_anchor_mx)/tile;
+			double vy=drag_anchor_vy-double(gps->precise_mouse_y-drag_anchor_my)/tile;
+			rest_x=content_wx-vx;
+			rest_y=content_wy-vy;
+			// If DF's own drag disagrees by more than a tile and a half, rebase on its view.
+			const double lim=1.5;
+			if(rest_x<-lim||rest_x>lim||rest_y<-lim||rest_y>lim)
+				{
+				rest_x=std::clamp(rest_x,-lim,lim);
+				rest_y=std::clamp(rest_y,-lim,lim);
+				drag_anchor_vx=content_wx-rest_x+
+					double(gps->precise_mouse_x-drag_anchor_mx)/tile;
+				drag_anchor_vy=content_wy-rest_y+
+					double(gps->precise_mouse_y-drag_anchor_my)/tile;
+				}
+			}
+		}
+
+	if(transient_x!=0.0||transient_y!=0.0)
+		{
+		const double k=std::exp(-double(delta_ms)/camera_tau_ms);
+		transient_x*=k;
+		transient_y*=k;
+		if(std::abs(transient_x)<0.5&&std::abs(transient_y)<0.5)
+			{
+			transient_x=0.0;
+			transient_y=0.0;
+			}
+		}
 }
 
 constexpr uint32_t fire_bits=0x70000000U;
@@ -319,6 +628,7 @@ void update_visual_context(
 		{
 		++visual_context_revision;
 		previous_coverage.clear();
+		cancel_camera_transients();
 		}
 	previous_viewport=vp;
 	previous_view_signature=signature;
@@ -335,71 +645,268 @@ void update_visual_context(
 	has_pan_context=true;
 }
 
-std::array<int32_t *,6> creature_layers(df::graphic_viewportst *vp)
+using viewport_layer_memberst=int32_t *df::graphic_viewportst::*;
+
+struct visual_layer_bufferst
 {
-	return {
-		vp->screentexpos_right_creature,
-		vp->screentexpos,
-		vp->screentexpos_left_creature,
-		vp->screentexpos_upright_creature,
-		vp->screentexpos_up_creature,
-		vp->screentexpos_upleft_creature
-		};
+	viewport_visual_layer layer;
+	viewport_layer_memberst current;
+	viewport_layer_memberst previous;
+};
+
+constexpr size_t visual_layer_count=static_cast<size_t>(viewport_visual_layer::count);
+constexpr std::array visual_layer_buffers=
+	{
+	visual_layer_bufferst{viewport_visual_layer::right,
+		&df::graphic_viewportst::screentexpos_right_creature,
+		&df::graphic_viewportst::screentexpos_right_creature_old},
+	visual_layer_bufferst{viewport_visual_layer::center,
+		&df::graphic_viewportst::screentexpos,
+		&df::graphic_viewportst::screentexpos_old},
+	visual_layer_bufferst{viewport_visual_layer::left,
+		&df::graphic_viewportst::screentexpos_left_creature,
+		&df::graphic_viewportst::screentexpos_left_creature_old},
+	visual_layer_bufferst{viewport_visual_layer::upright,
+		&df::graphic_viewportst::screentexpos_upright_creature,
+		&df::graphic_viewportst::screentexpos_upright_creature_old},
+	visual_layer_bufferst{viewport_visual_layer::up,
+		&df::graphic_viewportst::screentexpos_up_creature,
+		&df::graphic_viewportst::screentexpos_up_creature_old},
+	visual_layer_bufferst{viewport_visual_layer::upleft,
+		&df::graphic_viewportst::screentexpos_upleft_creature,
+		&df::graphic_viewportst::screentexpos_upleft_creature_old},
+	visual_layer_bufferst{viewport_visual_layer::vehicle,
+		&df::graphic_viewportst::screentexpos_vehicle,
+		&df::graphic_viewportst::screentexpos_vehicle_old},
+	visual_layer_bufferst{viewport_visual_layer::item,
+		&df::graphic_viewportst::screentexpos_item,
+		&df::graphic_viewportst::screentexpos_item_old},
+	visual_layer_bufferst{viewport_visual_layer::designation,
+		&df::graphic_viewportst::screentexpos_designation,
+		&df::graphic_viewportst::screentexpos_designation_old}
+	};
+
+constexpr bool valid_visual_layer_buffers()
+{
+	uint16_t layers=0;
+	for(const auto &buffer:visual_layer_buffers)
+		{
+		const uint16_t layer=uint16_t(1U<<static_cast<uint8_t>(buffer.layer));
+		if(layers&layer)return false;
+		layers|=layer;
+		}
+	return layers==uint16_t((1U<<visual_layer_count)-1);
 }
 
-std::array<int32_t *,9> visual_layers(df::graphic_viewportst *vp)
+static_assert(valid_visual_layer_buffers());
+
+template<typename Viewport>
+auto visual_layers(Viewport *vp,bool previous=false)
 {
-	auto creature=creature_layers(vp);
-	return {
-		creature[0],
-		creature[1],
-		creature[2],
-		creature[3],
-		creature[4],
-		creature[5],
-		vp->screentexpos_vehicle,
-		vp->screentexpos_item,
-		vp->screentexpos_designation
-		};
+	using layer_pointer=std::conditional_t<
+		std::is_const_v<Viewport>,const int32_t *,int32_t *>;
+	std::array<layer_pointer,visual_layer_count> layers{};
+	for(const auto &buffer:visual_layer_buffers)
+		layers[static_cast<size_t>(buffer.layer)]=vp->*(previous?
+			buffer.previous:buffer.current);
+	return layers;
 }
 
 viewport_visual_animation_inputst animation_input(df::graphic_viewportst *vp)
 {
+	const df::graphic_viewportst *const_viewport=vp;
 	return {
 		vp,
 		vp->dim_x,
 		vp->dim_y,
 		visual_context_revision,
-		{
-			vp->screentexpos_right_creature,
-			vp->screentexpos,
-			vp->screentexpos_left_creature,
-			vp->screentexpos_upright_creature,
-			vp->screentexpos_up_creature,
-			vp->screentexpos_upleft_creature,
-			vp->screentexpos_vehicle,
-			vp->screentexpos_item,
-			vp->screentexpos_designation
-			},
-		{
-			vp->screentexpos_right_creature_old,
-			vp->screentexpos_old,
-			vp->screentexpos_left_creature_old,
-			vp->screentexpos_upright_creature_old,
-			vp->screentexpos_up_creature_old,
-			vp->screentexpos_upleft_creature_old,
-			vp->screentexpos_vehicle_old,
-			vp->screentexpos_item_old,
-			vp->screentexpos_designation_old
-			},
+		visual_layers(const_viewport),
+		visual_layers(const_viewport,true),
 		window_x?*window_x:0,
 		window_y?*window_y:0,
-		// Scroll-landing oracle: lets creature movements that coincide with a camera scroll
-		// animate (adventure mode -- the camera follows the player, so EVERY step is one).
+		// Scroll-landing oracle: lets movements that coincide with a camera scroll be
+		// attributed (adventure mode -- the camera follows the player, EVERY step is one).
 		vp->screentexpos_background,
 		vp->screentexpos_background_old
 		};
 }
+
+struct tile_transitionst
+{
+	tile_transition_layer layer;
+	int32_t previous_texpos;
+	int32_t current_texpos;
+	uint32_t start_time_ms;
+};
+
+bool is_tile_construction_or_destruction(
+	df::tiletype previous,
+	df::tiletype current)
+{
+	if(previous==current)return false;
+	if(tileMaterial(previous)==df::tiletype_material::CONSTRUCTION||
+		tileMaterial(current)==df::tiletype_material::CONSTRUCTION)
+		return true;
+	if(!isGroundMaterial(previous)||
+		tileShape(previous)==tileShape(current))return false;
+	return isWallTerrain(previous)||
+		isFloorTerrain(previous)||
+		isRampTerrain(previous)||
+		isStairTerrain(previous);
+}
+
+class tile_transition_managerst
+{
+	const void *viewport=nullptr;
+	int32_t dim_x=0;
+	int32_t dim_y=0;
+	uint64_t context_revision=0;
+	int32_t pan_x=0;
+	int32_t pan_y=0;
+	bool has_context=false;
+	std::unordered_map<int32_t,tile_transitionst> transitions;
+	std::vector<df::tiletype> previous_tiletypes;
+	std::vector<uint8_t> has_previous_tiletype;
+
+	static constexpr uint32_t transition_duration_ms=120;
+
+	void snapshot_tiletypes(df::graphic_viewportst *vp)
+		{
+		const int32_t tile_count=vp->dim_x*vp->dim_y;
+		previous_tiletypes.resize(tile_count);
+		has_previous_tiletype.assign(tile_count,0);
+		const int32_t map_x=window_x?*window_x:0;
+		const int32_t map_y=window_y?*window_y:0;
+		const int32_t map_z=window_z?*window_z:0;
+		for(int32_t x=0;x<vp->dim_x;++x)
+			{
+			for(int32_t y=0;y<vp->dim_y;++y)
+				{
+				const int32_t index=x*vp->dim_y+y;
+				const df::tiletype *tiletype=
+					Maps::getTileType(map_x+x,map_y+y,map_z);
+				if(tiletype==nullptr)continue;
+				previous_tiletypes[index]=*tiletype;
+				has_previous_tiletype[index]=1;
+				}
+			}
+		}
+
+	public:
+		void clear()
+			{
+			transitions.clear();
+			previous_tiletypes.clear();
+			has_previous_tiletype.clear();
+			has_context=false;
+			}
+
+		void reset()
+			{
+			clear();
+			}
+
+		void synchronize(df::graphic_viewportst *vp,uint32_t now_ms)
+			{
+			const int32_t current_pan_x=window_x?*window_x:0;
+			const int32_t current_pan_y=window_y?*window_y:0;
+			const bool context_changed=!has_context||viewport!=vp||
+				dim_x!=vp->dim_x||dim_y!=vp->dim_y||
+				context_revision!=visual_context_revision||
+				pan_x!=current_pan_x||pan_y!=current_pan_y;
+			viewport=vp;
+			dim_x=vp->dim_x;
+			dim_y=vp->dim_y;
+			context_revision=visual_context_revision;
+			pan_x=current_pan_x;
+			pan_y=current_pan_y;
+			has_context=true;
+			if(context_changed)
+				{
+				transitions.clear();
+				snapshot_tiletypes(vp);
+				return;
+				}
+
+			const int32_t map_x=window_x?*window_x:0;
+			const int32_t map_y=window_y?*window_y:0;
+			const int32_t map_z=window_z?*window_z:0;
+			for(int32_t x=0;x<dim_x;++x)
+				{
+				for(int32_t y=0;y<dim_y;++y)
+					{
+					const int32_t index=x*dim_y+y;
+					const df::tiletype *tiletype=
+						Maps::getTileType(map_x+x,map_y+y,map_z);
+					const bool gameplay_change=tiletype!=nullptr&&
+						has_previous_tiletype[index]&&
+						is_tile_construction_or_destruction(
+							previous_tiletypes[index],*tiletype);
+					if(tiletype!=nullptr)
+						{
+						previous_tiletypes[index]=*tiletype;
+						has_previous_tiletype[index]=1;
+						}
+					else
+						has_previous_tiletype[index]=0;
+					if(!gameplay_change)continue;
+					const auto candidate=select_tile_transition(
+						vp->screentexpos_background[index],
+						vp->screentexpos_background_old[index],
+						vp->screentexpos_building_one[index],
+						vp->screentexpos_building_one_old[index]);
+					if(candidate.layer!=tile_transition_layer::none)
+						{
+						const auto existing=transitions.find(index);
+						if(existing==transitions.end()||
+							existing->second.layer!=candidate.layer||
+							existing->second.previous_texpos!=candidate.previous_texpos||
+							existing->second.current_texpos!=candidate.current_texpos)
+							{
+							transitions[index]={
+								candidate.layer,
+								candidate.previous_texpos,
+								candidate.current_texpos,
+								now_ms
+								};
+							}
+						}
+					}
+				}
+			for(auto it=transitions.begin();it!=transitions.end();)
+				{
+				if(now_ms-it->second.start_time_ms>=transition_duration_ms)
+					it=transitions.erase(it);
+				else
+					++it;
+				}
+			}
+
+		bool active() const
+			{
+			return !transitions.empty();
+			}
+
+		const tile_transitionst *get(int32_t index) const
+			{
+			const auto found=transitions.find(index);
+			return found==transitions.end()?nullptr:&found->second;
+			}
+
+		float progress(const tile_transitionst &transition,uint32_t now_ms) const
+			{
+			return animation_progress(
+				now_ms,transition.start_time_ms,transition_duration_ms);
+			}
+
+		const std::unordered_map<int32_t,tile_transitionst> &entries() const
+			{
+			return transitions;
+			}
+
+};
+
+tile_transition_managerst tile_transition_manager;
 
 int32_t tile_pixel(int32_t tile,int32_t origin,int32_t zoom)
 {
@@ -417,41 +924,47 @@ bool has_fire(const df::graphic_viewportst *vp,int32_t x,int32_t y)
 	return vp->screentexpos_spatter_flag[x*vp->dim_y+y]&fire_bits;
 }
 
-bool is_main_creature(viewport_creature_layer layer)
-{
-	return layer==viewport_creature_layer::right||
-		layer==viewport_creature_layer::center||
-		layer==viewport_creature_layer::left;
-}
-
 template<typename T>
-class scoped_zerost
+class scoped_value_restorest
 {
-	T *value_ptr;
-	T saved{};
+	T &value;
+	T saved;
 
 	public:
-		scoped_zerost(T *ptr,bool enabled=true):value_ptr(enabled?ptr:nullptr)
+		explicit scoped_value_restorest(T &value,T replacement=T{}):
+			value(value),
+			saved(std::exchange(value,std::move(replacement)))
 			{
-			if(value_ptr!=nullptr)
-				{
-				saved=*value_ptr;
-				*value_ptr=0;
-				}
+			static_assert(std::is_nothrow_move_assignable_v<T>);
 			}
 
-		~scoped_zerost()
+		~scoped_value_restorest() noexcept
 			{
-			if(value_ptr!=nullptr)*value_ptr=saved;
+			value=std::move(saved);
 			}
 
-		scoped_zerost(const scoped_zerost &)=delete;
-		scoped_zerost &operator=(const scoped_zerost &)=delete;
+		scoped_value_restorest(const scoped_value_restorest &)=delete;
+		scoped_value_restorest &operator=(const scoped_value_restorest &)=delete;
+		scoped_value_restorest(scoped_value_restorest &&)=delete;
+		scoped_value_restorest &operator=(scoped_value_restorest &&)=delete;
 };
+
+template<typename Callback>
+void with_zeroed_values(const Callback &callback)
+{
+	callback();
+}
+
+template<typename Callback,typename T,typename... Values>
+void with_zeroed_values(const Callback &callback,T &value,Values &...values)
+{
+	scoped_value_restorest<T> zero(value);
+	with_zeroed_values(callback,values...);
+}
 
 struct render_proxyst
 {
-	viewport_creature_layer layer;
+	viewport_visual_layer layer;
 	float source_x;
 	float source_y;
 	int32_t target_x;
@@ -462,6 +975,104 @@ struct render_proxyst
 	std::set<std::pair<int32_t,int32_t>> coverage;
 };
 
+constexpr uint16_t visual_layer_bit(viewport_visual_layer layer)
+{
+	return uint16_t(1U<<static_cast<uint8_t>(layer));
+}
+
+uint16_t selected_mask(
+	const std::unordered_map<int32_t,uint16_t> &selected,
+	int32_t index)
+{
+	const auto found=selected.find(index);
+	return found==selected.end()?0:found->second;
+}
+
+template<size_t Layer=0,typename Callback>
+void with_suppressed_visual_layers(
+	const std::array<int32_t *,visual_layer_count> &layers,
+	int32_t index,
+	uint16_t mask,
+	const Callback &callback)
+{
+	if constexpr(Layer==visual_layer_count)
+		callback();
+	else if(mask&(1U<<Layer))
+		{
+		scoped_value_restorest<int32_t> zero(layers[Layer][index]);
+		with_suppressed_visual_layers<Layer+1>(layers,index,mask,callback);
+		}
+	else
+		with_suppressed_visual_layers<Layer+1>(layers,index,mask,callback);
+}
+
+template<typename Callback>
+void with_base_suppressed(
+	df::graphic_viewportst *vp,
+	int32_t index,
+	const Callback &callback)
+{
+	with_zeroed_values(
+		callback,
+		vp->screentexpos_background[index],
+		vp->screentexpos_floor_flag[index],
+		vp->screentexpos_background_two[index],
+		vp->screentexpos_liquid_flag[index],
+		vp->screentexpos_spatter_flag[index],
+		vp->screentexpos_spatter[index],
+		vp->screentexpos_ramp_flag[index],
+		vp->screentexpos_shadow_flag[index],
+		vp->screentexpos_building_one[index]);
+}
+
+template<typename Callback>
+void with_main_suppressed(
+	df::graphic_viewportst *vp,
+	int32_t index,
+	const Callback &callback)
+{
+	with_base_suppressed(vp,index,[&]
+		{
+		with_zeroed_values(callback,vp->screentexpos_vermin[index]);
+		});
+}
+
+template<typename Callback>
+void with_upper_suppressed(
+	df::graphic_viewportst *vp,
+	int32_t index,
+	const Callback &callback)
+{
+	with_main_suppressed(vp,index,[&]
+		{
+		with_zeroed_values(
+			callback,
+			vp->screentexpos_building_two[index],
+			vp->screentexpos_projectile[index],
+			vp->screentexpos_high_flow[index],
+			vp->screentexpos_top_shadow[index],
+			vp->screentexpos_signpost[index]);
+		});
+}
+
+template<typename Callback>
+void with_incoming_tile_suppressed(
+	df::graphic_viewportst *vp,
+	int32_t index,
+	const Callback &callback)
+{
+	const tile_transitionst *transition=tile_transition_manager.get(index);
+	if(transition==nullptr||transition->current_texpos==0)
+		{
+		callback();
+		return;
+		}
+	if(transition->layer==tile_transition_layer::background)
+		with_zeroed_values(callback,vp->screentexpos_background[index]);
+	else
+		with_zeroed_values(callback,vp->screentexpos_building_one[index]);
+}
+
 void redraw_world_tile(
 	df::renderer_2d_base *renderer,
 	df::graphic_viewportst *vp,
@@ -470,153 +1081,106 @@ void redraw_world_tile(
 	const std::unordered_map<int32_t,uint16_t> &selected)
 {
 	const int32_t index=x*vp->dim_y+y;
-	const auto found=selected.find(index);
-	const uint16_t mask=found==selected.end()?0:found->second;
-	auto layers=creature_layers(vp);
-	scoped_zerost<int32_t> item(
-		vp->screentexpos_item+index,
-		mask&(1U<<static_cast<uint8_t>(viewport_creature_layer::item)));
-	scoped_zerost<int32_t> vehicle(
-		vp->screentexpos_vehicle+index,
-		mask&(1U<<static_cast<uint8_t>(viewport_creature_layer::vehicle)));
-	scoped_zerost<int32_t> right(layers[0]+index,mask&(1U<<0));
-	scoped_zerost<int32_t> center(layers[1]+index,mask&(1U<<1));
-	scoped_zerost<int32_t> left(layers[2]+index,mask&(1U<<2));
-	scoped_zerost<int32_t> upright(layers[3]+index,mask&(1U<<3));
-	scoped_zerost<int32_t> up(layers[4]+index,mask&(1U<<4));
-	scoped_zerost<int32_t> upleft(layers[5]+index,mask&(1U<<5));
-	scoped_zerost<int32_t> designation(
-		vp->screentexpos_designation+index,
-		mask&(1U<<static_cast<uint8_t>(viewport_creature_layer::designation)));
-
-	for(int32_t lower=7;lower>=0;--lower)
+	const auto redraw=[&]
 		{
-		df::graphic_viewportst *lower_vp=gps->lower_viewport[lower];
-		if(lower_vp!=nullptr&&lower_vp->flag.bits.active)
-			renderer->update_viewport_tile(lower_vp,x,y);
+		for(int32_t lower=7;lower>=0;--lower)
+			{
+			df::graphic_viewportst *lower_vp=gps->lower_viewport[lower];
+			if(lower_vp!=nullptr&&lower_vp->flag.bits.active)
+				renderer->update_viewport_tile(lower_vp,x,y);
+			}
+		renderer->update_viewport_tile(vp,x,y);
+		};
+	with_incoming_tile_suppressed(vp,index,[&]
+		{
+		with_suppressed_visual_layers(
+			visual_layers(vp),index,selected_mask(selected,index),redraw);
+		});
+}
+
+constexpr uint16_t visual_layers_through_group(visual_render_groupst group)
+{
+	uint16_t mask=0;
+	for(const auto &descriptor:visual_layer_descriptors)
+		if(descriptor.render_group!=visual_render_groupst::designation&&
+			static_cast<uint8_t>(descriptor.render_group)<=static_cast<uint8_t>(group))
+			mask|=visual_layer_bit(descriptor.layer);
+	return mask;
+}
+
+void redraw_above(
+	df::renderer_2d_base *renderer,
+	df::graphic_viewportst *vp,
+	int32_t x,
+	int32_t y,
+	visual_render_groupst group,
+	const std::unordered_map<int32_t,uint16_t> &selected)
+{
+	const int32_t index=x*vp->dim_y+y;
+	const auto redraw=[&]{renderer->update_viewport_tile(vp,x,y);};
+	const auto suppress_visuals=[&]
+		{
+		with_suppressed_visual_layers(
+			visual_layers(vp),
+			index,
+			selected_mask(selected,index)|visual_layers_through_group(group),
+			redraw);
+		};
+	if(group==visual_render_groupst::item||group==visual_render_groupst::vehicle)
+		with_base_suppressed(vp,index,suppress_visuals);
+	else if(group==visual_render_groupst::main)
+		with_main_suppressed(vp,index,suppress_visuals);
+	else
+		with_upper_suppressed(vp,index,suppress_visuals);
+}
+
+SDL_Texture *cached_texture(
+	df::renderer_2d_base *renderer,
+	int32_t texpos,
+	bool transparent_background=true)
+{
+	if(texpos==0)return nullptr;
+	df::texture_fullid texture_id;
+	texture_id.texpos=texpos;
+	texture_id.r=texture_id.g=texture_id.b=1.0f;
+	texture_id.br=texture_id.bg=texture_id.bb=0.0f;
+	texture_id.flag=transparent_background?
+		df::texture_fullid_flag::mask_transparent_background:
+		0;
+	const auto texture=renderer->tile_cache.tile_cache.find(texture_id);
+	return texture==renderer->tile_cache.tile_cache.end()?
+		nullptr:
+		static_cast<SDL_Texture *>(texture->second);
+}
+
+SDL_Texture *cached_tile_texture(
+	df::renderer_2d_base *renderer,
+	int32_t texpos)
+{
+	SDL_Texture *texture=cached_texture(renderer,texpos,false);
+	return texture!=nullptr?texture:cached_texture(renderer,texpos);
+}
+
+void draw_texture_with_alpha(
+	SDL_Renderer *renderer,
+	SDL_Texture *texture,
+	const SDL_FRect &destination,
+	float opacity)
+{
+	if(opacity<=0.0f)return;
+	Uint8 saved_alpha=255;
+	SDL_BlendMode saved_blend=SDL_BLENDMODE_NONE;
+	if(get_texture_alpha_mod(texture,&saved_alpha)!=0||
+		get_texture_blend_mode(texture,&saved_blend)!=0)
+		{
+		render_copy_f(renderer,texture,nullptr,&destination);
+		return;
 		}
-	renderer->update_viewport_tile(vp,x,y);
-}
-
-void redraw_above_base(
-	df::renderer_2d_base *renderer,
-	df::graphic_viewportst *vp,
-	int32_t x,
-	int32_t y,
-	viewport_creature_layer layer,
-	const std::unordered_map<int32_t,uint16_t> &selected)
-{
-	const int32_t index=x*vp->dim_y+y;
-	const auto found=selected.find(index);
-	const uint16_t mask=found==selected.end()?0:found->second;
-
-	scoped_zerost<int32_t> background(vp->screentexpos_background+index);
-	scoped_zerost<uint64_t> floor_flag(vp->screentexpos_floor_flag+index);
-	scoped_zerost<int32_t> background_two(vp->screentexpos_background_two+index);
-	scoped_zerost<uint32_t> liquid_flag(vp->screentexpos_liquid_flag+index);
-	scoped_zerost<uint32_t> spatter_flag(vp->screentexpos_spatter_flag+index);
-	scoped_zerost<int32_t> spatter(vp->screentexpos_spatter+index);
-	scoped_zerost<uint64_t> ramp_flag(vp->screentexpos_ramp_flag+index);
-	scoped_zerost<uint32_t> shadow_flag(vp->screentexpos_shadow_flag+index);
-	scoped_zerost<int32_t> building_one(vp->screentexpos_building_one+index);
-	scoped_zerost<int32_t> item(vp->screentexpos_item+index);
-	scoped_zerost<int32_t> vehicle(
-		vp->screentexpos_vehicle+index,
-		layer==viewport_creature_layer::vehicle||
-			mask&(1U<<static_cast<uint8_t>(viewport_creature_layer::vehicle)));
-	scoped_zerost<int32_t> right(
-		vp->screentexpos_right_creature+index,mask&(1U<<0));
-	scoped_zerost<int32_t> center(
-		vp->screentexpos+index,mask&(1U<<1));
-	scoped_zerost<int32_t> left(
-		vp->screentexpos_left_creature+index,mask&(1U<<2));
-	scoped_zerost<int32_t> upright(
-		vp->screentexpos_upright_creature+index,mask&(1U<<3));
-	scoped_zerost<int32_t> up(
-		vp->screentexpos_up_creature+index,mask&(1U<<4));
-	scoped_zerost<int32_t> upleft(
-		vp->screentexpos_upleft_creature+index,mask&(1U<<5));
-	scoped_zerost<int32_t> designation(
-		vp->screentexpos_designation+index,
-		mask&(1U<<static_cast<uint8_t>(viewport_creature_layer::designation)));
-	renderer->update_viewport_tile(vp,x,y);
-}
-
-void redraw_above_main(
-	df::renderer_2d_base *renderer,
-	df::graphic_viewportst *vp,
-	int32_t x,
-	int32_t y,
-	const std::unordered_map<int32_t,uint16_t> &selected)
-{
-	const int32_t index=x*vp->dim_y+y;
-	const auto found=selected.find(index);
-	const uint16_t mask=found==selected.end()?0:found->second;
-
-	scoped_zerost<int32_t> background(vp->screentexpos_background+index);
-	scoped_zerost<uint64_t> floor_flag(vp->screentexpos_floor_flag+index);
-	scoped_zerost<int32_t> background_two(vp->screentexpos_background_two+index);
-	scoped_zerost<uint32_t> liquid_flag(vp->screentexpos_liquid_flag+index);
-	scoped_zerost<uint32_t> spatter_flag(vp->screentexpos_spatter_flag+index);
-	scoped_zerost<int32_t> spatter(vp->screentexpos_spatter+index);
-	scoped_zerost<uint64_t> ramp_flag(vp->screentexpos_ramp_flag+index);
-	scoped_zerost<uint32_t> shadow_flag(vp->screentexpos_shadow_flag+index);
-	scoped_zerost<int32_t> building_one(vp->screentexpos_building_one+index);
-	scoped_zerost<int32_t> item(vp->screentexpos_item+index);
-	scoped_zerost<int32_t> vehicle(vp->screentexpos_vehicle+index);
-	scoped_zerost<int32_t> vermin(vp->screentexpos_vermin+index);
-	scoped_zerost<int32_t> right(vp->screentexpos_right_creature+index);
-	scoped_zerost<int32_t> center(vp->screentexpos+index);
-	scoped_zerost<int32_t> left(vp->screentexpos_left_creature+index);
-	scoped_zerost<int32_t> upright(
-		vp->screentexpos_upright_creature+index,mask&(1U<<3));
-	scoped_zerost<int32_t> up(
-		vp->screentexpos_up_creature+index,mask&(1U<<4));
-	scoped_zerost<int32_t> upleft(
-		vp->screentexpos_upleft_creature+index,mask&(1U<<5));
-	scoped_zerost<int32_t> designation(
-		vp->screentexpos_designation+index,
-		mask&(1U<<static_cast<uint8_t>(viewport_creature_layer::designation)));
-	renderer->update_viewport_tile(vp,x,y);
-}
-
-void redraw_above_upper(
-	df::renderer_2d_base *renderer,
-	df::graphic_viewportst *vp,
-	int32_t x,
-	int32_t y,
-	const std::unordered_map<int32_t,uint16_t> &selected)
-{
-	const int32_t index=x*vp->dim_y+y;
-	const auto found=selected.find(index);
-	const uint16_t mask=found==selected.end()?0:found->second;
-	scoped_zerost<int32_t> background(vp->screentexpos_background+index);
-	scoped_zerost<uint64_t> floor_flag(vp->screentexpos_floor_flag+index);
-	scoped_zerost<int32_t> background_two(vp->screentexpos_background_two+index);
-	scoped_zerost<uint32_t> liquid_flag(vp->screentexpos_liquid_flag+index);
-	scoped_zerost<uint32_t> spatter_flag(vp->screentexpos_spatter_flag+index);
-	scoped_zerost<int32_t> spatter(vp->screentexpos_spatter+index);
-	scoped_zerost<uint64_t> ramp_flag(vp->screentexpos_ramp_flag+index);
-	scoped_zerost<uint32_t> shadow_flag(vp->screentexpos_shadow_flag+index);
-	scoped_zerost<int32_t> building_one(vp->screentexpos_building_one+index);
-	scoped_zerost<int32_t> item(vp->screentexpos_item+index);
-	scoped_zerost<int32_t> vehicle(vp->screentexpos_vehicle+index);
-	scoped_zerost<int32_t> vermin(vp->screentexpos_vermin+index);
-	scoped_zerost<int32_t> right(vp->screentexpos_right_creature+index);
-	scoped_zerost<int32_t> center(vp->screentexpos+index);
-	scoped_zerost<int32_t> left(vp->screentexpos_left_creature+index);
-	scoped_zerost<int32_t> building_two(vp->screentexpos_building_two+index);
-	scoped_zerost<int32_t> projectile(vp->screentexpos_projectile+index);
-	scoped_zerost<int32_t> high_flow(vp->screentexpos_high_flow+index);
-	scoped_zerost<int32_t> top_shadow(vp->screentexpos_top_shadow+index);
-	scoped_zerost<int32_t> signpost(vp->screentexpos_signpost+index);
-	scoped_zerost<int32_t> upright(vp->screentexpos_upright_creature+index);
-	scoped_zerost<int32_t> up(vp->screentexpos_up_creature+index);
-	scoped_zerost<int32_t> upleft(vp->screentexpos_upleft_creature+index);
-	scoped_zerost<int32_t> designation(
-		vp->screentexpos_designation+index,
-		mask&(1U<<static_cast<uint8_t>(viewport_creature_layer::designation)));
-	renderer->update_viewport_tile(vp,x,y);
+	set_texture_blend_mode(texture,SDL_BLENDMODE_BLEND);
+	set_texture_alpha_mod(texture,Uint8(std::lround(saved_alpha*opacity)));
+	render_copy_f(renderer,texture,nullptr,&destination);
+	set_texture_alpha_mod(texture,saved_alpha);
+	set_texture_blend_mode(texture,saved_blend);
 }
 
 void draw_proxy(df::renderer_2d_base *renderer,const render_proxyst &proxy)
@@ -647,19 +1211,10 @@ std::vector<render_proxyst> collect_proxies(
 {
 	std::vector<render_proxyst> proxies;
 	auto layers=visual_layers(vp);
-	const std::array order={
-		viewport_creature_layer::center,
-		viewport_creature_layer::item,
-		viewport_creature_layer::vehicle,
-		viewport_creature_layer::right,
-		viewport_creature_layer::left,
-		viewport_creature_layer::upright,
-		viewport_creature_layer::up,
-		viewport_creature_layer::upleft,
-		viewport_creature_layer::designation
-		};
-	for(viewport_creature_layer visual_layer:order)
+	auto previous_layers=visual_layers(vp,true);
+	for(uint8_t draw_order=0;draw_order<visual_layer_count;++draw_order)
 		{
+		const viewport_visual_layer visual_layer=visual_layer_at_draw_order(draw_order);
 		const size_t layer=static_cast<size_t>(visual_layer);
 		for(int32_t y=0;y<vp->dim_y;++y)
 			{
@@ -669,16 +1224,21 @@ std::vector<render_proxyst> collect_proxies(
 				const int32_t texpos=layers[layer][index];
 				if(texpos==0)continue;
 				const auto movement=animation_manager.get_movement(
-					vp,static_cast<viewport_creature_layer>(layer),x,y);
+					vp,static_cast<viewport_visual_layer>(layer),x,y);
 				if(!movement.active)continue;
-				if(layer!=static_cast<size_t>(viewport_creature_layer::center)&&
-					layer!=static_cast<size_t>(viewport_creature_layer::vehicle)&&
-					layer!=static_cast<size_t>(viewport_creature_layer::item))
+				const int32_t inherited_source_x=inherited_visual_source_tile(
+					x,movement.source_x,x);
+				const int32_t inherited_source_y=inherited_visual_source_tile(
+					y,movement.source_y,y);
+				const bool inherited_source_in_bounds=
+					inherited_source_x>=0&&inherited_source_x<vp->dim_x&&
+					inherited_source_y>=0&&inherited_source_y<vp->dim_y;
+				if(!visual_layer_moves_independently(visual_layer))
 					{
 					bool anchored=false;
 					for(const render_proxyst &anchor:proxies)
 						{
-						if(anchor.layer==viewport_creature_layer::center&&
+						if(anchor.layer==viewport_visual_layer::center&&
 							std::abs(anchor.target_x-x)<=1&&
 							std::abs(anchor.target_y-y)<=1&&
 							anchor.source_x-anchor.target_x==movement.source_x-x&&
@@ -687,34 +1247,47 @@ std::vector<render_proxyst> collect_proxies(
 						}
 					if(!anchored)continue;
 					}
-				if((visual_layer==viewport_creature_layer::item||
-					visual_layer==viewport_creature_layer::designation)&&
-					movement.inherited)
+					if((visual_layer==viewport_visual_layer::item||
+						visual_layer==viewport_visual_layer::designation)&&
+						movement.inherited)
 					{
-					// A sprite that reappeared exactly where a creature stood last frame
-					// was UN-OCCLUDED as it walked away, not carried along: never ride it
-					// on the walker's motion (dense item scatter otherwise hitches rides).
-					if(vp->screentexpos_old[index]!=0)continue;
-					const int32_t source_x=x-
-						((x>movement.source_x)-(x<movement.source_x));
-					const int32_t source_y=y-
-						((y>movement.source_y)-(y<movement.source_y));
-					if(source_x<0||source_x>=vp->dim_x||
-						source_y<0||source_y>=vp->dim_y)continue;
+					if(visual_layer==viewport_visual_layer::item&&
+						vp->screentexpos_old[index]!=0)continue;
+					if(!inherited_source_in_bounds)continue;
 					const int32_t source=
-						source_x*vp->dim_y+source_y;
+						inherited_source_x*vp->dim_y+inherited_source_y;
 					if(!visual_moved_between_tiles(
-						layers[layer],
-						visual_layer==viewport_creature_layer::item?
-							vp->screentexpos_item_old:
-							vp->screentexpos_designation_old,
-						source,
-						index))continue;
+						visual_layer,
+							layers[layer],
+							previous_layers[layer],
+							source,
+							index))continue;
+					}
+				if(!visual_layer_moves_independently(visual_layer)&&
+					visual_layer!=viewport_visual_layer::designation&&movement.inherited)
+					{
+					const bool fragment_moved=inherited_source_in_bounds&&
+						visual_moved_between_tiles(
+							visual_layer,layers[layer],previous_layers[layer],
+							inherited_source_x*vp->dim_y+inherited_source_y,index);
+					if(!fragment_moved)
+						{
+					const auto &descriptor=visual_layer_descriptor(visual_layer);
+					bool owns_fragment=false;
+					for(const render_proxyst &anchor:proxies)
+						if(anchor.layer==viewport_visual_layer::center&&
+							anchor.target_x==x+descriptor.center_x&&
+							anchor.target_y==y+descriptor.center_y&&
+							anchor.source_x-anchor.target_x==movement.source_x-x&&
+							anchor.source_y-anchor.target_y==movement.source_y-y&&
+							anchor.progress==movement.progress)owns_fragment=true;
+					if(!owns_fragment)continue;
+						}
 					}
 
 				render_proxyst proxy=
 					{
-					static_cast<viewport_creature_layer>(layer),
+					static_cast<viewport_visual_layer>(layer),
 					movement.source_x,
 					movement.source_y,
 					x,
@@ -740,7 +1313,7 @@ std::vector<render_proxyst> collect_proxies(
 							blocked=true;
 							break;
 							}
-						if(is_main_creature(proxy.layer)&&
+						if(visual_render_group(proxy.layer)==visual_render_groupst::main&&
 							has_fire(vp,coverage_x,coverage_y))
 							{
 							blocked=true;
@@ -752,20 +1325,8 @@ std::vector<render_proxyst> collect_proxies(
 					}
 				if(blocked)continue;
 
-				df::texture_fullid texture_id;
-				texture_id.texpos=texpos;
-				texture_id.r=texture_id.g=texture_id.b=1.0f;
-				texture_id.br=texture_id.bg=texture_id.bb=0.0f;
-				texture_id.flag=
-					df::texture_fullid_flag::mask_transparent_background;
-				const auto texture=renderer->tile_cache.tile_cache.find(texture_id);
-				if(texture==renderer->tile_cache.tile_cache.end())
-					{
-					++stat_cache_misses;
-					continue;
-					}
-				proxy.texture=static_cast<SDL_Texture *>(texture->second);
-				++stat_proxies;
+				proxy.texture=cached_texture(renderer,texpos);
+				if(proxy.texture==nullptr)continue;
 				proxies.push_back(std::move(proxy));
 				}
 			}
@@ -773,27 +1334,121 @@ std::vector<render_proxyst> collect_proxies(
 	return proxies;
 }
 
+using tile_coveragest=std::set<std::pair<int32_t,int32_t>>;
+
+struct render_coveragest
+{
+	tile_coveragest all;
+	std::array<tile_coveragest,static_cast<size_t>(visual_render_groupst::count)> groups;
+	std::unordered_map<int32_t,uint16_t> selected;
+};
+
+render_coveragest collect_coverage(
+	const std::vector<render_proxyst> &proxies,
+	int32_t dim_y)
+{
+	render_coveragest coverage;
+	for(const render_proxyst &proxy:proxies)
+		{
+		coverage.all.insert(proxy.coverage.begin(),proxy.coverage.end());
+		coverage.selected[proxy.target_x*dim_y+proxy.target_y]|=
+			visual_layer_bit(proxy.layer);
+		auto &group=coverage.groups[static_cast<size_t>(visual_render_group(proxy.layer))];
+		group.insert(proxy.coverage.begin(),proxy.coverage.end());
+		}
+	return coverage;
+}
+
+void add_tile_transition_coverage(
+	render_coveragest &coverage,
+	int32_t dim_y)
+{
+	for(const auto &entry:tile_transition_manager.entries())
+		coverage.all.emplace(entry.first/dim_y,entry.first%dim_y);
+}
+
+void draw_tile_transitions(
+	df::renderer_2d_base *renderer,
+	df::graphic_viewportst *vp)
+{
+	SDL_Renderer *sdl_renderer=static_cast<SDL_Renderer *>(renderer->sdl_renderer);
+	const int32_t zoom=renderer->viewport_zoom_factor;
+	const int32_t tile_size=zoom==128?32:std::max(1,zoom*32/128);
+	const uint32_t now_ms=animation_manager.get_frame_time_ms();
+	for(const auto &[index,transition]:tile_transition_manager.entries())
+		{
+		const int32_t x=index/vp->dim_y;
+		const int32_t y=index%vp->dim_y;
+		if(!inside_clip(vp,x,y))continue;
+		const int32_t target_x=tile_pixel(x,renderer->origin_x,zoom);
+		const int32_t target_y=tile_pixel(y,renderer->origin_y,zoom);
+		const float progress=tile_transition_manager.progress(transition,now_ms);
+		const SDL_FRect destination=
+			{
+			float(target_x),
+			float(target_y),
+			float(tile_size),
+			float(tile_size)
+			};
+		SDL_Texture *previous=cached_tile_texture(renderer,transition.previous_texpos);
+		SDL_Texture *current=cached_tile_texture(renderer,transition.current_texpos);
+		if(previous==nullptr&&current==nullptr)
+			{
+			continue;
+			}
+		if(previous!=nullptr)
+			draw_texture_with_alpha(sdl_renderer,previous,destination,1.0f-progress);
+		if(current!=nullptr)
+			draw_texture_with_alpha(sdl_renderer,current,destination,progress);
+		}
+}
+
+void draw_interpolation_stages(
+	df::renderer_2d_base *renderer,
+	df::graphic_viewportst *vp,
+	const std::vector<render_proxyst> &proxies,
+	const render_coveragest &coverage)
+{
+	for(size_t index=0;index<coverage.groups.size();++index)
+		{
+		const auto group=static_cast<visual_render_groupst>(index);
+		for(const render_proxyst &proxy:proxies)
+			if(visual_render_group(proxy.layer)==group)draw_proxy(renderer,proxy);
+		if(group==visual_render_groupst::designation)continue;
+		for(const auto &[x,y]:coverage.groups[index])
+			redraw_above(renderer,vp,x,y,group,coverage.selected);
+		}
+}
+
 void render_interpolated_world(df::renderer_2d_base *renderer)
 {
 	df::graphic_viewportst *vp=gps?gps->main_viewport:nullptr;
 
 	if(vp!=nullptr)update_visual_context(renderer,vp);
-	animation_manager.begin_frame(get_ticks());
+	const uint32_t now_ms=Core::getInstance().p->getTickCount();
+	animation_manager.begin_frame(now_ms);
 	if(vp!=nullptr)
 		{
 		const auto input=animation_input(vp);
 		animation_manager.synchronize_viewport(
 			input,
 			vp->flag.bits.active);
+		if(vp->flag.bits.active&&construction_transitions_enabled)
+			tile_transition_manager.synchronize(vp,now_ms);
+		else
+			tile_transition_manager.clear();
 		}
+	else
+		tile_transition_manager.clear();
 	animation_manager.end_frame();
 
-	if(vp==nullptr||!vp->flag.bits.active||
-		render_copy_f==nullptr||renderer->sdl_renderer==nullptr)
+	if(vp==nullptr||!vp->flag.bits.active||renderer->sdl_renderer==nullptr)
 		return;
+	update_camera(renderer,vp,animation_manager.get_frame_delta_ms());
 	const double cam_tile=tile_px(renderer);
-	// --- world-tile slide update ---
-	const uint32_t now_ms=animation_manager.get_frame_time_ms();
+	const bool camera_active=camera_enabled&&!adventure_mode();
+
+	// --- world-tile slide (owns smoothing whenever the fort camera does not) ---
 	if(animation_manager.stats.resets!=slide_resets_seen||
 		visual_context_revision!=slide_revision_seen)
 		{
@@ -803,10 +1458,8 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		}
 	slide_resets_seen=animation_manager.stats.resets;
 	slide_revision_seen=visual_context_revision;
-	// A middle-mouse drag is a direct manipulation: the view must track the mouse
-	// crisply, so the slide sits out while the button is held -- and for a few frames
-	// after release, since the drag's final window steps land in the buffers late and
-	// would otherwise bounce the view back as a parting slide.
+	// A middle-mouse drag is direct manipulation: the slide sits out while the button is
+	// held, plus a few frames after release (the drag's final window steps land late).
 	const bool dragging=enabler!=nullptr&&enabler->mouse_mbut;
 	if(dragging)
 		{
@@ -823,32 +1476,48 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		slide_now_y=0.0;
 		}
 	if(animation_manager.stats.last_shift_x!=0||animation_manager.stats.last_shift_y!=0)
+		{
 		strip_cache_update(
 			vp,
 			animation_manager.stats.last_shift_x,
 			animation_manager.stats.last_shift_y);
-	if((animation_manager.stats.last_shift_x!=0||animation_manager.stats.last_shift_y!=0)&&
-		!dragging&&slide_drag_cooldown==0)
-		{
-		// A scroll landed this frame: the content jumped by -shift tiles on screen. Start
-		// (or retarget from the current fractional offset) a slide back to the grid.
-		const double cap=slide_max_tiles*cam_tile;
-		slide_from_x=std::clamp(
-			slide_now_x+double(animation_manager.stats.last_shift_x)*cam_tile,-cap,cap);
-		slide_from_y=std::clamp(
-			slide_now_y+double(animation_manager.stats.last_shift_y)*cam_tile,-cap,cap);
-		slide_start_ms=now_ms;
-		slide_active=true;
-		slide_now_x=slide_from_x;
-		slide_now_y=slide_from_y;
+		if(!camera_active&&!dragging&&slide_drag_cooldown==0)
+			{
+			// A scroll landed: the content jumped by -shift tiles on screen. Start (or
+			// retarget from the current fractional offset) a slide back to the grid.
+			const double cap=slide_max_tiles*cam_tile;
+			slide_from_x=std::clamp(
+				slide_now_x+double(animation_manager.stats.last_shift_x)*cam_tile,
+				-cap,cap);
+			slide_from_y=std::clamp(
+				slide_now_y+double(animation_manager.stats.last_shift_y)*cam_tile,
+				-cap,cap);
+			slide_start_ms=now_ms;
+			slide_active=true;
+			slide_now_x=slide_from_x;
+			slide_now_y=slide_from_y;
+			}
 		}
-	const int32_t glide_x=int32_t(std::lround(slide_now_x));
-	const int32_t glide_y=int32_t(std::lround(slide_now_y));
-	// Visual continuity check: the drawn world offset is -window*tile + glide. Any one-frame
-	// move above 0.6 tile is a visible jump -- either an intended snap or the jank we hunt.
+	if(camera_active&&slide_active)
+		{
+		slide_active=false;
+		slide_now_x=0.0;
+		slide_now_y=0.0;
+		}
+
+	const int32_t glide_x=camera_active?
+		int32_t(std::lround(transient_x+rest_x*cam_tile)):
+		int32_t(std::lround(slide_now_x));
+	const int32_t glide_y=camera_active?
+		int32_t(std::lround(transient_y+rest_y*cam_tile)):
+		int32_t(std::lround(slide_now_y));
+	const bool glide=glide_x!=0||glide_y!=0;
+
+	// Visual continuity check: the drawn world offset is -window*tile + glide. Any
+	// one-frame move above 0.6 tile is a visible jump -- an intended snap or a bug.
 	{
-	const double visual_x=-double(window_x?*window_x:0)*cam_tile+slide_now_x;
-	const double visual_y=-double(window_y?*window_y:0)*cam_tile+slide_now_y;
+	const double visual_x=-double(window_x?*window_x:0)*cam_tile+double(glide_x);
+	const double visual_y=-double(window_y?*window_y:0)*cam_tile+double(glide_y);
 	last_jump_x=0.0f;
 	last_jump_y=0.0f;
 	if(has_prev_visual&&prev_visual_revision==visual_context_revision&&
@@ -868,38 +1537,20 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	prev_visual_revision=visual_context_revision;
 	has_prev_visual=true;
 	}
-	const bool glide=glide_x!=0||glide_y!=0;
-	if(!glide&&slide_was_offset)
+	if(!glide&&camera_was_offset)
 		{
-		// The world just re-joined the grid: one engine redraw replaces the last shifted frame.
-		slide_was_offset=false;
+		// The camera just re-joined the grid: one engine redraw replaces the last shifted frame.
+		camera_was_offset=false;
 		if(gps!=nullptr)++gps->force_full_display_count;
 		}
-	if(glide)slide_was_offset=true;
-	if(!glide&&!animation_manager.requires_full_redraw())
+	if(glide)camera_was_offset=true;
+	if(!glide&&!animation_manager.requires_full_redraw()&&
+		!tile_transition_manager.active())
 		return;
 
 	std::vector<render_proxyst> proxies=collect_proxies(renderer,vp);
-	std::set<std::pair<int32_t,int32_t>> current_coverage;
-	std::set<std::pair<int32_t,int32_t>> item_coverage;
-	std::set<std::pair<int32_t,int32_t>> vehicle_coverage;
-	std::set<std::pair<int32_t,int32_t>> main_coverage;
-	std::set<std::pair<int32_t,int32_t>> upper_coverage;
-	std::unordered_map<int32_t,uint16_t> selected;
-	for(const render_proxyst &proxy:proxies)
-		{
-		current_coverage.insert(proxy.coverage.begin(),proxy.coverage.end());
-		auto &layer_mask=selected[proxy.target_x*vp->dim_y+proxy.target_y];
-		layer_mask|=uint16_t(1U<<static_cast<uint8_t>(proxy.layer));
-		if(proxy.layer==viewport_creature_layer::item)
-			item_coverage.insert(proxy.coverage.begin(),proxy.coverage.end());
-		else if(proxy.layer==viewport_creature_layer::vehicle)
-			vehicle_coverage.insert(proxy.coverage.begin(),proxy.coverage.end());
-		else if(is_main_creature(proxy.layer))
-			main_coverage.insert(proxy.coverage.begin(),proxy.coverage.end());
-		else if(proxy.layer!=viewport_creature_layer::designation)
-			upper_coverage.insert(proxy.coverage.begin(),proxy.coverage.end());
-		}
+	render_coveragest coverage=collect_coverage(proxies,vp->dim_y);
+	add_tile_transition_coverage(coverage,vp->dim_y);
 
 	SDL_Renderer *sdl_renderer=static_cast<SDL_Renderer *>(renderer->sdl_renderer);
 	const int32_t zoom=renderer->viewport_zoom_factor;
@@ -910,12 +1561,11 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		++stat_glide_frames;
 		// Camera-carried sprites (screen-static across a landing: the adventure player and
 		// its overlays) are masked out of the sliding repaint and drawn pinned afterwards.
-		const auto &pinned=animation_manager.get_pinned(vp);
+		const auto &pinned=camera_active?
+			visual_animation_managerst::empty_pinned:
+			animation_manager.get_pinned(vp);
 		for(const auto &pin:pinned)
-			{
-			auto &layer_mask=selected[pin.x*vp->dim_y+pin.y];
-			layer_mask|=uint16_t(1U<<static_cast<uint8_t>(pin.layer));
-			}
+			coverage.selected[pin.x*vp->dim_y+pin.y]|=visual_layer_bit(pin.layer);
 		// Camera mid-glide: repaint the WHOLE map rect at the shifted origin so the world (and
 		// the creature proxies, which read origin at draw time) renders between tiles. The engine
 		// already drew this frame at the snapped position; everything here overdraws it, clipped
@@ -944,11 +1594,11 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		for(int32_t x=vp->clipx[0];x<=vp->clipx[1];++x)
 			{
 			for(int32_t y=vp->clipy[0];y<=vp->clipy[1];++y)
-				redraw_world_tile(renderer,vp,x,y,selected);
+				redraw_world_tile(renderer,vp,x,y,coverage.selected);
 			}
-		// Trailing edge: the band uncovered by the slide has no viewport data any more --
-		// draw it from the outgoing-tile cache so departed world stays visible while the
-		// slide lands (the clip rect confines any overdraw to the map).
+		// Trailing edge: the band uncovered by the glide has no viewport data any more --
+		// draw it from the outgoing-tile cache so departed world stays visible (the clip
+		// rect confines any overdraw to the map).
 		{
 		const strip_cachest &strip=strip_caches[strip_cache_front];
 		if(strip.valid&&strip.dim_x==vp->dim_x&&strip.dim_y==vp->dim_y)
@@ -970,39 +1620,8 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 				}
 			}
 		}
-		for(const render_proxyst &proxy:proxies)
-			{
-			if(proxy.layer==viewport_creature_layer::item)draw_proxy(renderer,proxy);
-			}
-		for(const auto &[x,y]:item_coverage)
-			redraw_above_base(
-				renderer,vp,x,y,viewport_creature_layer::item,selected);
-		for(const render_proxyst &proxy:proxies)
-			{
-			if(proxy.layer==viewport_creature_layer::vehicle)draw_proxy(renderer,proxy);
-			}
-		for(const auto &[x,y]:vehicle_coverage)
-			redraw_above_base(
-				renderer,vp,x,y,viewport_creature_layer::vehicle,selected);
-		for(const render_proxyst &proxy:proxies)
-			{
-			if(is_main_creature(proxy.layer))draw_proxy(renderer,proxy);
-			}
-		for(const auto &[x,y]:main_coverage)
-			redraw_above_main(renderer,vp,x,y,selected);
-		for(const render_proxyst &proxy:proxies)
-			{
-			if(proxy.layer!=viewport_creature_layer::item&&
-				proxy.layer!=viewport_creature_layer::vehicle&&
-				proxy.layer!=viewport_creature_layer::designation&&
-				!is_main_creature(proxy.layer))draw_proxy(renderer,proxy);
-			}
-		for(const auto &[x,y]:upper_coverage)
-			redraw_above_upper(renderer,vp,x,y,selected);
-		for(const render_proxyst &proxy:proxies)
-			{
-			if(proxy.layer==viewport_creature_layer::designation)draw_proxy(renderer,proxy);
-			}
+		draw_tile_transitions(renderer,vp);
+		draw_interpolation_stages(renderer,vp,proxies,coverage);
 		renderer->origin_x=saved_origin_x;
 		renderer->origin_y=saved_origin_y;
 		// The pinned sprites render at their true screen tiles, WITHOUT the slide: the
@@ -1036,7 +1655,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		return;
 		}
 
-	std::set<std::pair<int32_t,int32_t>> redraw_coverage=current_coverage;
+	std::set<std::pair<int32_t,int32_t>> redraw_coverage=coverage.all;
 	redraw_coverage.insert(previous_coverage.begin(),previous_coverage.end());
 	Uint8 old_r=0,old_g=0,old_b=0,old_a=255;
 	get_render_draw_color(sdl_renderer,&old_r,&old_g,&old_b,&old_a);
@@ -1057,63 +1676,38 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 
 	for(const auto &[x,y]:redraw_coverage)
 		{
-		if(inside_clip(vp,x,y))redraw_world_tile(renderer,vp,x,y,selected);
+		if(inside_clip(vp,x,y))redraw_world_tile(renderer,vp,x,y,coverage.selected);
 		}
-	for(const render_proxyst &proxy:proxies)
-		{
-		if(proxy.layer==viewport_creature_layer::item)draw_proxy(renderer,proxy);
-		}
-	for(const auto &[x,y]:item_coverage)
-		redraw_above_base(renderer,vp,x,y,viewport_creature_layer::item,selected);
-	for(const render_proxyst &proxy:proxies)
-		{
-		if(proxy.layer==viewport_creature_layer::vehicle)draw_proxy(renderer,proxy);
-		}
-	for(const auto &[x,y]:vehicle_coverage)
-		redraw_above_base(renderer,vp,x,y,viewport_creature_layer::vehicle,selected);
-	for(const render_proxyst &proxy:proxies)
-		{
-		if(is_main_creature(proxy.layer))draw_proxy(renderer,proxy);
-		}
-	for(const auto &[x,y]:main_coverage)
-		redraw_above_main(renderer,vp,x,y,selected);
-	for(const render_proxyst &proxy:proxies)
-		{
-		if(proxy.layer!=viewport_creature_layer::item&&
-			proxy.layer!=viewport_creature_layer::vehicle&&
-			proxy.layer!=viewport_creature_layer::designation&&
-			!is_main_creature(proxy.layer))draw_proxy(renderer,proxy);
-		}
-	for(const auto &[x,y]:upper_coverage)
-		redraw_above_upper(renderer,vp,x,y,selected);
-	for(const render_proxyst &proxy:proxies)
-		{
-		if(proxy.layer==viewport_creature_layer::designation)draw_proxy(renderer,proxy);
-		}
+	draw_tile_transitions(renderer,vp);
+	draw_interpolation_stages(renderer,vp,proxies,coverage);
 
-	previous_coverage=std::move(current_coverage);
+	previous_coverage=std::move(coverage.all);
 }
 
-// --- mouse dispatch under a camera offset ------------------------------------------------------
-// While the free camera draws the world at a visual offset, DF's mouse->map-tile math (in
-// graphics mode: viewport position + precise_mouse / tile_pixels) still resolves against the
-// snapped grid, so clicks dispatch to the tile UNDER the grid instead of the tile the user sees
-// under the cursor -- up to several tiles off mid-glide, and one tile off near tile edges while
-// the camera rests between tiles. The fix presents DF's input consumers with pixel coordinates
-// in the DISPLAYED frame: precise_mouse minus the visual offset, applied scoped around the map
-// screens' feed/logic and around the engine's UI render stage (hover highlight), then restored.
-// The interface-grid mouse (gps->mouse_x/y) is untouched, so UI widget hit-testing -- which runs
-// on the interface grid, not map pixels -- is unaffected, and everything outside the wrapped
-// calls (including this plugin's own drag-pan anchors) sees raw hardware values.
-
-// Current visual camera offset in pixels, from gps's copy of the viewport zoom so input hooks
-// need no renderer object. Matches the glide offset the render path applies to the world.
+// --- mouse dispatch under a visual offset ------------------------------------------------------
+// While the world is drawn at a visual offset (fort camera glide/rest, or the adventure world
+// slide), DF's mouse->map-tile math still resolves precise_mouse against the snapped grid, so
+// clicks dispatch to the tile under the grid instead of the tile the user sees. The map screens'
+// input (and the engine's hover-highlight stage) run with precise_mouse shifted into the
+// displayed frame, scoped and restored; the interface-grid mouse is untouched.
 bool visual_mouse_shift(int32_t &shift_px_x,int32_t &shift_px_y)
 {
-	if(!slide_active||gps==nullptr)return false;
-	const uint32_t now_ms=animation_manager.get_frame_time_ms();
-	shift_px_x=int32_t(std::lround(slide_offset_now(now_ms,slide_from_x)));
-	shift_px_y=int32_t(std::lround(slide_offset_now(now_ms,slide_from_y)));
+	if(gps==nullptr)return false;
+	const int32_t zoom=gps->viewport_zoom_factor;
+	const double tile=double(zoom==128?32:std::max(1,zoom*32/128));
+	if(camera_enabled&&!adventure_mode())
+		{
+		shift_px_x=int32_t(std::lround(transient_x+rest_x*tile));
+		shift_px_y=int32_t(std::lround(transient_y+rest_y*tile));
+		}
+	else if(slide_active)
+		{
+		const uint32_t now_ms=Core::getInstance().p->getTickCount();
+		shift_px_x=int32_t(std::lround(slide_offset_now(now_ms,slide_from_x)));
+		shift_px_y=int32_t(std::lround(slide_offset_now(now_ms,slide_from_y)));
+		}
+	else
+		return false;
 	return shift_px_x!=0||shift_px_y!=0;
 }
 
@@ -1136,8 +1730,6 @@ class scoped_mouse_shiftst
 			const int32_t tile=zoom==128?32:std::max(1,zoom*32/128);
 			saved_x=gps->precise_mouse_x;
 			saved_y=gps->precise_mouse_y;
-			// Clamp into the viewport: pixels over the trailing black strip have no displayed
-			// tile, so they resolve to the nearest edge tile instead of going out of range.
 			gps->precise_mouse_x=std::clamp(saved_x-shift_x,0,vp->dim_x*tile-1);
 			gps->precise_mouse_y=std::clamp(saved_y-shift_y,0,vp->dim_y*tile-1);
 			active=true;
@@ -1205,14 +1797,6 @@ void fort_input_hook::interpose_fn_logic()
 	INTERPOSE_NEXT(logic)();
 }
 
-struct renderer_hook : df::renderer_2d_base
-{
-	typedef df::renderer_2d_base interpose_base;
-	DEFINE_VMETHOD_INTERPOSE(void,update_all,());
-};
-
-IMPLEMENT_VMETHOD_INTERPOSE(renderer_hook,update_all);
-
 void record_trace_frame()
 {
 	trace_framest &rec=trace_ring[trace_frames%trace_capacity];
@@ -1235,65 +1819,97 @@ void record_trace_frame()
 	rec.pans=uint32_t(st.pan_frames);
 	rec.pending_dx=st.last_pending_dx;
 	rec.pending_dy=st.last_pending_dy;
-	const uint32_t now_ms=animation_manager.get_frame_time_ms();
+	const uint32_t now_ms=Core::getInstance().p->getTickCount();
 	rec.slide_px_x=float(slide_offset_now(now_ms,slide_from_x));
 	rec.slide_px_y=float(slide_offset_now(now_ms,slide_from_y));
 	rec.jump_x=last_jump_x;
 	rec.jump_y=last_jump_y;
 }
 
+struct renderer_hook : df::renderer_2d_base
+{
+	typedef df::renderer_2d_base interpose_base;
+	DEFINE_VMETHOD_INTERPOSE(void,update_all,());
+};
+
+IMPLEMENT_VMETHOD_INTERPOSE(renderer_hook,update_all);
+
 void renderer_hook::interpose_fn_update_all()
 {
 	// update_all is the existing UI stage, so world correction must run first.
 	render_interpolated_world(this);
 	record_trace_frame();
-	// The UI stage computes the hover highlight from the mouse; shift it into the displayed
-	// frame too, so the highlighted tile is the one a click would dispatch to.
+	// The UI stage computes the hover highlight from the mouse; shift it into the
+	// displayed frame too, so the highlighted tile is the one a click dispatches to.
 	scoped_mouse_shiftst shifted;
 	INTERPOSE_NEXT(update_all)();
 }
 
+void clear_sdl_bindings()
+{
+	if(sdl_handle!=nullptr)ClosePlugin(sdl_handle);
+	sdl_handle=nullptr;
+	render_copy_f=nullptr;
+	render_fill_rect=nullptr;
+	render_set_clip_rect=nullptr;
+	get_render_draw_color=nullptr;
+	set_render_draw_color=nullptr;
+	get_texture_alpha_mod=nullptr;
+	set_texture_alpha_mod=nullptr;
+	get_texture_blend_mode=nullptr;
+	set_texture_blend_mode=nullptr;
+}
+
 bool load_sdl(color_ostream &out)
 {
+	clear_sdl_bindings();
 	sdl_handle=OpenPlugin(sdl_library);
 	if(sdl_handle==nullptr)
 		{
 		out.printerr("smooth-movement: could not load SDL2\n");
 		return false;
 		}
-	render_copy_f=reinterpret_cast<RenderCopyF>(
-		LookupPlugin(sdl_handle,"SDL_RenderCopyF"));
-	render_fill_rect=reinterpret_cast<RenderFillRect>(
-		LookupPlugin(sdl_handle,"SDL_RenderFillRect"));
-	render_set_clip_rect=reinterpret_cast<RenderSetClipRect>(
-		LookupPlugin(sdl_handle,"SDL_RenderSetClipRect"));
-	get_render_draw_color=reinterpret_cast<GetRenderDrawColor>(
-		LookupPlugin(sdl_handle,"SDL_GetRenderDrawColor"));
-	set_render_draw_color=reinterpret_cast<SetRenderDrawColor>(
-		LookupPlugin(sdl_handle,"SDL_SetRenderDrawColor"));
-	get_ticks=reinterpret_cast<GetTicks>(LookupPlugin(sdl_handle,"SDL_GetTicks"));
-	if(render_copy_f==nullptr||render_fill_rect==nullptr||
-		render_set_clip_rect==nullptr||
-		get_render_draw_color==nullptr||set_render_draw_color==nullptr||
-		get_ticks==nullptr)
-		{
-		out.printerr("smooth-movement: required SDL2 functions are unavailable\n");
-		ClosePlugin(sdl_handle);
-		sdl_handle=nullptr;
-		return false;
+	#define bind(name,target) \
+		target=reinterpret_cast<decltype(target)>(LookupPlugin(sdl_handle,#name)); \
+		if(target==nullptr) { \
+			out.printerr("smooth-movement: SDL2 function unavailable: " #name "\n"); \
+			clear_sdl_bindings(); \
+			return false; \
 		}
+	bind(SDL_RenderCopyF,render_copy_f);
+	bind(SDL_RenderFillRect,render_fill_rect);
+	bind(SDL_RenderSetClipRect,render_set_clip_rect);
+	bind(SDL_GetRenderDrawColor,get_render_draw_color);
+	bind(SDL_SetRenderDrawColor,set_render_draw_color);
+	bind(SDL_GetTextureAlphaMod,get_texture_alpha_mod);
+	bind(SDL_SetTextureAlphaMod,set_texture_alpha_mod);
+	bind(SDL_GetTextureBlendMode,get_texture_blend_mode);
+	bind(SDL_SetTextureBlendMode,set_texture_blend_mode);
+	#undef bind
 	return true;
 }
 
 void reset_state()
 {
-	animation_manager=visual_animation_managerst();
-	stat_proxies=0;
-	stat_cache_misses=0;
+	slide_from_x=0.0;
+	slide_from_y=0.0;
+	slide_start_ms=0;
+	slide_active=false;
+	slide_resets_seen=0;
+	slide_revision_seen=0;
+	slide_drag_cooldown=0;
+	strip_cache_invalidate();
+	strip_recipe_memo.clear();
 	stat_glide_frames=0;
 	stat_mouse_shifts=0;
 	stat_visual_jumps=0;
+	stat_strip_draws=0;
+	stat_strip_misses=0;
 	has_prev_visual=false;
+	trace_frames=0;
+	last_sig_diff=0;
+	animation_manager=visual_animation_managerst();
+	tile_transition_manager.reset();
 	previous_coverage.clear();
 	visual_context_revision=0;
 	previous_viewport=nullptr;
@@ -1302,18 +1918,13 @@ void reset_state()
 	previous_pan_x=0;
 	previous_pan_y=0;
 	has_pan_context=false;
-	slide_from_x=0.0;
-	slide_from_y=0.0;
-	slide_start_ms=0;
-	slide_active=false;
-	slide_was_offset=false;
-	slide_resets_seen=0;
-	slide_revision_seen=0;
-	slide_drag_cooldown=0;
-	strip_cache_invalidate();
-	strip_recipe_memo.clear();
-	stat_strip_draws=0;
-	stat_strip_misses=0;
+	cancel_camera_transients();
+	rest_x=0.0;
+	rest_y=0.0;
+	camera_enabled=false;
+	camera_has_prev=false;
+	camera_was_offset=false;
+	construction_transitions_enabled=false;
 }
 
 command_result status_command(
@@ -1326,23 +1937,30 @@ command_result status_command(
 			"smooth-movement {}: {}\n",
 			plugin_version,
 			is_enabled?"enabled":"disabled");
-		out.print("world slide: {}, offset {:.1f} {:.1f} px\n",
+		out.print("free camera (fortress mode): {}, offset {:.3f} {:.3f}"
+			" (tiles east/south of the grid)\n",
+			camera_enabled?"on":"off",-rest_x,-rest_y);
+		{
+		const uint32_t now_ms=Core::getInstance().p->getTickCount();
+		out.print("world slide (adventure mode): {}, offset {:.1f} {:.1f} px\n",
 			slide_active?"active":"idle",
-			slide_offset_now(animation_manager.get_frame_time_ms(),slide_from_x),
-			slide_offset_now(animation_manager.get_frame_time_ms(),slide_from_y));
+			slide_offset_now(now_ms,slide_from_x),
+			slide_offset_now(now_ms,slide_from_y));
+		}
+		out.print("construction transitions: {}\n",
+			construction_transitions_enabled?"on":"off");
 		out.print(
-			"stats: movements {} landings {} suppressed {} resets {} | proxies {} cache-misses {}\n",
+			"stats: movements {} landings {} suppressed {} resets {}\n",
 			animation_manager.stats.movements,
 			animation_manager.stats.landings,
 			animation_manager.stats.suppressed,
-			animation_manager.stats.resets,
-			stat_proxies,
-			stat_cache_misses);
+			animation_manager.stats.resets);
 		out.print("glide frames: {}, shifted input dispatches: {}, visual jumps: {}\n",
 			stat_glide_frames,stat_mouse_shifts,stat_visual_jumps);
 		out.print("strip: draws {} cache-misses {}\n",stat_strip_draws,stat_strip_misses);
 		out.print(
-			"scroll: pans {} static {} identical {} unrecognized {} absorbed {} pending {} {}\n",
+			"scroll: pans {} static {} identical {} unrecognized {} absorbed {}"
+			" pending {} {}\n",
 			animation_manager.stats.pan_frames,
 			animation_manager.stats.static_frames,
 			animation_manager.stats.identical_frames,
@@ -1367,8 +1985,6 @@ command_result status_command(
 		}
 	if(parameters[0]=="trace")
 		{
-		// Dump the interesting rows of the per-frame ring: window moves, signature
-		// flickers, manager attribution outcomes, camera pending/transient activity.
 		static const char *sig_names[12]=
 			{"z","dimx","dimy","cx0","cx1","cy0","cy1","zoom","ox","oy","gdimx","gdimy"};
 		const uint32_t have=trace_frames<trace_capacity?trace_frames:uint32_t(trace_capacity);
@@ -1430,6 +2046,79 @@ command_result status_command(
 		out.print("({} of {} frames interesting)\n",printed,have);
 		return CR_OK;
 		}
+	if(parameters[0]=="construction")
+		{
+		if(parameters.size()==1)
+			{
+			out.print("construction transitions: {}\n",
+				construction_transitions_enabled?"on":"off");
+			return CR_OK;
+			}
+		if(parameters.size()==2&&parameters[1]=="on")
+			{
+			construction_transitions_enabled=true;
+			return CR_OK;
+			}
+		if(parameters.size()==2&&parameters[1]=="off")
+			{
+			construction_transitions_enabled=false;
+			tile_transition_manager.clear();
+			return CR_OK;
+			}
+		return CR_WRONG_USAGE;
+		}
+	if(parameters[0]=="camera")
+		{
+		if(parameters.size()==1)
+			{
+			out.print("free camera: {}, offset {:.3f} {:.3f}\n",
+				camera_enabled?"on":"off",-rest_x,-rest_y);
+			return CR_OK;
+			}
+		if(parameters.size()==2&&parameters[1]=="on")
+			{
+			set_camera_enabled(true);
+			if(adventure_mode())
+				out.print("note: adventure mode uses the world slide; the free camera"
+					" applies in fortress mode.\n");
+			return CR_OK;
+			}
+		if(parameters.size()==2&&parameters[1]=="off")
+			{
+			set_camera_enabled(false);
+			return CR_OK;
+			}
+		if(parameters.size()==2&&parameters[1]=="reset")
+			{
+			rest_x=0.0;
+			rest_y=0.0;
+			return CR_OK;
+			}
+		if(parameters.size()==3)
+			{
+			try
+				{
+				const double fx=std::stod(parameters[1]);
+				const double fy=std::stod(parameters[2]);
+				if(fx<-0.99||fx>0.99||fy<-0.99||fy>0.99)
+					{
+					out.printerr("offsets must be within -0.99..0.99 tiles\n");
+					return CR_FAILURE;
+					}
+				// User-facing: positive = view sits east/south of the grid position.
+				set_camera_enabled(true);
+				rest_x=-fx;
+				rest_y=-fy;
+				normalize_rest();
+				return CR_OK;
+				}
+			catch(...)
+				{
+				return CR_WRONG_USAGE;
+				}
+			}
+		return CR_WRONG_USAGE;
+		}
 	return CR_WRONG_USAGE;
 }
 
@@ -1440,7 +2129,7 @@ plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 {
 	commands.emplace_back(
 		"smooth-movement",
-		"Smooth movement status and diagnostics (trace).",
+		"Smooth movement status; camera on|off|reset|<fx> <fy>; construction on|off; trace; slidems <n>.",
 		status_command);
 	return CR_OK;
 }
@@ -1464,8 +2153,7 @@ DFhackCExport command_result plugin_enable(color_ostream &out,bool enable)
 			INTERPOSE_HOOK(adventure_input_hook,logic).remove();
 			INTERPOSE_HOOK(fort_input_hook,feed).remove();
 			INTERPOSE_HOOK(fort_input_hook,logic).remove();
-			ClosePlugin(sdl_handle);
-			sdl_handle=nullptr;
+			clear_sdl_bindings();
 			return CR_FAILURE;
 			}
 		}
@@ -1477,13 +2165,7 @@ DFhackCExport command_result plugin_enable(color_ostream &out,bool enable)
 		INTERPOSE_HOOK(fort_input_hook,feed).remove();
 		INTERPOSE_HOOK(fort_input_hook,logic).remove();
 		reset_state();
-		if(sdl_handle!=nullptr)ClosePlugin(sdl_handle);
-		sdl_handle=nullptr;
-		render_copy_f=nullptr;
-		render_fill_rect=nullptr;
-		get_render_draw_color=nullptr;
-		set_render_draw_color=nullptr;
-		get_ticks=nullptr;
+		clear_sdl_bindings();
 		if(gps!=nullptr)++gps->force_full_display_count;
 		}
 	is_enabled=enable;
