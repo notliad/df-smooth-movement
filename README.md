@@ -110,8 +110,9 @@ the game's own tile camera (`window_x`/`window_y`) is untouched:
 - Map scrolls glide: the view exponentially catches up to the new position
   (~100 ms) instead of stepping, drawing the world at sub-tile pixel offsets.
   Jumps larger than 3 tiles (recenter, minimap) snap instantly.
-- Pixel-perfect middle-mouse drag panning: the view follows the mouse 1:1 and
-  rests wherever it is released — including half-way between tiles.
+- Middle-mouse drag panning is native and crisp: the camera stands down while
+  the button is held (a pixel-anchored drag fights DF's own drag stepping and
+  strands the view off-grid), and re-engages for glides on release.
 - `smooth-movement camera <fx> <fy>` sets a persistent sub-tile offset directly
   (positive = view east/south of the grid, up to ±0.99 tiles);
   `smooth-movement camera reset` returns to the grid; `smooth-movement camera`

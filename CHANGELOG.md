@@ -2,6 +2,13 @@
 
 ## Unreleased (adventure-slide)
 
+- Retire the pixel-anchored middle-mouse drag: DF's native drag pans with its own
+  stepping and rate, so the anchor inevitably diverged (visible lurching every dragged
+  tile, and a camera stranded exactly half a tile off-grid on release, which also
+  displaced every click correction -- misplaced dig designations). Middle-drag is now
+  fully native and crisp; the camera glide covers scrolls and recenters, and manual
+  sub-tile offsets remain via `camera <fx> <fy>`.
+
 - Adventure mode support, world-slide style. Scroll landings are attributed on the
   background layer (largest applied prefix), so creatures moving during a
   camera-follow scroll animate relative to the world. The player is not interpolated:

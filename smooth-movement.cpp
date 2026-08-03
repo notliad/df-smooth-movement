@@ -106,11 +106,7 @@ int32_t camera_pending_dy=0;
 int32_t camera_pending_frames=0;
 int32_t self_scroll_x=0;                      // window deltas WE wrote: visual no-ops when landing
 int32_t self_scroll_y=0;
-bool drag_active=false;
-double drag_anchor_vx=0.0;                    // visual camera at drag start, tiles
-double drag_anchor_vy=0.0;
-int32_t drag_anchor_mx=0;                     // precise mouse at drag start, pixels
-int32_t drag_anchor_my=0;
+bool drag_active=false;                       // kept for cancel bookkeeping; never set now
 bool camera_was_offset=false;                 // edge-detects offset->0 for one cleanup redraw
 int32_t camera_prev_wx=0;                     // window-scroll observation baseline
 int32_t camera_prev_wy=0;
@@ -171,6 +167,10 @@ struct trace_framest
 	uint32_t landings,static_f,identical,unrecognized,absorbed,resets,movements,suppressed,pans;
 	int32_t pending_dx,pending_dy;
 	float slide_px_x,slide_px_y;
+	float glide_px_x,glide_px_y;   // the offset actually rendered (camera or slide)
+	float rest_x_t,rest_y_t;       // camera rest, tiles
+	int32_t cam_pending_x,cam_pending_y;
+	uint8_t flags;                 // 1=dragging 2=camera_active
 	float jump_x,jump_y;
 };
 constexpr size_t trace_capacity=2700;
@@ -437,6 +437,19 @@ void update_camera(
 	uint32_t delta_ms)
 {
 	if(!camera_enabled||adventure_mode())return;   // adventure smoothing = the world slide
+	// Middle-mouse drags are DF's own: its drag pans with its own stepping and rate, and a
+	// pixel-anchored drag inevitably diverges from it (clamp -> lurch -> rest stranded at
+	// half a tile, skewing the world and every corrected click). While the button is held
+	// the camera stands down entirely -- crisp native drag -- and re-baselines on release.
+	if(enabler!=nullptr&&enabler->mouse_mbut)
+		{
+		cancel_camera_transients();
+		camera_excursion=false;
+		camera_prev_wx=window_x?*window_x:0;
+		camera_prev_wy=window_y?*window_y:0;
+		camera_has_prev=true;
+		return;
+		}
 	const double tile=tile_px(renderer);
 	const int32_t wx=window_x?*window_x:0;
 	const int32_t wy=window_y?*window_y:0;
@@ -546,49 +559,10 @@ void update_camera(
 			}
 		}
 
-	// --- pixel-perfect middle-mouse drag: the view follows the mouse 1:1 and rests where
-	// released. DF's own drag still moves window in tile steps; rest carries the remainder.
-	// Positions are tracked against the CONTENT window (window minus unlanded jumps) so the
-	// buffer lag never causes a visible stutter.
-	const bool mbut=enabler!=nullptr&&enabler->mouse_mbut;
-	const double content_wx=double(wx-camera_pending_dx);
-	const double content_wy=double(wy-camera_pending_dy);
-	if(mbut&&!drag_active&&gps!=nullptr)
-		{
-		drag_active=true;
-		drag_anchor_vx=content_wx-rest_x-transient_x/tile;
-		drag_anchor_vy=content_wy-rest_y-transient_y/tile;
-		drag_anchor_mx=gps->precise_mouse_x;
-		drag_anchor_my=gps->precise_mouse_y;
-		transient_x=0.0;
-		transient_y=0.0;
-		}
-	if(drag_active)
-		{
-		if(!mbut)
-			{
-			drag_active=false;
-			normalize_rest();
-			}
-		else if(gps!=nullptr)
-			{
-			double vx=drag_anchor_vx-double(gps->precise_mouse_x-drag_anchor_mx)/tile;
-			double vy=drag_anchor_vy-double(gps->precise_mouse_y-drag_anchor_my)/tile;
-			rest_x=content_wx-vx;
-			rest_y=content_wy-vy;
-			// If DF's own drag disagrees by more than a tile and a half, rebase on its view.
-			const double lim=1.5;
-			if(rest_x<-lim||rest_x>lim||rest_y<-lim||rest_y>lim)
-				{
-				rest_x=std::clamp(rest_x,-lim,lim);
-				rest_y=std::clamp(rest_y,-lim,lim);
-				drag_anchor_vx=content_wx-rest_x+
-					double(gps->precise_mouse_x-drag_anchor_mx)/tile;
-				drag_anchor_vy=content_wy-rest_y+
-					double(gps->precise_mouse_y-drag_anchor_my)/tile;
-				}
-			}
-		}
+	// (The former pixel-anchored middle-drag lived here. It fought DF's native drag --
+	// divergence, clamps, and a camera stranded half a tile off-grid -- so drags are now
+	// fully native: the camera stands down at the top of this function while the middle
+	// button is held.)
 
 	if(transient_x!=0.0||transient_y!=0.0)
 		{
@@ -1838,6 +1812,18 @@ void record_trace_frame()
 	const uint32_t now_ms=Core::getInstance().p->getTickCount();
 	rec.slide_px_x=float(slide_offset_now(now_ms,slide_from_x));
 	rec.slide_px_y=float(slide_offset_now(now_ms,slide_from_y));
+	const int32_t zoom=gps!=nullptr?gps->viewport_zoom_factor:128;
+	const double tile=double(zoom==128?32:std::max(1,zoom*32/128));
+	const bool cam_active=camera_enabled&&!adventure_mode();
+	rec.glide_px_x=cam_active?
+		float(transient_x+rest_x*tile):rec.slide_px_x;
+	rec.glide_px_y=cam_active?
+		float(transient_y+rest_y*tile):rec.slide_px_y;
+	rec.rest_x_t=float(rest_x);
+	rec.rest_y_t=float(rest_y);
+	rec.cam_pending_x=camera_pending_dx;
+	rec.cam_pending_y=camera_pending_dy;
+	rec.flags=uint8_t((enabler!=nullptr&&enabler->mouse_mbut?1:0)|(cam_active?2:0));
 	rec.jump_x=last_jump_x;
 	rec.jump_y=last_jump_y;
 }
@@ -2012,6 +1998,9 @@ command_result status_command(
 				trace_ring[(trace_frames-have+i)%trace_capacity];
 			bool interesting=rec.jump_x!=0.0f||rec.jump_y!=0.0f||rec.sig_diff!=0||
 				rec.pending_dx!=0||rec.pending_dy!=0||
+				(rec.flags&1)!=0||
+				rec.cam_pending_x!=0||rec.cam_pending_y!=0||
+				std::abs(rec.glide_px_x)>0.5f||std::abs(rec.glide_px_y)>0.5f||
 				std::abs(rec.slide_px_x)>0.5f||std::abs(rec.slide_px_y)>0.5f;
 			std::string delta;
 			if(prev!=nullptr)
@@ -2048,13 +2037,18 @@ command_result status_command(
 					jump=" JUMP="+std::to_string(int(rec.jump_x))+","+
 						std::to_string(int(rec.jump_y));
 				out.print(
-					"f={} w={},{},{}{}{}{} pend={},{} slide={:.1f},{:.1f}\n",
+					"f={} w={},{},{}{}{}{}{}{} pend={},{} cpend={},{} glide={:.1f},{:.1f}"
+					" rest={:.2f},{:.2f}\n",
 					rec.frame,rec.wx,rec.wy,rec.wz,
 					sig.empty()?"":(" sig="+sig),
 					delta,
 					jump,
+					(rec.flags&1)?" DRAG":"",
+					(rec.flags&2)?"":" noCam",
 					rec.pending_dx,rec.pending_dy,
-					rec.slide_px_x,rec.slide_px_y);
+					rec.cam_pending_x,rec.cam_pending_y,
+					rec.glide_px_x,rec.glide_px_y,
+					rec.rest_x_t,rec.rest_y_t);
 				++printed;
 				}
 			prev=&rec;
