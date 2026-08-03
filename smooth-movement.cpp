@@ -27,6 +27,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <chrono>
 #include <set>
 #include <string>
 #include <type_traits>
@@ -186,7 +187,8 @@ int32_t tile_pixel(int32_t tile,int32_t origin,int32_t zoom);
 // the CURRENT window's coordinate frame is rebuilt from them, chaining the previous cache so
 // stacked landings keep up to `strip_pad` tiles of departed world alive.
 constexpr int32_t strip_pad=int32_t(slide_max_tiles);
-constexpr size_t strip_layer_count=10;
+constexpr size_t strip_layer_count=4;   // terrain+buildings only: the band lives ~100 ms,
+                                        // and each extra layer multiplies SDL draw calls
 struct strip_cachest
 {
 	int32_t dim_x=0;
@@ -198,6 +200,8 @@ strip_cachest strip_caches[2];
 int strip_cache_front=0;
 uint64_t stat_strip_draws=0;
 uint64_t stat_strip_misses=0;
+double glide_ms_ema=0.0;        // smoothed cost of a glide repaint frame
+double glide_ms_max=0.0;
 // The engine's tile cache is keyed by (texpos, tint colors, flags) and terrain tints vary per
 // tile, so an exact-recipe lookup misses. Departed tiles were just on screen, so SOME recipe for
 // their texpos is cached: remember which full key worked per texpos and re-find it fresh each
@@ -215,12 +219,6 @@ std::array<const int32_t *,strip_layer_count> strip_old_layers(df::graphic_viewp
 		vp->screentexpos_background_old,
 		vp->screentexpos_background_two_old,
 		vp->screentexpos_building_one_old,
-		vp->screentexpos_item_old,
-		vp->screentexpos_vehicle_old,
-		vp->screentexpos_vermin_old,
-		vp->screentexpos_right_creature_old,
-		vp->screentexpos_old,
-		vp->screentexpos_left_creature_old,
 		vp->screentexpos_building_two_old
 		};
 }
@@ -701,6 +699,7 @@ auto visual_layers(Viewport *vp,bool previous=false)
 viewport_visual_animation_inputst animation_input(df::graphic_viewportst *vp)
 {
 	const df::graphic_viewportst *const_viewport=vp;
+	const bool slide_owns_smoothing=!(camera_enabled&&!adventure_mode());
 	return {
 		vp,
 		vp->dim_x,
@@ -713,7 +712,8 @@ viewport_visual_animation_inputst animation_input(df::graphic_viewportst *vp)
 		// Scroll-landing oracle: lets movements that coincide with a camera scroll be
 		// attributed (adventure mode -- the camera follows the player, EVERY step is one).
 		vp->screentexpos_background,
-		vp->screentexpos_background_old
+		vp->screentexpos_background_old,
+		slide_owns_smoothing
 		};
 }
 
@@ -1542,6 +1542,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	const int32_t zoom=renderer->viewport_zoom_factor;
 	const int32_t tile_size=zoom==128?32:std::max(1,zoom*32/128);
 
+	const auto glide_t0=std::chrono::steady_clock::now();
 	if(glide)
 		{
 		++stat_glide_frames;
@@ -1638,6 +1639,10 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 
 		// Everything was repainted; per-tile coverage bookkeeping restarts after the glide.
 		previous_coverage.clear();
+		const double ms=std::chrono::duration<double,std::milli>(
+			std::chrono::steady_clock::now()-glide_t0).count();
+		glide_ms_ema=glide_ms_ema*0.95+ms*0.05;
+		if(ms>glide_ms_max)glide_ms_max=ms;
 		return;
 		}
 
@@ -1907,6 +1912,8 @@ void reset_state()
 	stat_visual_jumps=0;
 	stat_strip_draws=0;
 	stat_strip_misses=0;
+	glide_ms_ema=0.0;
+	glide_ms_max=0.0;
 	has_prev_visual=false;
 	trace_frames=0;
 	last_sig_diff=0;
@@ -1960,6 +1967,8 @@ command_result status_command(
 		out.print("glide frames: {}, shifted input dispatches: {}, visual jumps: {}\n",
 			stat_glide_frames,stat_mouse_shifts,stat_visual_jumps);
 		out.print("strip: draws {} cache-misses {}\n",stat_strip_draws,stat_strip_misses);
+		out.print("glide frame cost: {:.2f} ms avg, {:.2f} ms max\n",
+			glide_ms_ema,glide_ms_max);
 		out.print(
 			"scroll: pans {} static {} identical {} unrecognized {} absorbed {}"
 			" pending {} {}\n",

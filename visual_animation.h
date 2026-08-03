@@ -148,6 +148,9 @@ struct viewport_visual_animation_inputst
 	// left null: the manager then falls back to the layer majority test with suppression.
 	const int32_t *background=nullptr;
 	const int32_t *background_old=nullptr;
+	// The renderer only draws pinned sprites under the world-tile slide; when something
+	// else owns smoothing (the fortress free camera), skip the per-landing pin scan.
+	bool want_pinned=true;
 
 	bool valid() const
 		{
@@ -701,7 +704,8 @@ class visual_animation_managerst
 				--state.untrusted_frames;
 				}
 
-			if(translated&&(shift_x!=0||shift_y!=0)&&!suppress_detection)
+			if(translated&&(shift_x!=0||shift_y!=0)&&!suppress_detection&&
+				input.want_pinned)
 				{
 				// Record screen-static sprites on every layer as PINNED: they ride the
 				// camera (the adventure player), so the renderer draws them without the
