@@ -2,6 +2,13 @@
 
 ## Unreleased (adventure-slide)
 
+- The offset-repaint smoothers are OFF by default: gliding requires repainting the
+  whole map rect every frame the view sits between tiles -- a full extra map render
+  that is too heavy at fortress zoom levels. `smooth-movement slide on` (adventure
+  world slide) and `smooth-movement camera on` (fortress free camera) opt in. The
+  default experience is the cheap part: creature/NPC interpolation everywhere,
+  including across adventure camera-follow scrolls.
+
 - Retire the pixel-anchored middle-mouse drag: DF's native drag pans with its own
   stepping and rate, so the anchor inevitably diverged (visible lurching every dragged
   tile, and a camera stranded exactly half a tile off-grid on release, which also

@@ -130,6 +130,9 @@ bool adventure_mode()
 // the landing, reported by the manager as "pinned" -- draw WITHOUT the offset. Active whenever the
 // fortress free camera is not (the camera owns fort-mode smoothing when enabled).
 constexpr double slide_max_tiles=4.0;         // beyond this the view just steps (fast scrolling)
+bool slide_enabled=false;                     // OFF by default: the offset repaint costs a full
+                                              // extra map render per glide frame, which is too
+                                              // heavy at fort zoom levels. `slide on` opts in.
 uint32_t slide_duration_ms=100;               // debug-tunable: `smooth-movement slidems <n>`
 double slide_from_x=0.0;                      // pixel offset at slide start
 double slide_from_y=0.0;
@@ -699,7 +702,7 @@ auto visual_layers(Viewport *vp,bool previous=false)
 viewport_visual_animation_inputst animation_input(df::graphic_viewportst *vp)
 {
 	const df::graphic_viewportst *const_viewport=vp;
-	const bool slide_owns_smoothing=!(camera_enabled&&!adventure_mode());
+	const bool slide_owns_smoothing=slide_enabled&&!(camera_enabled&&!adventure_mode());
 	return {
 		vp,
 		vp->dim_x,
@@ -1461,13 +1464,14 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		slide_now_x=0.0;
 		slide_now_y=0.0;
 		}
-	if(animation_manager.stats.last_shift_x!=0||animation_manager.stats.last_shift_y!=0)
+	if((animation_manager.stats.last_shift_x!=0||animation_manager.stats.last_shift_y!=0)&&
+		(slide_enabled||camera_active))
 		{
 		strip_cache_update(
 			vp,
 			animation_manager.stats.last_shift_x,
 			animation_manager.stats.last_shift_y);
-		if(!camera_active&&!dragging&&slide_drag_cooldown==0)
+		if(slide_enabled&&!camera_active&&!dragging&&slide_drag_cooldown==0)
 			{
 			// A scroll landed: the content jumped by -shift tiles on screen. Start (or
 			// retarget from the current fractional offset) a slide back to the grid.
@@ -1902,6 +1906,7 @@ void reset_state()
 	slide_from_y=0.0;
 	slide_start_ms=0;
 	slide_active=false;
+	slide_enabled=false;
 	slide_resets_seen=0;
 	slide_revision_seen=0;
 	slide_drag_cooldown=0;
@@ -1952,7 +1957,7 @@ command_result status_command(
 		{
 		const uint32_t now_ms=Core::getInstance().p->getTickCount();
 		out.print("world slide (adventure mode): {}, offset {:.1f} {:.1f} px\n",
-			slide_active?"active":"idle",
+			!slide_enabled?"off":slide_active?"active":"idle",
 			slide_offset_now(now_ms,slide_from_x),
 			slide_offset_now(now_ms,slide_from_y));
 		}
@@ -1979,6 +1984,13 @@ command_result status_command(
 			animation_manager.stats.absorbed,
 			animation_manager.stats.last_pending_dx,
 			animation_manager.stats.last_pending_dy);
+		return CR_OK;
+		}
+	if(parameters[0]=="slide"&&parameters.size()==2&&
+		(parameters[1]=="on"||parameters[1]=="off"))
+		{
+		slide_enabled=parameters[1]=="on";
+		if(!slide_enabled)slide_active=false;
 		return CR_OK;
 		}
 	if(parameters[0]=="slidems"&&parameters.size()==2)
@@ -2148,7 +2160,7 @@ plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 {
 	commands.emplace_back(
 		"smooth-movement",
-		"Smooth movement status; camera on|off|reset|<fx> <fy>; construction on|off; trace; slidems <n>.",
+		"Smooth movement status; camera on|off|reset|<fx> <fy>; slide on|off; construction on|off; trace.",
 		status_command);
 	return CR_OK;
 }
