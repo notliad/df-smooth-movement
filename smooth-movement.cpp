@@ -115,6 +115,10 @@ bool camera_was_offset=false;                 // edge-detects offset->0 for one 
 int32_t camera_prev_wx=0;                     // window-scroll observation baseline
 int32_t camera_prev_wy=0;
 bool camera_has_prev=false;
+bool camera_excursion=false;                  // a SINGLE frame announced an excursion-sized
+                                              // jump; accumulated fast-scroll pending never
+                                              // arms this (freezing attribution reads as
+                                              // jitter)
 
 bool adventure_mode()
 {
@@ -357,6 +361,7 @@ void clear_camera_pending()
 
 void cancel_camera_transients()
 {
+	camera_excursion=false;
 	transient_x=0.0;
 	transient_y=0.0;
 	clear_camera_pending();
@@ -444,6 +449,7 @@ void update_camera(
 			// Almost certainly a one-frame window excursion (combat/announcement camera
 			// flick) whose reversal arrives a frame or two later: park it for the wait
 			// below instead of cancelling.
+			camera_excursion=true;
 			camera_pending_dx+=dx;
 			camera_pending_dy+=dy;
 			camera_pending_frames=0;
@@ -457,6 +463,9 @@ void update_camera(
 			camera_pending_dy+=dy;
 			camera_pending_frames=0;
 			}
+		if(camera_excursion&&
+			std::abs(camera_pending_dx)<=6&&std::abs(camera_pending_dy)<=6)
+			camera_excursion=false;   // the excursion reversed
 		}
 	camera_prev_wx=wx;
 	camera_prev_wy=wy;
@@ -464,7 +473,7 @@ void update_camera(
 
 	if(camera_pending_dx!=0||camera_pending_dy!=0)
 		{
-		if(std::abs(camera_pending_dx)>6||std::abs(camera_pending_dy)>6)
+		if(camera_excursion)
 			{
 			// One-frame window excursion: the reversal usually collapses the delta on
 			// its own -- attribute nothing meanwhile so the glide keeps decaying
@@ -475,6 +484,7 @@ void update_camera(
 				transient_x=0.0;
 				transient_y=0.0;
 				clear_camera_pending();
+				camera_excursion=false;
 				}
 			}
 		else
@@ -486,12 +496,14 @@ void update_camera(
 			// qualifying shifts only happen on uniform terrain, where mistiming is invisible.
 			const int32_t stepx=(camera_pending_dx>0)-(camera_pending_dx<0);
 			const int32_t stepy=(camera_pending_dy>0)-(camera_pending_dy<0);
+			const int32_t span_x=std::min(std::abs(camera_pending_dx),8);
+			const int32_t span_y=std::min(std::abs(camera_pending_dy),8);
 			int32_t best_ax=0,best_ay=0,best_mag=-1;
 			double best_score=-1.0;
 			bool no_data=false;
-			for(int32_t ix=0;ix<=std::abs(camera_pending_dx);++ix)
+			for(int32_t ix=0;ix<=span_x;++ix)
 				{
-				for(int32_t iy=0;iy<=std::abs(camera_pending_dy);++iy)
+				for(int32_t iy=0;iy<=span_y;++iy)
 					{
 					const double score=background_match_ratio(vp,ix*stepx,iy*stepy);
 					if(score<0.0){no_data=true;break;}
@@ -1693,6 +1705,10 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 bool visual_mouse_shift(int32_t &shift_px_x,int32_t &shift_px_y)
 {
 	if(gps==nullptr)return false;
+	// Never correct the mouse while the middle button is held: DF's native drag reads the
+	// mouse too, and feeding it shifted coordinates while our pixel-drag moves the offset
+	// creates a feedback loop -- the camera visibly jitters under the drag.
+	if(enabler!=nullptr&&enabler->mouse_mbut)return false;
 	const int32_t zoom=gps->viewport_zoom_factor;
 	const double tile=double(zoom==128?32:std::max(1,zoom*32/128));
 	if(camera_enabled&&!adventure_mode())

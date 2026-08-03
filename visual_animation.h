@@ -303,6 +303,10 @@ class visual_animation_managerst
 		// Frames whose PREVIOUS buffer is a window excursion's off-view render: comparing
 		// against it fabricates movements, so detection and content expiry sit out.
 		int32_t untrusted_frames=0;
+		// True only when a SINGLE frame announced an excursion-sized jump (camera flick /
+		// teleport). Accumulated pending from fast scrolling must never arm this: freezing
+		// attribution mid-scroll reads as jitter.
+		bool excursion=false;
 	};
 
 	uint32_t frame_time_ms=0;
@@ -380,6 +384,7 @@ class visual_animation_managerst
 		abandon_pending(state);
 		state.suppress_frames=0;
 		state.untrusted_frames=0;
+		state.excursion=false;
 		}
 
 	static std::array<int32_t,2> shared_movement_delta(
@@ -483,16 +488,18 @@ class visual_animation_managerst
 			// that made sprites float when the camera moved.
 			if(state.has_pan&&(state.pan_x!=input.pan_x||state.pan_y!=input.pan_y))
 				{
-				const bool was_excursion=
-					std::abs(state.pending_dx)>6||std::abs(state.pending_dy)>6;
-				state.pending_dx+=input.pan_x-state.pan_x;
-				state.pending_dy+=input.pan_y-state.pan_y;
+				const int32_t ddx=input.pan_x-state.pan_x;
+				const int32_t ddy=input.pan_y-state.pan_y;
+				if(std::abs(ddx)>6||std::abs(ddy)>6)state.excursion=true;
+				state.pending_dx+=ddx;
+				state.pending_dy+=ddy;
 				state.pending_frames=0;
 				state.suppress_frames=2;
 				++stats.pan_frames;
-				if(was_excursion&&
+				if(state.excursion&&
 					std::abs(state.pending_dx)<=6&&std::abs(state.pending_dy)<=6)
 					{
+					state.excursion=false;
 					++stats.absorbed;   // the excursion reversed: net delta back in range
 					// This frame's PREVIOUS buffer is still the excursion's off-view
 					// render; give it one frame to flush before trusting comparisons.
@@ -520,7 +527,7 @@ class visual_animation_managerst
 				input.background!=nullptr&&input.background_old!=nullptr;
 			if(state.pending_dx!=0||state.pending_dy!=0)
 				{
-				if(std::abs(state.pending_dx)>6||std::abs(state.pending_dy)>6)
+				if(state.excursion)
 					{
 					// One-frame window EXCURSION (combat/announcement camera flicks) or a
 					// genuine teleport. Attribute and reset nothing while it is in flight:
@@ -534,6 +541,7 @@ class visual_animation_managerst
 						abandon_pending(state);
 						state.suppress_frames=0;
 						state.untrusted_frames=1;
+						state.excursion=false;
 						}
 					}
 				else if(has_background)
@@ -544,12 +552,14 @@ class visual_animation_managerst
 					// is invisible.
 					const int32_t stepx=(state.pending_dx>0)-(state.pending_dx<0);
 					const int32_t stepy=(state.pending_dy>0)-(state.pending_dy<0);
+					const int32_t span_x=std::min(std::abs(state.pending_dx),8);
+					const int32_t span_y=std::min(std::abs(state.pending_dy),8);
 					int32_t best_ax=0,best_ay=0,best_mag=-1;
 					double best_score=-1.0;
 					bool no_data=false;
-					for(int32_t ix=0;ix<=std::abs(state.pending_dx)&&!no_data;++ix)
+					for(int32_t ix=0;ix<=span_x&&!no_data;++ix)
 						{
-						for(int32_t iy=0;iy<=std::abs(state.pending_dy);++iy)
+						for(int32_t iy=0;iy<=span_y;++iy)
 							{
 							const double score=
 								background_shift_match(input,ix*stepx,iy*stepy);
