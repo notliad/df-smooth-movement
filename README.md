@@ -9,15 +9,16 @@ ticks, saves, or gameplay state.
 
 ## Compatibility
 
-Development currently targets the DFHack `develop` branch and the SDL 2D
-renderer. DFHack C++ plugins are ABI-specific, so rebuild the plugin whenever
-the DFHack or Dwarf Fortress version changes.
+v0.3.0 requires DFHack 53.15-r3 or newer and the SDL 2D renderer. DFHack C++
+plugins are ABI-specific, so rebuild the plugin whenever the DFHack or Dwarf
+Fortress version changes.
 
 ## Install
 
 1. Download the release archive for your operating system and exact DFHack
    version.
-2. Extract it into the Dwarf Fortress installation directory. The resulting
+2. Extract it into the DFHack folder for a Steam DFHack installation, or into
+   the Dwarf Fortress folder for a manual DFHack installation. The resulting
    plugin must be:
    - Linux: `hack/plugins/smooth-movement.plug.so`
    - Windows: `hack/plugins/smooth-movement.plug.dll`
