@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-08-03
 
 - Target DFHack `develop` and reuse DFHack's SDL library handle instead of
   independently opening and closing SDL.
