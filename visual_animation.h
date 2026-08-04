@@ -544,6 +544,7 @@ class visual_animation_managerst
 			if(buffers_advanced)state.previous_view_stale=false;
 
 			bool translated=false;
+			std::array<int32_t,2> landed_shift{};
 			if(buffers_advanced&&!crossed_views&&!state.pending.empty())
 				{
 				// Queued scrolls land in order and may coalesce, so each hypothesis is a prefix.
@@ -625,6 +626,10 @@ class visual_animation_managerst
 						state.pending.begin()+int32_t(landed_count));
 					state.pending_frames=0;
 					state.pending_age=0;
+					// A landing accounts for the scroll, so the settle window has nothing left to
+					// guard against and must not suppress the rebased pass below.
+					state.suppress_frames=0;
+					landed_shift=landed;
 					translated=true;
 					}
 				else if(shift_match_ratio(input,0,0)>=0.5&&
@@ -644,7 +649,36 @@ class visual_animation_managerst
 					}
 				}
 
-			const bool suppress=!buffers_advanced||crossed_views||translated||
+			// On the frame a scroll lands, `previous` is still framed on the pre-scroll view.
+			// Rebasing it by the landed delta makes the comparison valid again: stationary content
+			// then matches exactly and yields nothing, while a creature that walked during the
+			// scroll is still recognized instead of losing its facing to the tile it vacated.
+			auto previous_layers=input.previous;
+			std::vector<std::vector<int32_t>> rebased_previous;
+			if(translated&&(landed_shift[0]!=0||landed_shift[1]!=0))
+				{
+				rebased_previous.resize(input.previous.size());
+				for(size_t layer=0;layer<input.previous.size();++layer)
+					{
+					rebased_previous[layer].assign(
+						size_t(input.dim_x)*size_t(input.dim_y),0);
+					for(int32_t x=0;x<input.dim_x;++x)
+						{
+						const int32_t sx=x+landed_shift[0];
+						if(sx<0||sx>=input.dim_x)continue;
+						for(int32_t y=0;y<input.dim_y;++y)
+							{
+							const int32_t sy=y+landed_shift[1];
+							if(sy<0||sy>=input.dim_y)continue;
+							rebased_previous[layer][x*input.dim_y+y]=
+								input.previous[layer][sx*input.dim_y+sy];
+							}
+						}
+					previous_layers[layer]=rebased_previous[layer].data();
+					}
+				}
+
+			const bool suppress=!buffers_advanced||crossed_views||
 				!state.pending.empty()||state.suppress_frames>0;
 			// The countdown measures redraws, not frames, so a repeated viewport must not spend it.
 			if(buffers_advanced&&state.suppress_frames>0)--state.suppress_frames;
@@ -669,7 +703,7 @@ class visual_animation_managerst
 						static_cast<viewport_visual_layer>(layer)))continue;
 					std::fill(claimed_sources.begin(),claimed_sources.end(),0);
 					const int32_t *current=input.current[layer];
-					const int32_t *previous=input.previous[layer];
+					const int32_t *previous=previous_layers[layer];
 					const auto shared_delta=
 						static_cast<viewport_visual_layer>(layer)==viewport_visual_layer::center?
 						shared_movement_delta(
@@ -684,7 +718,7 @@ class visual_animation_managerst
 							if(texpos==0)continue;
 							if(static_cast<viewport_visual_layer>(layer)==
 								viewport_visual_layer::item&&
-								input.previous[static_cast<size_t>(
+								previous_layers[static_cast<size_t>(
 									viewport_visual_layer::center)][target]!=0)continue;
 
 							int32_t source=-1;
