@@ -278,6 +278,8 @@ class visual_animation_managerst
 		// One facing per tile, keyed by tile rather than by unit.
 		// The viewport exposes one creature texpos per tile, so DF has already picked it.
 		std::vector<int8_t> facing;
+		// Stationary mirrored creatures are repainted every frame; this is the cheap pre-check.
+		bool has_mirrored=false;
 		int32_t pan_x=0;
 		int32_t pan_y=0;
 		bool has_pan=false;
@@ -401,6 +403,7 @@ class visual_animation_managerst
 				{
 				reset_tracking(state);
 				state.has_context=false;
+				state.has_mirrored=false;
 				return;
 				}
 
@@ -430,9 +433,12 @@ class visual_animation_managerst
 			state.pan_y=input.pan_y;
 			state.has_pan=true;
 			if(context_changed)
+				{
 				state.facing.assign(
 					size_t(input.dim_x)*size_t(input.dim_y),
 					int8_t(native_sprite_facing));
+				state.has_mirrored=false;
+				}
 			if(context_changed||!allow_new_movements)
 				{
 				reset_tracking(state);
@@ -690,14 +696,21 @@ class visual_animation_managerst
 							!visual_layer_matches(movement.layer,current,movement.texpos);
 						}),
 				state.movements.end());
+			// has_mirrored is recomputed here rather than maintained at every write site.
 			if(state.facing.size()==size_t(input.dim_x)*size_t(input.dim_y))
 				{
 				const int32_t *center_current=
 					input.current[static_cast<size_t>(
 						viewport_visual_layer::center)];
+				bool any_mirrored=false;
 				for(size_t i=0;i<state.facing.size();++i)
+					{
 					if(center_current[i]==0)
 						state.facing[i]=int8_t(native_sprite_facing);
+					else if(state.facing[i]!=int8_t(native_sprite_facing))
+						any_mirrored=true;
+					}
+				state.has_mirrored=any_mirrored;
 				}
 			if(!state.movements.empty())force_full_redraw=true;
 			}
@@ -740,6 +753,17 @@ class visual_animation_managerst
 				return static_cast<visual_facingst>(state.facing[index]);
 				}
 			return native_sprite_facing;
+			}
+
+		// The render path must then keep painting with no movement in flight.
+		bool has_mirrored_facing(const void *viewport) const
+			{
+			for(const viewport_animationst &state:viewports)
+				{
+				if(state.viewport!=viewport)continue;
+				return state.has_mirrored;
+				}
+			return false;
 			}
 
 		bool requires_full_redraw() const

@@ -134,6 +134,32 @@ int main()
 	assert(manager.get_facing(viewport,2,2)==visual_facingst::east);
 	}
 
+	// The mirrored flag gates the render path's early return.
+	// It must rise only for a genuinely mirrored creature and fall when that tile empties.
+	{
+	visual_animation_managerst manager;
+	auto input=make_input(viewport,dim,empty);
+	set_layer(input,viewport_visual_layer::center,before,empty);
+	run_frame(manager,input,1000);
+	assert(!manager.has_mirrored_facing(viewport));
+	// Moving west matches the art, so nothing is mirrored yet.
+	set_layer(input,viewport_visual_layer::center,west_after,before);
+	run_frame(manager,input,1016);
+	assert(manager.get_facing(viewport,1,2)==visual_facingst::west);
+	assert(!manager.has_mirrored_facing(viewport));
+	// Moving east faces away from the art and raises the flag.
+	set_layer(input,viewport_visual_layer::center,before,west_after);
+	run_frame(manager,input,1032);
+	assert(manager.get_facing(viewport,2,2)==visual_facingst::east);
+	assert(manager.has_mirrored_facing(viewport));
+	// The creature leaves: the tile clears and so does the flag.
+	set_layer(input,viewport_visual_layer::center,empty,before);
+	run_frame(manager,input,1048);
+	assert(manager.get_facing(viewport,2,2)==native_sprite_facing);
+	assert(!manager.has_mirrored_facing(viewport));
+	assert(!manager.has_mirrored_facing(nullptr));
+	}
+
 	// Pure vertical movement carries the existing facing to the new tile.
 	{
 	visual_animation_managerst manager;
