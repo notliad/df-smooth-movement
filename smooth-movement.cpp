@@ -1076,6 +1076,25 @@ std::vector<render_proxyst> collect_proxies(
 						}
 					}
 
+				// Items, vehicles and designations keep their vanilla orientation.
+				const auto &mirror_descriptor=
+					visual_layer_descriptor(visual_layer);
+				const visual_render_groupst group=
+					visual_render_group(visual_layer);
+				const bool mirror_eligible=
+					group==visual_render_groupst::main||
+					group==visual_render_groupst::upper;
+				// Facing is read from the anchor tile so every fragment of one creature agrees.
+				const bool mirrored=mirror_eligible&&
+					animation_manager.get_facing(
+						vp,
+						x+mirror_descriptor.center_x,
+						y+mirror_descriptor.center_y)!=native_sprite_facing;
+				// Reflecting a fragment about its anchor moves it by twice its
+				// offset to that anchor. The anchor itself has center_x 0 and
+				// so only flips in place.
+				const int32_t mirror_shift=
+					mirrored?2*mirror_descriptor.center_x:0;
 				render_proxyst proxy=
 					{
 					static_cast<viewport_visual_layer>(layer),
@@ -1086,6 +1105,8 @@ std::vector<render_proxyst> collect_proxies(
 					texpos,
 					movement.progress,
 					nullptr,
+					mirrored,
+					mirror_shift,
 					{}
 					};
 				bool blocked=false;
@@ -1115,6 +1136,29 @@ std::vector<render_proxyst> collect_proxies(
 					if(blocked)break;
 					}
 				if(blocked)continue;
+				if(proxy.mirror_shift!=0)
+					{
+					std::set<std::pair<int32_t,int32_t>> mirrored_coverage;
+					for(const auto &tile:proxy.coverage)
+						mirrored_coverage.emplace(
+							tile.first+proxy.mirror_shift,tile.second);
+					for(const auto &tile:mirrored_coverage)
+						{
+						if(!inside_clip(vp,tile.first,tile.second))
+							{
+							blocked=true;
+							break;
+							}
+						if(visual_render_group(proxy.layer)==visual_render_groupst::main&&
+							has_fire(vp,tile.first,tile.second))
+							{
+							blocked=true;
+							break;
+							}
+						proxy.coverage.insert(tile);
+						}
+					if(blocked)continue;
+					}
 
 				proxy.texture=cached_texture(renderer,texpos);
 				if(proxy.texture==nullptr)continue;

@@ -119,9 +119,8 @@ int main()
 	assert(manager.get_facing(viewport,1,2)==visual_facingst::west);
 	}
 
-	// Moving east sets east facing. The target's prior facing is made
-	// genuinely west first (not the grid's default east), so this only
-	// passes if the east branch of facing_after_move is actually taken.
+	// Moving east sets east facing.
+	// East is neither the grid default nor the source facing, so the assertion is not vacuous.
 	{
 	visual_animation_managerst manager;
 	auto input=make_input(viewport,dim,empty);
@@ -151,23 +150,21 @@ int main()
 	assert(manager.get_facing(viewport,1,1)==visual_facingst::west);
 	}
 
-	// Out-of-range and unknown viewports default to east.
+	// Out-of-range and unknown viewports fall back to the native facing.
 	{
 	visual_animation_managerst manager;
 	auto input=make_input(viewport,dim,empty);
 	set_layer(input,viewport_visual_layer::center,before,empty);
 	run_frame(manager,input,1000);
-	assert(manager.get_facing(viewport,-1,0)==visual_facingst::east);
-	assert(manager.get_facing(viewport,dim,0)==visual_facingst::east);
-	assert(manager.get_facing(nullptr,0,0)==visual_facingst::east);
+	assert(manager.get_facing(viewport,-1,0)==native_sprite_facing);
+	assert(manager.get_facing(viewport,dim,0)==native_sprite_facing);
+	assert(manager.get_facing(nullptr,0,0)==native_sprite_facing);
 	}
 	}
 
-	// Regression: two creatures marching in the same column in a single
-	// frame is exactly the case shared_movement_delta exists to detect,
-	// and it is a chain -- A's target tile is B's source tile. A's write
-	// must not corrupt B's read of its own pre-frame facing. A picks up
-	// a genuinely different (west) facing first so a swap is observable.
+	// Regression: A and B move in the same frame, chained -- A's target tile is B's source tile.
+	// A's write must not corrupt B's read of its own pre-frame facing.
+	// A is sent east first, so its facing differs from the default B carries and a swap shows.
 	{
 	constexpr int32_t chase_dim=5;
 	int32_t chase_empty[chase_dim*chase_dim]={};
@@ -177,12 +174,9 @@ int main()
 	const int chase_token=0;
 	const void *chase_viewport=&chase_token;
 
-	// A starts off-column and steps west into the column, picking up a
-	// west facing. B sits stationary in the column, keeping its default
-	// (east) facing.
-	frame_a[3*chase_dim+1]=77;   // A at (3,1)
-	frame_a[2*chase_dim+2]=88;   // B at (2,2), stationary
-	frame_b[2*chase_dim+1]=77;   // A steps west: (3,1) -> (2,1)
+	frame_a[1*chase_dim+1]=77;   // A at (1,1)
+	frame_a[2*chase_dim+2]=88;   // B at (2,2), stationary, keeps the default facing
+	frame_b[2*chase_dim+1]=77;   // A steps east: (1,1) -> (2,1), picks up an east facing
 	frame_b[2*chase_dim+2]=88;   // B unchanged
 
 	// Both step south in the same frame: shared_movement_delta needs two tiles on the same delta.
@@ -195,17 +189,14 @@ int main()
 	run_frame(manager,input,1000);
 	set_layer(input,viewport_visual_layer::center,frame_b,frame_a);
 	run_frame(manager,input,1016);
-	assert(manager.get_facing(chase_viewport,2,1)==visual_facingst::west);
-	assert(manager.get_facing(chase_viewport,2,2)==visual_facingst::east);
+	assert(manager.get_facing(chase_viewport,2,1)==visual_facingst::east);
+	assert(manager.get_facing(chase_viewport,2,2)==native_sprite_facing);
 
 	set_layer(input,viewport_visual_layer::center,frame_c,frame_b);
 	run_frame(manager,input,1032);
-	// A carries its own (west) facing forward.
-	assert(manager.get_facing(chase_viewport,2,2)==visual_facingst::west);
-	// B carries its own (east) facing forward -- not A's, even though A's
-	// write into (2,2) happens earlier in the same raster pass that B's
-	// movement reads (2,2) as its source.
-	assert(manager.get_facing(chase_viewport,2,3)==visual_facingst::east);
+	assert(manager.get_facing(chase_viewport,2,2)==visual_facingst::east);
+	// B carries its own default forward, not A's, though A wrote (2,2) earlier in the same pass.
+	assert(manager.get_facing(chase_viewport,2,3)==native_sprite_facing);
 	}
 
 	// Regression: a vacated source tile is reoccupied the same frame by an UNTRACKED creature.
@@ -220,12 +211,11 @@ int main()
 	const int gap_token=0;
 	const void *gap_viewport=&gap_token;
 
-	// D at (3,1); E is a stationary companion at (2,2) so that D's later
-	// southward departure from (2,1) shares a delta with E's own move and
-	// shared_movement_delta engages (it needs two tiles on the same delta).
-	frame_a[3*gap_dim+1]=77;   // D
-	frame_a[2*gap_dim+2]=88;   // E, stationary companion
-	frame_b[2*gap_dim+1]=77;   // D steps west: (3,1) -> (2,1), picks up west facing
+	// E is a companion so that D's later departure shares a delta with E's own move.
+	// shared_movement_delta engages only once two tiles move on the same delta.
+	frame_a[1*gap_dim+1]=77;   // D at (1,1)
+	frame_a[2*gap_dim+2]=88;   // E at (2,2), stationary companion
+	frame_b[2*gap_dim+1]=77;   // D steps east: (1,1) -> (2,1), facing differs from the default
 	frame_b[2*gap_dim+2]=88;   // E unchanged
 
 	// D and E both step south, chained, and F appears at D's just-vacated tile the same frame.
@@ -241,17 +231,16 @@ int main()
 	run_frame(manager,input,1000);
 	set_layer(input,viewport_visual_layer::center,frame_b,frame_a);
 	run_frame(manager,input,1016);
-	assert(manager.get_facing(gap_viewport,2,1)==visual_facingst::west);
+	assert(manager.get_facing(gap_viewport,2,1)==visual_facingst::east);
 
 	set_layer(input,viewport_visual_layer::center,frame_c,frame_b);
 	run_frame(manager,input,1032);
 	assert(!manager.get_movement(
 		gap_viewport,viewport_visual_layer::center,2,1).active);
-	// F must not inherit D's stale west facing -- the tile falls back to
-	// the default (east) even though it is occupied, not empty.
-	assert(manager.get_facing(gap_viewport,2,1)==visual_facingst::east);
-	assert(manager.get_facing(gap_viewport,2,2)==visual_facingst::west);
-	assert(manager.get_facing(gap_viewport,2,3)==visual_facingst::east);
+	// F must not inherit D's stale east facing, though the tile is occupied rather than empty.
+	assert(manager.get_facing(gap_viewport,2,1)==native_sprite_facing);
+	assert(manager.get_facing(gap_viewport,2,2)==visual_facingst::east);
+	assert(manager.get_facing(gap_viewport,2,3)==native_sprite_facing);
 	}
 
 	assert(animation_progress(100,0,100)==1.0f);

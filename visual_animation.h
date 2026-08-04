@@ -231,6 +231,10 @@ enum class visual_facingst : int8_t
 	west=1
 };
 
+// DF creature art faces west: an unmirrored blit already faces west, so only east needs flipping.
+// Also the default and cleared value -- a tile nothing wrote must not be marked for mirroring.
+constexpr visual_facingst native_sprite_facing=visual_facingst::west;
+
 // Sticky facing: only a horizontal component changes it.
 // Vertical-only movement and standing still carry the previous facing, not the default.
 constexpr visual_facingst facing_after_move(
@@ -428,7 +432,7 @@ class visual_animation_managerst
 			if(context_changed)
 				state.facing.assign(
 					size_t(input.dim_x)*size_t(input.dim_y),
-					int8_t(visual_facingst::east));
+					int8_t(native_sprite_facing));
 			if(context_changed||!allow_new_movements)
 				{
 				reset_tracking(state);
@@ -498,7 +502,7 @@ class visual_animation_managerst
 						size_t(input.dim_x)*size_t(input.dim_y))
 						{
 						std::vector<int8_t> shifted(
-							state.facing.size(),int8_t(visual_facingst::east));
+							state.facing.size(),int8_t(native_sprite_facing));
 						for(int32_t x=0;x<input.dim_x;++x)
 							{
 							const int32_t sx=x+dwx;
@@ -668,7 +672,7 @@ class visual_animation_managerst
 						{
 						if(!facing_target_written[size_t(pending_source)])
 							state.facing[size_t(pending_source)]=
-								int8_t(visual_facingst::east);
+								int8_t(native_sprite_facing);
 						}
 					}
 				}
@@ -693,7 +697,7 @@ class visual_animation_managerst
 						viewport_visual_layer::center)];
 				for(size_t i=0;i<state.facing.size();++i)
 					if(center_current[i]==0)
-						state.facing[i]=int8_t(visual_facingst::east);
+						state.facing[i]=int8_t(native_sprite_facing);
 				}
 			if(!state.movements.empty())force_full_redraw=true;
 			}
@@ -735,7 +739,7 @@ class visual_animation_managerst
 				if(index>=state.facing.size())break;
 				return static_cast<visual_facingst>(state.facing[index]);
 				}
-			return visual_facingst::east;
+			return native_sprite_facing;
 			}
 
 		bool requires_full_redraw() const
