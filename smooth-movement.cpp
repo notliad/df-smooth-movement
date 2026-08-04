@@ -53,6 +53,7 @@ constexpr const char *sdl_library="libSDL2-2.0.so.0";
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 DFLibrary *sdl_handle=nullptr;
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
+decltype(&SDL_RenderCopyExF) render_copy_ex_f=nullptr;
 decltype(&SDL_RenderFillRect) render_fill_rect=nullptr;
 decltype(&SDL_RenderSetClipRect) render_set_clip_rect=nullptr;
 decltype(&SDL_GetRenderDrawColor) get_render_draw_color=nullptr;
@@ -740,6 +741,8 @@ struct render_proxyst
 	int32_t texpos;
 	float progress;
 	SDL_Texture *texture;
+	bool mirrored=false;
+	int32_t mirror_shift=0;
 	std::set<std::pair<int32_t,int32_t>> coverage;
 };
 
@@ -929,11 +932,30 @@ SDL_Texture *cached_tile_texture(
 	return texture!=nullptr?texture:cached_texture(renderer,texpos);
 }
 
+// The render_copy_ex_f null check is defensive only, not a graceful-degradation path.
+// `bind` aborts load_sdl on any missing symbol and plugin_enable then refuses the render hook.
+void render_copy_maybe_mirrored(
+	SDL_Renderer *renderer,
+	SDL_Texture *texture,
+	const SDL_FRect &destination,
+	bool mirrored)
+{
+	if(mirrored&&render_copy_ex_f!=nullptr)
+		{
+		render_copy_ex_f(
+			renderer,texture,nullptr,&destination,
+			0.0,nullptr,SDL_FLIP_HORIZONTAL);
+		return;
+		}
+	render_copy_f(renderer,texture,nullptr,&destination);
+}
+
 void draw_texture_with_alpha(
 	SDL_Renderer *renderer,
 	SDL_Texture *texture,
 	const SDL_FRect &destination,
-	float opacity)
+	float opacity,
+	bool mirrored)
 {
 	if(opacity<=0.0f)return;
 	Uint8 saved_alpha=255;
@@ -941,12 +963,12 @@ void draw_texture_with_alpha(
 	if(get_texture_alpha_mod(texture,&saved_alpha)!=0||
 		get_texture_blend_mode(texture,&saved_blend)!=0)
 		{
-		render_copy_f(renderer,texture,nullptr,&destination);
+		render_copy_maybe_mirrored(renderer,texture,destination,mirrored);
 		return;
 		}
 	set_texture_blend_mode(texture,SDL_BLENDMODE_BLEND);
 	set_texture_alpha_mod(texture,Uint8(std::lround(saved_alpha*opacity)));
-	render_copy_f(renderer,texture,nullptr,&destination);
+	render_copy_maybe_mirrored(renderer,texture,destination,mirrored);
 	set_texture_alpha_mod(texture,saved_alpha);
 	set_texture_blend_mode(texture,saved_blend);
 }
@@ -959,18 +981,19 @@ void draw_proxy(df::renderer_2d_base *renderer,const render_proxyst &proxy)
 	const float tile_size=float(zoom==128?32:std::max(1,zoom*32/128));
 	const float source_x=target_x+(proxy.source_x-proxy.target_x)*tile_size;
 	const float source_y=target_y+(proxy.source_y-proxy.target_y)*tile_size;
+	const float mirror_offset=float(proxy.mirror_shift)*tile_size;
 	const SDL_FRect destination=
 		{
-		source_x+(target_x-source_x)*proxy.progress,
+		source_x+(target_x-source_x)*proxy.progress+mirror_offset,
 		source_y+(target_y-source_y)*proxy.progress,
 		tile_size,
 		tile_size
 		};
-	render_copy_f(
+	render_copy_maybe_mirrored(
 		static_cast<SDL_Renderer *>(renderer->sdl_renderer),
 		proxy.texture,
-		nullptr,
-		&destination);
+		destination,
+		proxy.mirrored);
 }
 
 std::vector<render_proxyst> collect_proxies(
@@ -1165,9 +1188,9 @@ void draw_tile_transitions(
 			continue;
 			}
 		if(previous!=nullptr)
-			draw_texture_with_alpha(sdl_renderer,previous,destination,1.0f-progress);
+			draw_texture_with_alpha(sdl_renderer,previous,destination,1.0f-progress,false);
 		if(current!=nullptr)
-			draw_texture_with_alpha(sdl_renderer,current,destination,progress);
+			draw_texture_with_alpha(sdl_renderer,current,destination,progress,false);
 		}
 }
 
@@ -1328,6 +1351,7 @@ void clear_sdl_bindings()
 	if(sdl_handle!=nullptr)ClosePlugin(sdl_handle);
 	sdl_handle=nullptr;
 	render_copy_f=nullptr;
+	render_copy_ex_f=nullptr;
 	render_fill_rect=nullptr;
 	render_set_clip_rect=nullptr;
 	get_render_draw_color=nullptr;
@@ -1355,6 +1379,7 @@ bool load_sdl(color_ostream &out)
 			return false; \
 		}
 	bind(SDL_RenderCopyF,render_copy_f);
+	bind(SDL_RenderCopyExF,render_copy_ex_f);
 	bind(SDL_RenderFillRect,render_fill_rect);
 	bind(SDL_RenderSetClipRect,render_set_clip_rect);
 	bind(SDL_GetRenderDrawColor,get_render_draw_color);
