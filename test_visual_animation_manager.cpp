@@ -243,6 +243,75 @@ int main()
 	assert(diagonal.get_facing(diag_viewport,2,2)==visual_facingst::west);
 	}
 
+	// Facing is keyed by SCREEN tile, so a scroll moves the creatures out from under it.
+	// The two outcomes differ fundamentally: a landed shift has a known delta and is translated.
+	// An abandoned shift never identifies a delta, so the grid can only be dropped.
+	{
+	constexpr int32_t pan_dim=4;
+	int32_t pan_empty[pan_dim*pan_dim]={};
+	int32_t at_one[pan_dim*pan_dim]={};
+	int32_t at_two[pan_dim*pan_dim]={};
+	const int pan_token=0;
+	const void *pan_viewport=&pan_token;
+
+	at_one[1*pan_dim+1]=77;
+	at_two[2*pan_dim+1]=77;   // steps east, x 1 -> 2, so it faces east
+
+	// LANDED: the shift is recognized, so facing follows the buffers.
+	{
+	visual_animation_managerst landed;
+	auto input=make_input(pan_viewport,pan_dim,pan_empty);
+	set_layer(input,viewport_visual_layer::center,at_one,pan_empty);
+	run_frame(landed,input,1000);
+	set_layer(input,viewport_visual_layer::center,at_two,at_one);
+	run_frame(landed,input,1016);
+	assert(landed.get_facing(pan_viewport,2,1)==visual_facingst::east);
+	assert(landed.has_mirrored_facing(pan_viewport));
+
+	// Frame A: the scroll is announced but the buffers have not moved yet.
+	input.pan_x=1;
+	set_layer(input,viewport_visual_layer::center,at_two,at_two);
+	run_frame(landed,input,1032);
+	assert(landed.get_facing(pan_viewport,2,1)==visual_facingst::east);
+
+	// Frame B: the buffers shift east by one and the majority-match test recognizes it.
+	set_layer(input,viewport_visual_layer::center,at_one,at_two);
+	run_frame(landed,input,1048);
+	assert(landed.get_facing(pan_viewport,1,1)==visual_facingst::east);
+	assert(landed.get_facing(pan_viewport,2,1)==native_sprite_facing);
+	assert(landed.has_mirrored_facing(pan_viewport));
+	}
+
+	// ABANDONED: the shift never shows up in the buffers, so no delta is ever identified.
+	// The grid must be back at the default while the tile is still OCCUPIED.
+	// The empty-tile sweep cannot reach that case, so only an explicit reset clears it.
+	{
+	visual_animation_managerst abandoned;
+	auto input=make_input(pan_viewport,pan_dim,pan_empty);
+	set_layer(input,viewport_visual_layer::center,at_one,pan_empty);
+	run_frame(abandoned,input,2000);
+	set_layer(input,viewport_visual_layer::center,at_two,at_one);
+	run_frame(abandoned,input,2016);
+	assert(abandoned.get_facing(pan_viewport,2,1)==visual_facingst::east);
+
+	// The buffers stay put, so the majority-match test fails every frame.
+	// It tolerates four before giving up on the fifth.
+	input.pan_x=1;
+	set_layer(input,viewport_visual_layer::center,at_two,at_two);
+	for(int32_t frame=0;frame<4;++frame)
+		{
+		run_frame(abandoned,input,2032+uint32_t(frame)*16);
+		// Still pending, so the facing survives.
+		// The assertion after the giving-up frame therefore tests the reset, not an empty grid.
+		assert(abandoned.get_facing(pan_viewport,2,1)==visual_facingst::east);
+		assert(abandoned.has_mirrored_facing(pan_viewport));
+		}
+	run_frame(abandoned,input,2096);
+	assert(abandoned.get_facing(pan_viewport,2,1)==native_sprite_facing);
+	assert(!abandoned.has_mirrored_facing(pan_viewport));
+	}
+	}
+
 	// Regression: A and B move in the same frame, chained -- A's target tile is B's source tile.
 	// A's write must not corrupt B's read of its own pre-frame facing.
 	// A is sent east first, so its facing differs from the default B carries and a swap shows.

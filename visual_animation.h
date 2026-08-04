@@ -312,6 +312,15 @@ class visual_animation_managerst
 		clear_pending(state);
 		}
 
+	static void reset_facing(viewport_animationst &state)
+		{
+		std::fill(
+			state.facing.begin(),
+			state.facing.end(),
+			int8_t(native_sprite_facing));
+		state.has_mirrored=false;
+		}
+
 	static void reset_tracking(viewport_animationst &state)
 		{
 		abandon_pending(state);
@@ -441,6 +450,9 @@ class visual_animation_managerst
 				}
 			if(context_changed||!allow_new_movements)
 				{
+				// Skips the recompute sweep, so clear has_mirrored here or a stale true survives.
+				// The grid stays: an inactive viewport is not drawn and its facings still hold.
+				state.has_mirrored=false;
 				reset_tracking(state);
 				return;
 				}
@@ -483,6 +495,7 @@ class visual_animation_managerst
 					{
 					// Nothing visible to anchor the test on: nothing to animate either.
 					abandon_pending(state);
+					reset_facing(state);
 					}
 				else if(matches*2>=considered)
 					{
@@ -531,6 +544,8 @@ class visual_animation_managerst
 					// The shift never showed up recognizably (heavy simultaneous movement, culled
 					// render, ...): fall back to the safe reset behavior.
 					abandon_pending(state);
+					// The delta was never identified, so the grid cannot be translated -- drop it.
+					reset_facing(state);
 					}
 				}
 
