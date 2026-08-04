@@ -292,6 +292,9 @@ class visual_animation_managerst
 		int32_t pending_age=0;
 		// Frames left in which new-movement detection stays suppressed after scroll activity.
 		int32_t suppress_frames=0;
+		// Contents of the buffers last time they were interpreted, to recognize a repeat of them.
+		uint64_t buffer_signature=0;
+		bool has_buffer_signature=false;
 	};
 
 	uint32_t frame_time_ms=0;
@@ -332,6 +335,24 @@ class visual_animation_managerst
 		{
 		abandon_pending(state);
 		state.suppress_frames=0;
+		}
+
+	// Identifies the buffer contents this frame, to tell a redrawn viewport from a repeated one.
+	static uint64_t compute_buffer_signature(const viewport_visual_animation_inputst &input)
+		{
+		uint64_t hash=1469598103934665603ULL;
+		const int32_t tile_count=input.dim_x*input.dim_y;
+		for(size_t layer=0;layer<input.current.size();++layer)
+			{
+			if(!visual_layer_tracks_own_movement(
+				static_cast<viewport_visual_layer>(layer)))continue;
+			for(int32_t i=0;i<tile_count;++i)
+				{
+				hash=(hash^uint64_t(uint32_t(input.current[layer][i])))*1099511628211ULL;
+				hash=(hash^uint64_t(uint32_t(input.previous[layer][i])))*1099511628211ULL;
+				}
+			}
+		return hash;
 		}
 
 	// Fraction of visible tracked sprites consistent with the buffers having shifted by (dwx,dwy).
@@ -494,6 +515,17 @@ class visual_animation_managerst
 					int8_t(native_sprite_facing));
 				state.has_mirrored=false;
 				}
+			// DF hands the same buffer pair to more than one render frame: this hook runs per frame
+			// while the viewport is recomputed only when it changes, and a paused game barely
+			// recomputes it at all. A landed scroll therefore stays visible after it was consumed,
+			// and reading it a second time turns one pan into a one-tile step for every sprite on
+			// screen. Only a viewport that actually advanced says anything new about movement.
+			const uint64_t signature=compute_buffer_signature(input);
+			const bool buffers_advanced=!state.has_buffer_signature||
+				state.buffer_signature!=signature;
+			state.buffer_signature=signature;
+			state.has_buffer_signature=true;
+
 			if(context_changed||!allow_new_movements)
 				{
 				// Skips the recompute sweep, so clear has_mirrored here or a stale true survives.
@@ -504,7 +536,7 @@ class visual_animation_managerst
 				}
 
 			bool translated=false;
-			if(!state.pending.empty())
+			if(buffers_advanced&&!state.pending.empty())
 				{
 				// The buffers apply queued scrolls in order and may coalesce them, so each hypothesis
 				// is a prefix of the queue.
@@ -606,9 +638,10 @@ class visual_animation_managerst
 					}
 				}
 
-			const bool suppress=translated||
+			const bool suppress=!buffers_advanced||translated||
 				!state.pending.empty()||state.suppress_frames>0;
-			if(state.suppress_frames>0)--state.suppress_frames;
+			// The countdown measures redraws, not frames, so a repeated viewport must not spend it.
+			if(buffers_advanced&&state.suppress_frames>0)--state.suppress_frames;
 			if(!suppress)
 				{
 				const int32_t tile_count=input.dim_x*input.dim_y;
