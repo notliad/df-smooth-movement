@@ -284,8 +284,7 @@ class visual_animation_managerst
 		int32_t pan_y=0;
 		bool has_pan=false;
 		// Window scrolls not yet observed in the buffers, oldest first.
-		// A signed total instead of a queue cancels on a drag that reverses direction, and a zero
-		// total reads as "no pan outstanding" while the buffers still owe both shifts.
+		// A signed total would cancel on a reversing drag while both shifts are still owed.
 		std::vector<std::array<int32_t,2>> pending;
 		// Frames the head has gone unrecognized, and how long the queue has waited in total.
 		int32_t pending_frames=0;
@@ -295,6 +294,8 @@ class visual_animation_managerst
 		// Contents of the buffers last time they were interpreted, to recognize a repeat of them.
 		uint64_t buffer_signature=0;
 		bool has_buffer_signature=false;
+		// Set while the previous buffer still belongs to a view that has been left behind.
+		bool previous_view_stale=false;
 	};
 
 	uint32_t frame_time_ms=0;
@@ -355,9 +356,8 @@ class visual_animation_managerst
 		return hash;
 		}
 
-	// Fraction of visible tracked sprites consistent with the buffers having shifted by (dwx,dwy).
-	// A scroll of that much moves world content so that current[x] == previous[x+dwx], same for y.
-	// Negative when there is nothing to compare against.
+	// Fraction of visible tracked sprites consistent with a buffer shift of (dwx,dwy), which
+	// leaves current[x] == previous[x+dwx], same for y. Negative when there is nothing to compare.
 	static double shift_match_ratio(
 		const viewport_visual_animation_inputst &input,
 		int32_t dwx,
@@ -482,9 +482,12 @@ class visual_animation_managerst
 				return;
 				}
 
-			const bool context_changed=!state.has_context||
-				state.context_revision!=input.context_revision||
-				state.dim_x!=input.dim_x||state.dim_y!=input.dim_y;
+			// Only a replaced view leaves a previous buffer belonging somewhere else; a first
+			// sighting does not.
+			const bool view_switched=state.has_context&&
+				(state.context_revision!=input.context_revision||
+				state.dim_x!=input.dim_x||state.dim_y!=input.dim_y);
+			const bool context_changed=!state.has_context||view_switched;
 			// A pure map scroll is followable, but window_x/window_y change at INPUT time while the
 			// viewport buffers shift on a later render frame. So the scroll delta is only accumulated
 			// here as a pending hint; the buffers themselves are hypothesis-tested each frame to find
@@ -515,11 +518,8 @@ class visual_animation_managerst
 					int8_t(native_sprite_facing));
 				state.has_mirrored=false;
 				}
-			// DF hands the same buffer pair to more than one render frame: this hook runs per frame
-			// while the viewport is recomputed only when it changes, and a paused game barely
-			// recomputes it at all. A landed scroll therefore stays visible after it was consumed,
-			// and reading it a second time turns one pan into a one-tile step for every sprite on
-			// screen. Only a viewport that actually advanced says anything new about movement.
+			// This hook runs per frame; the viewport is recomputed only when it changes, and while
+			// paused hardly at all. Re-reading a landed scroll steps every sprite by a tile.
 			const uint64_t signature=compute_buffer_signature(input);
 			const bool buffers_advanced=!state.has_buffer_signature||
 				state.buffer_signature!=signature;
@@ -532,17 +532,23 @@ class visual_animation_managerst
 				// The grid stays: an inactive viewport is not drawn and its facings still hold.
 				state.has_mirrored=false;
 				reset_tracking(state);
+				// window_z, zoom and resize change at input time; the buffers cross later.
+				// This reset covers only the input frame, not the crossing itself.
+				if(view_switched||!allow_new_movements)state.previous_view_stale=true;
 				return;
 				}
 
+			// On the crossing frame `current` is the new view and `previous` the old one, so a
+			// sprite on each side, a tile apart, reads as one that moved between them.
+			const bool crossed_views=buffers_advanced&&state.previous_view_stale;
+			if(buffers_advanced)state.previous_view_stale=false;
+
 			bool translated=false;
-			if(buffers_advanced&&!state.pending.empty())
+			if(buffers_advanced&&!crossed_views&&!state.pending.empty())
 				{
-				// The buffers apply queued scrolls in order and may coalesce them, so each hypothesis
-				// is a prefix of the queue.
-				// Prefixes are tried shortest first, since distinct ones can share a cumulative delta.
-				// [+1,+1,-1] nets +1 at one entry and at three, and retiring more than the buffers
-				// applied leaves owed shifts to be read as creature movement.
+				// Queued scrolls land in order and may coalesce, so each hypothesis is a prefix.
+				// Shortest first: prefixes can share a delta ([+1,+1,-1] nets +1 at one and at
+				// three), and over-retiring leaves owed shifts to be read as movement.
 				std::array<int32_t,2> landed{};
 				size_t landed_count=0;
 				bool no_data=false;
@@ -638,7 +644,7 @@ class visual_animation_managerst
 					}
 				}
 
-			const bool suppress=!buffers_advanced||translated||
+			const bool suppress=!buffers_advanced||crossed_views||translated||
 				!state.pending.empty()||state.suppress_frames>0;
 			// The countdown measures redraws, not frames, so a repeated viewport must not spend it.
 			if(buffers_advanced&&state.suppress_frames>0)--state.suppress_frames;
