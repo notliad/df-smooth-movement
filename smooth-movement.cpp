@@ -1091,11 +1091,11 @@ std::vector<render_proxyst> collect_proxies(
 						vp,
 						x+mirror_descriptor.center_x,
 						y+mirror_descriptor.center_y)!=native_sprite_facing;
-				// Reflecting a fragment about its anchor moves it by twice its
-				// offset to that anchor. The anchor itself has center_x 0 and
-				// so only flips in place.
+				// The anchor's own layer has center_x 0, so it flips in place.
 				const int32_t mirror_shift=
-					mirrored?2*mirror_descriptor.center_x:0;
+					mirrored?
+					mirrored_tile_x(x,x+mirror_descriptor.center_x)-x:
+					0;
 				render_proxyst proxy=
 					{
 					static_cast<viewport_visual_layer>(layer),
@@ -1213,7 +1213,7 @@ std::vector<render_proxyst> collect_proxies(
 						1.0f,
 						nullptr,
 						true,
-						2*descriptor.center_x,
+						mirrored_tile_x(x,anchor_x)-x,
 						{}
 						};
 					// The sprite lands on x+mirror_shift, so that interval must be repaintable.

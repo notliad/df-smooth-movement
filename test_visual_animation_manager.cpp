@@ -84,7 +84,10 @@ int main()
 	// Facing rule: only a horizontal component changes facing.
 	assert(facing_after_move(1,visual_facingst::west)==visual_facingst::east);
 	assert(facing_after_move(-1,visual_facingst::east)==visual_facingst::west);
-	// Diagonals use their horizontal component.
+	// dy is not an input, so a diagonal is only ever the sign of dx.
+	// The four real diagonals run end to end through the manager further down.
+	assert(facing_after_move(1,visual_facingst::east)==visual_facingst::east);
+	assert(facing_after_move(-1,visual_facingst::west)==visual_facingst::west);
 	// Pure vertical and idle carry the previous facing (sticky).
 	assert(facing_after_move(0,visual_facingst::west)==visual_facingst::west);
 	assert(facing_after_move(0,visual_facingst::east)==visual_facingst::east);
@@ -92,7 +95,11 @@ int main()
 	assert(mirrored_tile_x(5,5)==5);   // anchor reflects to itself
 	assert(mirrored_tile_x(6,5)==4);   // right spill -> left
 	assert(mirrored_tile_x(4,5)==6);   // left spill -> right
-	assert(mirrored_tile_x(8,5)==2);   // width 6 needs no special case
+	// The formula is a general reflection, so it holds for offsets no layer can express.
+	assert(mirrored_tile_x(8,5)==2);
+	// center_x is only ever -1, 0 or +1, so the real mirror shift is only ever -2, 0 or +2.
+	for(const auto &descriptor:visual_layer_descriptors)
+		assert(descriptor.center_x>=-1&&descriptor.center_x<=1);
 	// Reflection is self-inverse.
 	assert(mirrored_tile_x(mirrored_tile_x(6,5),5)==6);
 	assert(mirrored_tile_x(mirrored_tile_x(8,5),5)==8);
@@ -186,6 +193,54 @@ int main()
 	assert(manager.get_facing(viewport,dim,0)==native_sprite_facing);
 	assert(manager.get_facing(nullptr,0,0)==native_sprite_facing);
 	}
+	}
+
+	// All four diagonals through the manager, so every step carries a real dy as well as a dx.
+	// The chain alternates direction, so no assertion can pass by inheriting the previous facing.
+	{
+	constexpr int32_t diag_dim=5;
+	int32_t diag_empty[diag_dim*diag_dim]={};
+	int32_t start[diag_dim*diag_dim]={};
+	int32_t north_east[diag_dim*diag_dim]={};
+	int32_t south_west[diag_dim*diag_dim]={};
+	int32_t south_east[diag_dim*diag_dim]={};
+	int32_t north_west[diag_dim*diag_dim]={};
+	const int diag_token=0;
+	const void *diag_viewport=&diag_token;
+
+	start[2*diag_dim+2]=77;        // (2,2)
+	north_east[3*diag_dim+1]=77;   // (2,2) -> (3,1): dx +1, dy -1
+	south_west[2*diag_dim+2]=77;   // (3,1) -> (2,2): dx -1, dy +1
+	south_east[3*diag_dim+3]=77;   // (2,2) -> (3,3): dx +1, dy +1
+	north_west[2*diag_dim+2]=77;   // (3,3) -> (2,2): dx -1, dy -1
+
+	visual_animation_managerst diagonal;
+	auto input=make_input(diag_viewport,diag_dim,diag_empty);
+	set_layer(input,viewport_visual_layer::center,start,diag_empty);
+	run_frame(diagonal,input,1000);
+	assert(diagonal.get_facing(diag_viewport,2,2)==native_sprite_facing);
+
+	set_layer(input,viewport_visual_layer::center,north_east,start);
+	run_frame(diagonal,input,1016);
+	assert(diagonal.get_facing(diag_viewport,3,1)==visual_facingst::east);
+
+	// West is the grid default, so the westward legs also assert a movement was registered.
+	// Otherwise an untracked step leaving the tile at its default would pass.
+	set_layer(input,viewport_visual_layer::center,south_west,north_east);
+	run_frame(diagonal,input,1032);
+	assert(diagonal.get_movement(
+		diag_viewport,viewport_visual_layer::center,2,2).active);
+	assert(diagonal.get_facing(diag_viewport,2,2)==visual_facingst::west);
+
+	set_layer(input,viewport_visual_layer::center,south_east,south_west);
+	run_frame(diagonal,input,1048);
+	assert(diagonal.get_facing(diag_viewport,3,3)==visual_facingst::east);
+
+	set_layer(input,viewport_visual_layer::center,north_west,south_east);
+	run_frame(diagonal,input,1064);
+	assert(diagonal.get_movement(
+		diag_viewport,viewport_visual_layer::center,2,2).active);
+	assert(diagonal.get_facing(diag_viewport,2,2)==visual_facingst::west);
 	}
 
 	// Regression: A and B move in the same frame, chained -- A's target tile is B's source tile.
