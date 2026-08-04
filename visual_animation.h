@@ -333,7 +333,10 @@ class visual_animation_managerst
 	// Identifies the buffer contents this frame, to tell a redrawn viewport from a repeated one.
 	static uint64_t compute_buffer_signature(const viewport_visual_animation_inputst &input)
 		{
-		uint64_t hash=1469598103934665603ULL;
+		// FNV-1a. Only ever compared against the previous frame's value, never stored.
+		constexpr uint64_t fnv_offset_basis=0xcbf29ce484222325ULL;
+		constexpr uint64_t fnv_prime=0x100000001b3ULL;
+		uint64_t hash=fnv_offset_basis;
 		const int32_t tile_count=input.dim_x*input.dim_y;
 		for(size_t layer=0;layer<input.current.size();++layer)
 			{
@@ -341,8 +344,8 @@ class visual_animation_managerst
 				static_cast<viewport_visual_layer>(layer)))continue;
 			for(int32_t i=0;i<tile_count;++i)
 				{
-				hash=(hash^uint64_t(uint32_t(input.current[layer][i])))*1099511628211ULL;
-				hash=(hash^uint64_t(uint32_t(input.previous[layer][i])))*1099511628211ULL;
+				hash=(hash^uint64_t(uint32_t(input.current[layer][i])))*fnv_prime;
+				hash=(hash^uint64_t(uint32_t(input.previous[layer][i])))*fnv_prime;
 				}
 			}
 		return hash;
