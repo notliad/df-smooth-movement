@@ -283,10 +283,13 @@ class visual_animation_managerst
 		int32_t pan_x=0;
 		int32_t pan_y=0;
 		bool has_pan=false;
-		// Window-scroll delta not yet observed in the buffers, and how long it has been pending.
-		int32_t pending_dx=0;
-		int32_t pending_dy=0;
+		// Window scrolls not yet observed in the buffers, oldest first.
+		// A signed total instead of a queue cancels on a drag that reverses direction, and a zero
+		// total reads as "no pan outstanding" while the buffers still owe both shifts.
+		std::vector<std::array<int32_t,2>> pending;
+		// Frames the head has gone unrecognized, and how long the queue has waited in total.
 		int32_t pending_frames=0;
+		int32_t pending_age=0;
 		// Frames left in which new-movement detection stays suppressed after scroll activity.
 		int32_t suppress_frames=0;
 	};
@@ -298,12 +301,16 @@ class visual_animation_managerst
 	std::vector<viewport_animationst> viewports;
 
 	static constexpr uint32_t movement_duration_ms=100;
+	// Scrolling faster than detection keeps up: give up rather than test ever more prefixes.
+	static constexpr size_t max_pending_shifts=8;
+	// Bounds the wait on a scroll that never lands, so suppression cannot stick forever.
+	static constexpr int32_t max_pending_age_frames=120;
 
 	static void clear_pending(viewport_animationst &state)
 		{
-		state.pending_dx=0;
-		state.pending_dy=0;
+		state.pending.clear();
 		state.pending_frames=0;
+		state.pending_age=0;
 		}
 
 	static void abandon_pending(viewport_animationst &state)
@@ -325,6 +332,44 @@ class visual_animation_managerst
 		{
 		abandon_pending(state);
 		state.suppress_frames=0;
+		}
+
+	// Fraction of visible tracked sprites consistent with the buffers having shifted by (dwx,dwy).
+	// A scroll of that much moves world content so that current[x] == previous[x+dwx], same for y.
+	// Negative when there is nothing to compare against.
+	static double shift_match_ratio(
+		const viewport_visual_animation_inputst &input,
+		int32_t dwx,
+		int32_t dwy)
+		{
+		int32_t considered=0;
+		int32_t matches=0;
+		for(size_t layer=0;layer<input.current.size();++layer)
+			{
+			if(!visual_layer_tracks_own_movement(
+				static_cast<viewport_visual_layer>(layer)))continue;
+			const int32_t *current=input.current[layer];
+			const int32_t *previous=input.previous[layer];
+			for(int32_t x=0;x<input.dim_x;++x)
+				{
+				const int32_t sx=x+dwx;
+				if(sx<0||sx>=input.dim_x)continue;
+				for(int32_t y=0;y<input.dim_y;++y)
+					{
+					const int32_t texpos=current[x*input.dim_y+y];
+					if(texpos==0)continue;
+					const int32_t sy=y+dwy;
+					if(sy<0||sy>=input.dim_y)continue;
+					++considered;
+					if(visual_layer_matches(
+						static_cast<viewport_visual_layer>(layer),
+						texpos,
+						previous[sx*input.dim_y+sy]))++matches;
+					}
+				}
+			}
+		if(considered==0)return -1.0;
+		return double(matches)/double(considered);
 		}
 
 	static std::array<int32_t,2> shared_movement_delta(
@@ -429,8 +474,9 @@ class visual_animation_managerst
 			// that made sprites float when the camera moved.
 			if(state.has_pan&&(state.pan_x!=input.pan_x||state.pan_y!=input.pan_y))
 				{
-				state.pending_dx+=input.pan_x-state.pan_x;
-				state.pending_dy+=input.pan_y-state.pan_y;
+				if(state.pending.size()>=max_pending_shifts)abandon_pending(state);
+				state.pending.push_back(
+					{input.pan_x-state.pan_x,input.pan_y-state.pan_y});
 				state.pending_frames=0;
 				state.suppress_frames=2;
 				}
@@ -458,49 +504,49 @@ class visual_animation_managerst
 				}
 
 			bool translated=false;
-			if(state.pending_dx!=0||state.pending_dy!=0)
+			if(!state.pending.empty())
 				{
-				// Did the buffers apply the pending scroll? After a scroll of (dwx,dwy) the world
-				// content moves so that current[x] == previous[x+dwx] (same for y). Test that over
-				// the visible creature sprites; a majority match means the shift landed this frame.
-				const int32_t dwx=state.pending_dx;
-				const int32_t dwy=state.pending_dy;
-				int32_t considered=0;
-				int32_t matches=0;
-				for(size_t layer=0;layer<input.current.size();++layer)
+				// The buffers apply queued scrolls in order and may coalesce them, so each hypothesis
+				// is a prefix of the queue.
+				// Prefixes are tried shortest first, since distinct ones can share a cumulative delta.
+				// [+1,+1,-1] nets +1 at one entry and at three, and retiring more than the buffers
+				// applied leaves owed shifts to be read as creature movement.
+				std::array<int32_t,2> landed{};
+				size_t landed_count=0;
+				bool no_data=false;
+				std::array<int32_t,2> shift{};
+				for(size_t count=1;count<=state.pending.size();++count)
 					{
-					if(!visual_layer_tracks_own_movement(
-						static_cast<viewport_visual_layer>(layer)))continue;
-					const int32_t *current=input.current[layer];
-					const int32_t *previous=input.previous[layer];
-					for(int32_t x=0;x<input.dim_x;++x)
+					shift[0]+=state.pending[count-1][0];
+					shift[1]+=state.pending[count-1][1];
+					// A prefix netting to zero is indistinguishable from "nothing landed yet".
+					// Accepting it would retire shifts the buffers have still to apply.
+					if(shift[0]==0&&shift[1]==0)continue;
+					const double ratio=shift_match_ratio(input,shift[0],shift[1]);
+					if(ratio<0.0)
 						{
-						const int32_t sx=x+dwx;
-						if(sx<0||sx>=input.dim_x)continue;
-						for(int32_t y=0;y<input.dim_y;++y)
-							{
-							const int32_t texpos=current[x*input.dim_y+y];
-							if(texpos==0)continue;
-							const int32_t sy=y+dwy;
-							if(sy<0||sy>=input.dim_y)continue;
-							++considered;
-						if(visual_layer_matches(
-								static_cast<viewport_visual_layer>(layer),
-								texpos,
-								previous[sx*input.dim_y+sy]))++matches;
-							}
+						no_data=true;
+						break;
+						}
+					if(ratio>=0.5)
+						{
+						landed=shift;
+						landed_count=count;
+						break;
 						}
 					}
-				if(considered==0)
+				if(no_data)
 					{
 					// Nothing visible to anchor the test on: nothing to animate either.
 					abandon_pending(state);
 					reset_facing(state);
 					}
-				else if(matches*2>=considered)
+				else if(landed_count>0)
 					{
 					// The shift landed: re-anchor in-flight movements to the new viewport frame and
 					// drop anything scrolled off-screen.
+					const int32_t dwx=landed[0];
+					const int32_t dwy=landed[1];
 					state.movements.erase(
 						std::remove_if(
 							state.movements.begin(),
@@ -536,8 +582,19 @@ class visual_animation_managerst
 							}
 						state.facing.swap(shifted);
 						}
-					clear_pending(state);
+					state.pending.erase(
+						state.pending.begin(),
+						state.pending.begin()+int32_t(landed_count));
+					state.pending_frames=0;
+					state.pending_age=0;
 					translated=true;
+					}
+				else if(shift_match_ratio(input,0,0)>=0.5&&
+					++state.pending_age<=max_pending_age_frames)
+					{
+					// The buffers demonstrably have not moved yet, so the scroll is still in flight.
+					// Waiting is not a failure here; only the age cap bounds it.
+					state.pending_frames=0;
 					}
 				else if(++state.pending_frames>4)
 					{
@@ -550,7 +607,7 @@ class visual_animation_managerst
 				}
 
 			const bool suppress=translated||
-				state.pending_dx!=0||state.pending_dy!=0||state.suppress_frames>0;
+				!state.pending.empty()||state.suppress_frames>0;
 			if(state.suppress_frames>0)--state.suppress_frames;
 			if(!suppress)
 				{
