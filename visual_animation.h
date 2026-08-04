@@ -271,6 +271,9 @@ class visual_animation_managerst
 		bool has_context=false;
 		bool seen=false;
 		std::vector<movementst> movements;
+		// One facing per tile, keyed by tile rather than by unit.
+		// The viewport exposes one creature texpos per tile, so DF has already picked it.
+		std::vector<int8_t> facing;
 		int32_t pan_x=0;
 		int32_t pan_y=0;
 		bool has_pan=false;
@@ -422,6 +425,10 @@ class visual_animation_managerst
 			state.pan_x=input.pan_x;
 			state.pan_y=input.pan_y;
 			state.has_pan=true;
+			if(context_changed)
+				state.facing.assign(
+					size_t(input.dim_x)*size_t(input.dim_y),
+					int8_t(visual_facingst::east));
 			if(context_changed||!allow_new_movements)
 				{
 				reset_tracking(state);
@@ -485,6 +492,27 @@ class visual_animation_managerst
 									movement.target_y<0||movement.target_y>=input.dim_y;
 								}),
 						state.movements.end());
+					// Facing describes creatures still on screen, not motion in progress.
+					// A landed pan therefore translates it instead of dropping it.
+					if(state.facing.size()==
+						size_t(input.dim_x)*size_t(input.dim_y))
+						{
+						std::vector<int8_t> shifted(
+							state.facing.size(),int8_t(visual_facingst::east));
+						for(int32_t x=0;x<input.dim_x;++x)
+							{
+							const int32_t sx=x+dwx;
+							if(sx<0||sx>=input.dim_x)continue;
+							for(int32_t y=0;y<input.dim_y;++y)
+								{
+								const int32_t sy=y+dwy;
+								if(sy<0||sy>=input.dim_y)continue;
+								shifted[x*input.dim_y+y]=
+									state.facing[sx*input.dim_y+sy];
+								}
+							}
+						state.facing.swap(shifted);
+						}
 					clear_pending(state);
 					translated=true;
 					}
@@ -504,6 +532,16 @@ class visual_animation_managerst
 				const int32_t tile_count=input.dim_x*input.dim_y;
 				std::vector<uint8_t> claimed_sources(tile_count);
 				const size_t existing_movement_count=state.movements.size();
+				// Source facing is read from a frame-start snapshot.
+				// A chained movement's source may already have been rewritten earlier this frame.
+				const std::vector<int8_t> facing_at_frame_start=state.facing;
+				// Source clears are deferred until every movement this frame is registered.
+				// A source can be another movement's target in the same frame -- a chain.
+				// Clearing inline is order-dependent: it stomps that target write, or loses to it.
+				std::vector<uint8_t> facing_target_written;
+				std::vector<int32_t> pending_facing_source_clears;
+				if(state.facing.size()==size_t(input.dim_x)*size_t(input.dim_y))
+					facing_target_written.assign(state.facing.size(),0);
 				for(size_t layer=0;layer<input.current.size();++layer)
 					{
 					if(!visual_layer_tracks_own_movement(
@@ -602,10 +640,38 @@ class visual_animation_managerst
 								y,
 								frame_time_ms
 								});
+							if(static_cast<viewport_visual_layer>(layer)==
+									viewport_visual_layer::center&&
+								state.facing.size()==
+									size_t(input.dim_x)*size_t(input.dim_y)&&
+								!facing_at_frame_start.empty()&&
+								facing_at_frame_start.size()==state.facing.size())
+								{
+								const int32_t source_tile_x=source/input.dim_y;
+								const int32_t target_index=x*input.dim_y+y;
+								state.facing[target_index]=int8_t(
+									facing_after_move(
+										x-source_tile_x,
+										static_cast<visual_facingst>(
+											facing_at_frame_start[source])));
+								facing_target_written[size_t(target_index)]=1;
+								pending_facing_source_clears.push_back(source);
+								}
 							}
 						}
 						}
+				// A source vacates its tile only if no movement this frame claimed it as a target.
+				// That covers the in-pass chain and an untracked creature occupying the tile.
+				if(!facing_target_written.empty())
+					{
+					for(int32_t pending_source:pending_facing_source_clears)
+						{
+						if(!facing_target_written[size_t(pending_source)])
+							state.facing[size_t(pending_source)]=
+								int8_t(visual_facingst::east);
+						}
 					}
+				}
 			state.movements.erase(
 				std::remove_if(
 					state.movements.begin(),
@@ -620,6 +686,15 @@ class visual_animation_managerst
 							!visual_layer_matches(movement.layer,current,movement.texpos);
 						}),
 				state.movements.end());
+			if(state.facing.size()==size_t(input.dim_x)*size_t(input.dim_y))
+				{
+				const int32_t *center_current=
+					input.current[static_cast<size_t>(
+						viewport_visual_layer::center)];
+				for(size_t i=0;i<state.facing.size();++i)
+					if(center_current[i]==0)
+						state.facing[i]=int8_t(visual_facingst::east);
+				}
 			if(!state.movements.empty())force_full_redraw=true;
 			}
 
@@ -645,6 +720,22 @@ class visual_animation_managerst
 		uint32_t get_frame_delta_ms() const
 			{
 			return frame_delta_ms;
+			}
+
+		visual_facingst get_facing(
+			const void *viewport,
+			int32_t x,
+			int32_t y) const
+			{
+			for(const viewport_animationst &state:viewports)
+				{
+				if(state.viewport!=viewport)continue;
+				if(x<0||x>=state.dim_x||y<0||y>=state.dim_y)break;
+				const size_t index=size_t(x)*size_t(state.dim_y)+size_t(y);
+				if(index>=state.facing.size())break;
+				return static_cast<visual_facingst>(state.facing[index]);
+				}
+			return visual_facingst::east;
 			}
 
 		bool requires_full_redraw() const

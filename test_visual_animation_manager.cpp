@@ -97,6 +97,163 @@ int main()
 	assert(mirrored_tile_x(mirrored_tile_x(6,5),5)==6);
 	assert(mirrored_tile_x(mirrored_tile_x(8,5),5)==8);
 
+	{
+	constexpr int32_t dim=4;
+	int32_t empty[dim*dim]={};
+	int32_t before[dim*dim]={};
+	int32_t west_after[dim*dim]={};
+	const int viewport_token=0;
+	const void *viewport=&viewport_token;
+
+	before[2*dim+2]=77;
+	west_after[1*dim+2]=77;   // moved west: x 2 -> 1
+
+	// Moving west sets west facing on the target tile.
+	{
+	visual_animation_managerst manager;
+	auto input=make_input(viewport,dim,empty);
+	set_layer(input,viewport_visual_layer::center,before,empty);
+	run_frame(manager,input,1000);
+	set_layer(input,viewport_visual_layer::center,west_after,before);
+	run_frame(manager,input,1016);
+	assert(manager.get_facing(viewport,1,2)==visual_facingst::west);
+	}
+
+	// Moving east sets east facing. The target's prior facing is made
+	// genuinely west first (not the grid's default east), so this only
+	// passes if the east branch of facing_after_move is actually taken.
+	{
+	visual_animation_managerst manager;
+	auto input=make_input(viewport,dim,empty);
+	set_layer(input,viewport_visual_layer::center,before,empty);
+	run_frame(manager,input,1000);
+	set_layer(input,viewport_visual_layer::center,west_after,before);
+	run_frame(manager,input,1016);
+	assert(manager.get_facing(viewport,1,2)==visual_facingst::west);
+	set_layer(input,viewport_visual_layer::center,before,west_after);
+	run_frame(manager,input,1032);
+	assert(manager.get_facing(viewport,2,2)==visual_facingst::east);
+	}
+
+	// Pure vertical movement carries the existing facing to the new tile.
+	{
+	visual_animation_managerst manager;
+	auto input=make_input(viewport,dim,empty);
+	set_layer(input,viewport_visual_layer::center,before,empty);
+	run_frame(manager,input,1000);
+	set_layer(input,viewport_visual_layer::center,west_after,before);
+	run_frame(manager,input,1016);
+	assert(manager.get_facing(viewport,1,2)==visual_facingst::west);
+	int32_t up[dim*dim]={};
+	up[1*dim+1]=77;   // north: (1,2) -> (1,1), no horizontal component
+	set_layer(input,viewport_visual_layer::center,up,west_after);
+	run_frame(manager,input,1032);
+	assert(manager.get_facing(viewport,1,1)==visual_facingst::west);
+	}
+
+	// Out-of-range and unknown viewports default to east.
+	{
+	visual_animation_managerst manager;
+	auto input=make_input(viewport,dim,empty);
+	set_layer(input,viewport_visual_layer::center,before,empty);
+	run_frame(manager,input,1000);
+	assert(manager.get_facing(viewport,-1,0)==visual_facingst::east);
+	assert(manager.get_facing(viewport,dim,0)==visual_facingst::east);
+	assert(manager.get_facing(nullptr,0,0)==visual_facingst::east);
+	}
+	}
+
+	// Regression: two creatures marching in the same column in a single
+	// frame is exactly the case shared_movement_delta exists to detect,
+	// and it is a chain -- A's target tile is B's source tile. A's write
+	// must not corrupt B's read of its own pre-frame facing. A picks up
+	// a genuinely different (west) facing first so a swap is observable.
+	{
+	constexpr int32_t chase_dim=5;
+	int32_t chase_empty[chase_dim*chase_dim]={};
+	int32_t frame_a[chase_dim*chase_dim]={};
+	int32_t frame_b[chase_dim*chase_dim]={};
+	int32_t frame_c[chase_dim*chase_dim]={};
+	const int chase_token=0;
+	const void *chase_viewport=&chase_token;
+
+	// A starts off-column and steps west into the column, picking up a
+	// west facing. B sits stationary in the column, keeping its default
+	// (east) facing.
+	frame_a[3*chase_dim+1]=77;   // A at (3,1)
+	frame_a[2*chase_dim+2]=88;   // B at (2,2), stationary
+	frame_b[2*chase_dim+1]=77;   // A steps west: (3,1) -> (2,1)
+	frame_b[2*chase_dim+2]=88;   // B unchanged
+
+	// Both step south in the same frame: shared_movement_delta needs two tiles on the same delta.
+	frame_c[2*chase_dim+2]=77;   // A: (2,1) -> (2,2)
+	frame_c[2*chase_dim+3]=88;   // B: (2,2) -> (2,3)
+
+	visual_animation_managerst manager;
+	auto input=make_input(chase_viewport,chase_dim,chase_empty);
+	set_layer(input,viewport_visual_layer::center,frame_a,chase_empty);
+	run_frame(manager,input,1000);
+	set_layer(input,viewport_visual_layer::center,frame_b,frame_a);
+	run_frame(manager,input,1016);
+	assert(manager.get_facing(chase_viewport,2,1)==visual_facingst::west);
+	assert(manager.get_facing(chase_viewport,2,2)==visual_facingst::east);
+
+	set_layer(input,viewport_visual_layer::center,frame_c,frame_b);
+	run_frame(manager,input,1032);
+	// A carries its own (west) facing forward.
+	assert(manager.get_facing(chase_viewport,2,2)==visual_facingst::west);
+	// B carries its own (east) facing forward -- not A's, even though A's
+	// write into (2,2) happens earlier in the same raster pass that B's
+	// movement reads (2,2) as its source.
+	assert(manager.get_facing(chase_viewport,2,3)==visual_facingst::east);
+	}
+
+	// Regression: a vacated source tile is reoccupied the same frame by an UNTRACKED creature.
+	// Nothing targets that tile, so no target write clears it, and it is not empty either.
+	// Only an explicit, order-independent source clear restores the default there.
+	{
+	constexpr int32_t gap_dim=5;
+	int32_t gap_empty[gap_dim*gap_dim]={};
+	int32_t frame_a[gap_dim*gap_dim]={};
+	int32_t frame_b[gap_dim*gap_dim]={};
+	int32_t frame_c[gap_dim*gap_dim]={};
+	const int gap_token=0;
+	const void *gap_viewport=&gap_token;
+
+	// D at (3,1); E is a stationary companion at (2,2) so that D's later
+	// southward departure from (2,1) shares a delta with E's own move and
+	// shared_movement_delta engages (it needs two tiles on the same delta).
+	frame_a[3*gap_dim+1]=77;   // D
+	frame_a[2*gap_dim+2]=88;   // E, stationary companion
+	frame_b[2*gap_dim+1]=77;   // D steps west: (3,1) -> (2,1), picks up west facing
+	frame_b[2*gap_dim+2]=88;   // E unchanged
+
+	// D and E both step south, chained, and F appears at D's just-vacated tile the same frame.
+	// previous[(2,1)] was occupied by D, so the empty-cell fallback cannot see F.
+	// No shared-delta source matches F's texpos either, so its arrival registers no movement.
+	frame_c[2*gap_dim+2]=77;   // D: (2,1) -> (2,2)
+	frame_c[2*gap_dim+3]=88;   // E: (2,2) -> (2,3)
+	frame_c[2*gap_dim+1]=55;   // F appears at (2,1), untracked
+
+	visual_animation_managerst manager;
+	auto input=make_input(gap_viewport,gap_dim,gap_empty);
+	set_layer(input,viewport_visual_layer::center,frame_a,gap_empty);
+	run_frame(manager,input,1000);
+	set_layer(input,viewport_visual_layer::center,frame_b,frame_a);
+	run_frame(manager,input,1016);
+	assert(manager.get_facing(gap_viewport,2,1)==visual_facingst::west);
+
+	set_layer(input,viewport_visual_layer::center,frame_c,frame_b);
+	run_frame(manager,input,1032);
+	assert(!manager.get_movement(
+		gap_viewport,viewport_visual_layer::center,2,1).active);
+	// F must not inherit D's stale west facing -- the tile falls back to
+	// the default (east) even though it is occupied, not empty.
+	assert(manager.get_facing(gap_viewport,2,1)==visual_facingst::east);
+	assert(manager.get_facing(gap_viewport,2,2)==visual_facingst::west);
+	assert(manager.get_facing(gap_viewport,2,3)==visual_facingst::east);
+	}
+
 	assert(animation_progress(100,0,100)==1.0f);
 	assert(inherited_visual_source_tile(0,0,1)==-1);
 	assert(inherited_visual_source_tile(2,0,1)==1);
