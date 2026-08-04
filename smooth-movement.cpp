@@ -50,15 +50,10 @@ REQUIRE_GLOBAL(window_z);
 namespace {
 
 constexpr const char *plugin_version="0.4.0-dev";
-#ifdef WIN32
-constexpr const char *sdl_library="SDL2.dll";
-#else
-constexpr const char *sdl_library="libSDL2-2.0.so.0";
-#endif
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
-DFLibrary *sdl_handle=nullptr;
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
+decltype(&SDL_RenderCopyExF) render_copy_ex_f=nullptr;
 decltype(&SDL_RenderFillRect) render_fill_rect=nullptr;
 decltype(&SDL_RenderSetClipRect) render_set_clip_rect=nullptr;
 decltype(&SDL_GetRenderDrawColor) get_render_draw_color=nullptr;
@@ -81,6 +76,7 @@ int32_t previous_pan_x=0;
 int32_t previous_pan_y=0;
 bool has_pan_context=false;
 bool construction_transitions_enabled=false;
+bool flip_enabled=false;
 
 // --- free camera -------------------------------------------------------------------------------
 // The camera is visually unbound from the tile grid. Two layered offsets:
@@ -961,6 +957,8 @@ struct render_proxyst
 	int32_t texpos;
 	float progress;
 	SDL_Texture *texture;
+	bool mirrored=false;
+	int32_t mirror_shift=0;
 	std::set<std::pair<int32_t,int32_t>> coverage;
 };
 
@@ -1150,11 +1148,30 @@ SDL_Texture *cached_tile_texture(
 	return texture!=nullptr?texture:cached_texture(renderer,texpos);
 }
 
+// The render_copy_ex_f null check is defensive only, not a graceful-degradation path.
+// `bind` aborts load_sdl on any missing symbol and plugin_enable then refuses the render hook.
+void render_copy_maybe_mirrored(
+	SDL_Renderer *renderer,
+	SDL_Texture *texture,
+	const SDL_FRect &destination,
+	bool mirrored)
+{
+	if(mirrored&&render_copy_ex_f!=nullptr)
+		{
+		render_copy_ex_f(
+			renderer,texture,nullptr,&destination,
+			0.0,nullptr,SDL_FLIP_HORIZONTAL);
+		return;
+		}
+	render_copy_f(renderer,texture,nullptr,&destination);
+}
+
 void draw_texture_with_alpha(
 	SDL_Renderer *renderer,
 	SDL_Texture *texture,
 	const SDL_FRect &destination,
-	float opacity)
+	float opacity,
+	bool mirrored)
 {
 	if(opacity<=0.0f)return;
 	Uint8 saved_alpha=255;
@@ -1162,12 +1179,12 @@ void draw_texture_with_alpha(
 	if(get_texture_alpha_mod(texture,&saved_alpha)!=0||
 		get_texture_blend_mode(texture,&saved_blend)!=0)
 		{
-		render_copy_f(renderer,texture,nullptr,&destination);
+		render_copy_maybe_mirrored(renderer,texture,destination,mirrored);
 		return;
 		}
 	set_texture_blend_mode(texture,SDL_BLENDMODE_BLEND);
 	set_texture_alpha_mod(texture,Uint8(std::lround(saved_alpha*opacity)));
-	render_copy_f(renderer,texture,nullptr,&destination);
+	render_copy_maybe_mirrored(renderer,texture,destination,mirrored);
 	set_texture_alpha_mod(texture,saved_alpha);
 	set_texture_blend_mode(texture,saved_blend);
 }
@@ -1180,18 +1197,19 @@ void draw_proxy(df::renderer_2d_base *renderer,const render_proxyst &proxy)
 	const float tile_size=float(zoom==128?32:std::max(1,zoom*32/128));
 	const float source_x=target_x+(proxy.source_x-proxy.target_x)*tile_size;
 	const float source_y=target_y+(proxy.source_y-proxy.target_y)*tile_size;
+	const float mirror_offset=float(proxy.mirror_shift)*tile_size;
 	const SDL_FRect destination=
 		{
-		source_x+(target_x-source_x)*proxy.progress,
+		source_x+(target_x-source_x)*proxy.progress+mirror_offset,
 		source_y+(target_y-source_y)*proxy.progress,
 		tile_size,
 		tile_size
 		};
-	render_copy_f(
+	render_copy_maybe_mirrored(
 		static_cast<SDL_Renderer *>(renderer->sdl_renderer),
 		proxy.texture,
-		nullptr,
-		&destination);
+		destination,
+		proxy.mirrored);
 }
 
 std::vector<render_proxyst> collect_proxies(
@@ -1274,6 +1292,25 @@ std::vector<render_proxyst> collect_proxies(
 						}
 					}
 
+				// Items, vehicles and designations keep their vanilla orientation.
+				const auto &mirror_descriptor=
+					visual_layer_descriptor(visual_layer);
+				const visual_render_groupst group=
+					visual_render_group(visual_layer);
+				const bool mirror_eligible=flip_enabled&&
+					(group==visual_render_groupst::main||
+					group==visual_render_groupst::upper);
+				// Facing is read from the anchor tile so every fragment of one creature agrees.
+				const bool mirrored=mirror_eligible&&
+					animation_manager.get_facing(
+						vp,
+						x+mirror_descriptor.center_x,
+						y+mirror_descriptor.center_y)!=native_sprite_facing;
+				// The anchor's own layer has center_x 0, so it flips in place.
+				const int32_t mirror_shift=
+					mirrored?
+					mirrored_tile_x(x,x+mirror_descriptor.center_x)-x:
+					0;
 				render_proxyst proxy=
 					{
 					static_cast<viewport_visual_layer>(layer),
@@ -1284,6 +1321,8 @@ std::vector<render_proxyst> collect_proxies(
 					texpos,
 					movement.progress,
 					nullptr,
+					mirrored,
+					mirror_shift,
 					{}
 					};
 				bool blocked=false;
@@ -1313,10 +1352,108 @@ std::vector<render_proxyst> collect_proxies(
 					if(blocked)break;
 					}
 				if(blocked)continue;
+				if(proxy.mirror_shift!=0)
+					{
+					std::set<std::pair<int32_t,int32_t>> mirrored_coverage;
+					for(const auto &tile:proxy.coverage)
+						mirrored_coverage.emplace(
+							tile.first+proxy.mirror_shift,tile.second);
+					for(const auto &tile:mirrored_coverage)
+						{
+						if(!inside_clip(vp,tile.first,tile.second))
+							{
+							blocked=true;
+							break;
+							}
+						if(visual_render_group(proxy.layer)==visual_render_groupst::main&&
+							has_fire(vp,tile.first,tile.second))
+							{
+							blocked=true;
+							break;
+							}
+						proxy.coverage.insert(tile);
+						}
+					if(blocked)continue;
+					}
 
 				proxy.texture=cached_texture(renderer,texpos);
 				if(proxy.texture==nullptr)continue;
 				proxies.push_back(std::move(proxy));
+				}
+			}
+		}
+
+	// A creature that has stopped still needs its mirrored sprite painted each frame.
+	// Otherwise the engine repaints it natively and the two orientations alternate between steps.
+	// A fragment's tile is its anchor minus the layer's centre offset, inverting the moving path.
+	if(flip_enabled)
+		{
+		for(int32_t anchor_x=0;anchor_x<vp->dim_x;++anchor_x)
+			{
+			for(int32_t anchor_y=0;anchor_y<vp->dim_y;++anchor_y)
+				{
+				if(animation_manager.get_facing(vp,anchor_x,anchor_y)==
+					native_sprite_facing)continue;
+				for(uint8_t draw_order=0;draw_order<visual_layer_count;++draw_order)
+					{
+					const viewport_visual_layer visual_layer=
+						visual_layer_at_draw_order(draw_order);
+					const visual_render_groupst group=
+						visual_render_group(visual_layer);
+					if(group!=visual_render_groupst::main&&
+						group!=visual_render_groupst::upper)continue;
+					const auto &descriptor=visual_layer_descriptor(visual_layer);
+					const int32_t x=anchor_x-descriptor.center_x;
+					const int32_t y=anchor_y-descriptor.center_y;
+					if(x<0||x>=vp->dim_x||y<0||y>=vp->dim_y)continue;
+					const size_t layer=static_cast<size_t>(visual_layer);
+					const int32_t texpos=layers[layer][x*vp->dim_y+y];
+					if(texpos==0)continue;
+					bool already_drawn=false;
+					for(const render_proxyst &existing:proxies)
+						if(existing.layer==visual_layer&&
+							existing.target_x==x&&existing.target_y==y)
+							already_drawn=true;
+					if(already_drawn)continue;
+
+					// source == target at progress 1.0 draws in place, moved only by mirror_shift.
+					render_proxyst proxy=
+						{
+						visual_layer,
+						float(x),
+						float(y),
+						x,
+						y,
+						texpos,
+						1.0f,
+						nullptr,
+						true,
+						mirrored_tile_x(x,anchor_x)-x,
+						{}
+						};
+					// The sprite lands on x+mirror_shift, so that interval must be repaintable.
+					// The shift has either sign, so order the interval ends first.
+					const int32_t coverage_first=std::min(x,x+proxy.mirror_shift);
+					const int32_t coverage_last=std::max(x,x+proxy.mirror_shift);
+					bool blocked=false;
+					for(int32_t coverage_x=coverage_first;
+						coverage_x<=coverage_last;++coverage_x)
+						{
+						if(!inside_clip(vp,coverage_x,y)||
+							(group==visual_render_groupst::main&&
+							has_fire(vp,coverage_x,y)))
+							{
+							blocked=true;
+							break;
+							}
+						proxy.coverage.emplace(coverage_x,y);
+						}
+					if(blocked)continue;
+
+					proxy.texture=cached_texture(renderer,texpos);
+					if(proxy.texture==nullptr)continue;
+					proxies.push_back(std::move(proxy));
+					}
 				}
 			}
 		}
@@ -1386,9 +1523,9 @@ void draw_tile_transitions(
 			continue;
 			}
 		if(previous!=nullptr)
-			draw_texture_with_alpha(sdl_renderer,previous,destination,1.0f-progress);
+			draw_texture_with_alpha(sdl_renderer,previous,destination,1.0f-progress,false);
 		if(current!=nullptr)
-			draw_texture_with_alpha(sdl_renderer,current,destination,progress);
+			draw_texture_with_alpha(sdl_renderer,current,destination,progress,false);
 		}
 }
 
@@ -1535,7 +1672,8 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		}
 	if(glide)camera_was_offset=true;
 	if(!glide&&!animation_manager.requires_full_redraw()&&
-		!tile_transition_manager.active())
+		!tile_transition_manager.active()&&
+		(!flip_enabled||!animation_manager.has_mirrored_facing(vp)))
 		return;
 
 	std::vector<render_proxyst> proxies=collect_proxies(renderer,vp);
@@ -1858,9 +1996,8 @@ void renderer_hook::interpose_fn_update_all()
 
 void clear_sdl_bindings()
 {
-	if(sdl_handle!=nullptr)ClosePlugin(sdl_handle);
-	sdl_handle=nullptr;
 	render_copy_f=nullptr;
+	render_copy_ex_f=nullptr;
 	render_fill_rect=nullptr;
 	render_set_clip_rect=nullptr;
 	get_render_draw_color=nullptr;
@@ -1874,12 +2011,7 @@ void clear_sdl_bindings()
 bool load_sdl(color_ostream &out)
 {
 	clear_sdl_bindings();
-	sdl_handle=OpenPlugin(sdl_library);
-	if(sdl_handle==nullptr)
-		{
-		out.printerr("smooth-movement: could not load SDL2\n");
-		return false;
-		}
+	DFLibrary *sdl_handle=DFSDL::obtain_library_handle();
 	#define bind(name,target) \
 		target=reinterpret_cast<decltype(target)>(LookupPlugin(sdl_handle,#name)); \
 		if(target==nullptr) { \
@@ -1888,6 +2020,7 @@ bool load_sdl(color_ostream &out)
 			return false; \
 		}
 	bind(SDL_RenderCopyF,render_copy_f);
+	bind(SDL_RenderCopyExF,render_copy_ex_f);
 	bind(SDL_RenderFillRect,render_fill_rect);
 	bind(SDL_RenderSetClipRect,render_set_clip_rect);
 	bind(SDL_GetRenderDrawColor,get_render_draw_color);
@@ -1939,6 +2072,7 @@ void reset_state()
 	camera_has_prev=false;
 	camera_was_offset=false;
 	construction_transitions_enabled=false;
+	flip_enabled=false;
 }
 
 command_result status_command(
@@ -1984,6 +2118,8 @@ command_result status_command(
 			animation_manager.stats.absorbed,
 			animation_manager.stats.last_pending_dx,
 			animation_manager.stats.last_pending_dy);
+		out.print("sprite flipping: {}\n",
+			flip_enabled?"on":"off");
 		return CR_OK;
 		}
 	if(parameters[0]=="slide"&&parameters.size()==2&&
@@ -2150,6 +2286,34 @@ command_result status_command(
 			}
 		return CR_WRONG_USAGE;
 		}
+	if(parameters[0]=="flip")
+		{
+		if(parameters.size()==1)
+			{
+			out.print("sprite flipping: {}\n",
+				flip_enabled?"on":"off");
+			return CR_OK;
+			}
+		// A toggle changes the screen without changing anything DF knows, so DF will not repaint.
+		// OFF matters most: the render path stops touching tiles it painted every frame.
+		// The last mirrored frame would persist.
+		// Same flush plugin_enable(false) uses.
+		if(parameters.size()==2&&parameters[1]=="on")
+			{
+			flip_enabled=true;
+			if(gps!=nullptr)++gps->force_full_display_count;
+			out.print("smooth-movement: sprite flipping enabled\n");
+			return CR_OK;
+			}
+		if(parameters.size()==2&&parameters[1]=="off")
+			{
+			flip_enabled=false;
+			if(gps!=nullptr)++gps->force_full_display_count;
+			out.print("smooth-movement: sprite flipping disabled\n");
+			return CR_OK;
+			}
+		return CR_WRONG_USAGE;
+		}
 	return CR_WRONG_USAGE;
 }
 
@@ -2160,7 +2324,8 @@ plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 {
 	commands.emplace_back(
 		"smooth-movement",
-		"Smooth movement status; camera on|off|reset|<fx> <fy>; slide on|off; construction on|off; trace.",
+		"Smooth movement status; camera on|off|reset|<fx> <fy>; slide on|off; "
+		"construction on|off; flip on|off; trace.",
 		status_command);
 	return CR_OK;
 }

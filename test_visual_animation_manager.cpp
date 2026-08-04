@@ -80,6 +80,319 @@ int main()
 	assert(dug.previous_texpos==10&&dug.current_texpos==0);
 	assert(select_tile_transition(10,10,20,20).layer==
 		tile_transition_layer::none);
+
+	// Facing rule: only a horizontal component changes facing.
+	assert(facing_after_move(1,visual_facingst::west)==visual_facingst::east);
+	assert(facing_after_move(-1,visual_facingst::east)==visual_facingst::west);
+	// dy is not an input, so a diagonal is only ever the sign of dx.
+	// The four real diagonals run end to end through the manager further down.
+	assert(facing_after_move(1,visual_facingst::east)==visual_facingst::east);
+	assert(facing_after_move(-1,visual_facingst::west)==visual_facingst::west);
+	// Pure vertical and idle carry the previous facing (sticky).
+	assert(facing_after_move(0,visual_facingst::west)==visual_facingst::west);
+	assert(facing_after_move(0,visual_facingst::east)==visual_facingst::east);
+
+	assert(mirrored_tile_x(5,5)==5);   // anchor reflects to itself
+	assert(mirrored_tile_x(6,5)==4);   // right spill -> left
+	assert(mirrored_tile_x(4,5)==6);   // left spill -> right
+	// The formula is a general reflection, so it holds for offsets no layer can express.
+	assert(mirrored_tile_x(8,5)==2);
+	// center_x is only ever -1, 0 or +1, so the real mirror shift is only ever -2, 0 or +2.
+	for(const auto &descriptor:visual_layer_descriptors)
+		assert(descriptor.center_x>=-1&&descriptor.center_x<=1);
+	// Reflection is self-inverse.
+	assert(mirrored_tile_x(mirrored_tile_x(6,5),5)==6);
+	assert(mirrored_tile_x(mirrored_tile_x(8,5),5)==8);
+
+	{
+	constexpr int32_t dim=4;
+	int32_t empty[dim*dim]={};
+	int32_t before[dim*dim]={};
+	int32_t west_after[dim*dim]={};
+	const int viewport_token=0;
+	const void *viewport=&viewport_token;
+
+	before[2*dim+2]=77;
+	west_after[1*dim+2]=77;   // moved west: x 2 -> 1
+
+	// Moving west sets west facing on the target tile.
+	{
+	visual_animation_managerst manager;
+	auto input=make_input(viewport,dim,empty);
+	set_layer(input,viewport_visual_layer::center,before,empty);
+	run_frame(manager,input,1000);
+	set_layer(input,viewport_visual_layer::center,west_after,before);
+	run_frame(manager,input,1016);
+	assert(manager.get_facing(viewport,1,2)==visual_facingst::west);
+	}
+
+	// Moving east sets east facing.
+	// East is neither the grid default nor the source facing, so the assertion is not vacuous.
+	{
+	visual_animation_managerst manager;
+	auto input=make_input(viewport,dim,empty);
+	set_layer(input,viewport_visual_layer::center,before,empty);
+	run_frame(manager,input,1000);
+	set_layer(input,viewport_visual_layer::center,west_after,before);
+	run_frame(manager,input,1016);
+	assert(manager.get_facing(viewport,1,2)==visual_facingst::west);
+	set_layer(input,viewport_visual_layer::center,before,west_after);
+	run_frame(manager,input,1032);
+	assert(manager.get_facing(viewport,2,2)==visual_facingst::east);
+	}
+
+	// The mirrored flag gates the render path's early return.
+	// It must rise only for a genuinely mirrored creature and fall when that tile empties.
+	{
+	visual_animation_managerst manager;
+	auto input=make_input(viewport,dim,empty);
+	set_layer(input,viewport_visual_layer::center,before,empty);
+	run_frame(manager,input,1000);
+	assert(!manager.has_mirrored_facing(viewport));
+	// Moving west matches the art, so nothing is mirrored yet.
+	set_layer(input,viewport_visual_layer::center,west_after,before);
+	run_frame(manager,input,1016);
+	assert(manager.get_facing(viewport,1,2)==visual_facingst::west);
+	assert(!manager.has_mirrored_facing(viewport));
+	// Moving east faces away from the art and raises the flag.
+	set_layer(input,viewport_visual_layer::center,before,west_after);
+	run_frame(manager,input,1032);
+	assert(manager.get_facing(viewport,2,2)==visual_facingst::east);
+	assert(manager.has_mirrored_facing(viewport));
+	// The creature leaves: the tile clears and so does the flag.
+	set_layer(input,viewport_visual_layer::center,empty,before);
+	run_frame(manager,input,1048);
+	assert(manager.get_facing(viewport,2,2)==native_sprite_facing);
+	assert(!manager.has_mirrored_facing(viewport));
+	assert(!manager.has_mirrored_facing(nullptr));
+	}
+
+	// Pure vertical movement carries the existing facing to the new tile.
+	{
+	visual_animation_managerst manager;
+	auto input=make_input(viewport,dim,empty);
+	set_layer(input,viewport_visual_layer::center,before,empty);
+	run_frame(manager,input,1000);
+	set_layer(input,viewport_visual_layer::center,west_after,before);
+	run_frame(manager,input,1016);
+	assert(manager.get_facing(viewport,1,2)==visual_facingst::west);
+	int32_t up[dim*dim]={};
+	up[1*dim+1]=77;   // north: (1,2) -> (1,1), no horizontal component
+	set_layer(input,viewport_visual_layer::center,up,west_after);
+	run_frame(manager,input,1032);
+	assert(manager.get_facing(viewport,1,1)==visual_facingst::west);
+	}
+
+	// Out-of-range and unknown viewports fall back to the native facing.
+	{
+	visual_animation_managerst manager;
+	auto input=make_input(viewport,dim,empty);
+	set_layer(input,viewport_visual_layer::center,before,empty);
+	run_frame(manager,input,1000);
+	assert(manager.get_facing(viewport,-1,0)==native_sprite_facing);
+	assert(manager.get_facing(viewport,dim,0)==native_sprite_facing);
+	assert(manager.get_facing(nullptr,0,0)==native_sprite_facing);
+	}
+	}
+
+	// All four diagonals through the manager, so every step carries a real dy as well as a dx.
+	// The chain alternates direction, so no assertion can pass by inheriting the previous facing.
+	{
+	constexpr int32_t diag_dim=5;
+	int32_t diag_empty[diag_dim*diag_dim]={};
+	int32_t start[diag_dim*diag_dim]={};
+	int32_t north_east[diag_dim*diag_dim]={};
+	int32_t south_west[diag_dim*diag_dim]={};
+	int32_t south_east[diag_dim*diag_dim]={};
+	int32_t north_west[diag_dim*diag_dim]={};
+	const int diag_token=0;
+	const void *diag_viewport=&diag_token;
+
+	start[2*diag_dim+2]=77;        // (2,2)
+	north_east[3*diag_dim+1]=77;   // (2,2) -> (3,1): dx +1, dy -1
+	south_west[2*diag_dim+2]=77;   // (3,1) -> (2,2): dx -1, dy +1
+	south_east[3*diag_dim+3]=77;   // (2,2) -> (3,3): dx +1, dy +1
+	north_west[2*diag_dim+2]=77;   // (3,3) -> (2,2): dx -1, dy -1
+
+	visual_animation_managerst diagonal;
+	auto input=make_input(diag_viewport,diag_dim,diag_empty);
+	set_layer(input,viewport_visual_layer::center,start,diag_empty);
+	run_frame(diagonal,input,1000);
+	assert(diagonal.get_facing(diag_viewport,2,2)==native_sprite_facing);
+
+	set_layer(input,viewport_visual_layer::center,north_east,start);
+	run_frame(diagonal,input,1016);
+	assert(diagonal.get_facing(diag_viewport,3,1)==visual_facingst::east);
+
+	// West is the grid default, so the westward legs also assert a movement was registered.
+	// Otherwise an untracked step leaving the tile at its default would pass.
+	set_layer(input,viewport_visual_layer::center,south_west,north_east);
+	run_frame(diagonal,input,1032);
+	assert(diagonal.get_movement(
+		diag_viewport,viewport_visual_layer::center,2,2).active);
+	assert(diagonal.get_facing(diag_viewport,2,2)==visual_facingst::west);
+
+	set_layer(input,viewport_visual_layer::center,south_east,south_west);
+	run_frame(diagonal,input,1048);
+	assert(diagonal.get_facing(diag_viewport,3,3)==visual_facingst::east);
+
+	set_layer(input,viewport_visual_layer::center,north_west,south_east);
+	run_frame(diagonal,input,1064);
+	assert(diagonal.get_movement(
+		diag_viewport,viewport_visual_layer::center,2,2).active);
+	assert(diagonal.get_facing(diag_viewport,2,2)==visual_facingst::west);
+	}
+
+	// Facing is keyed by SCREEN tile, so a scroll moves the creatures out from under it.
+	// The two outcomes differ fundamentally: a landed shift has a known delta and is translated.
+	// An abandoned shift never identifies a delta, so the grid can only be dropped.
+	{
+	constexpr int32_t pan_dim=4;
+	int32_t pan_empty[pan_dim*pan_dim]={};
+	int32_t at_one[pan_dim*pan_dim]={};
+	int32_t at_two[pan_dim*pan_dim]={};
+	const int pan_token=0;
+	const void *pan_viewport=&pan_token;
+
+	at_one[1*pan_dim+1]=77;
+	at_two[2*pan_dim+1]=77;   // steps east, x 1 -> 2, so it faces east
+
+	// LANDED: the shift is recognized, so facing follows the buffers.
+	{
+	visual_animation_managerst landed;
+	auto input=make_input(pan_viewport,pan_dim,pan_empty);
+	set_layer(input,viewport_visual_layer::center,at_one,pan_empty);
+	run_frame(landed,input,1000);
+	set_layer(input,viewport_visual_layer::center,at_two,at_one);
+	run_frame(landed,input,1016);
+	assert(landed.get_facing(pan_viewport,2,1)==visual_facingst::east);
+	assert(landed.has_mirrored_facing(pan_viewport));
+
+	// Frame A: the scroll is announced but the buffers have not moved yet.
+	input.pan_x=1;
+	set_layer(input,viewport_visual_layer::center,at_two,at_two);
+	run_frame(landed,input,1032);
+	assert(landed.get_facing(pan_viewport,2,1)==visual_facingst::east);
+
+	// Frame B: the buffers shift east by one and the majority-match test recognizes it.
+	set_layer(input,viewport_visual_layer::center,at_one,at_two);
+	run_frame(landed,input,1048);
+	assert(landed.get_facing(pan_viewport,1,1)==visual_facingst::east);
+	assert(landed.get_facing(pan_viewport,2,1)==native_sprite_facing);
+	assert(landed.has_mirrored_facing(pan_viewport));
+	}
+
+	// ABANDONED: the shift never shows up in the buffers, so no delta is ever identified.
+	// The grid must be back at the default while the tile is still OCCUPIED.
+	// The empty-tile sweep cannot reach that case, so only an explicit reset clears it.
+	{
+	visual_animation_managerst abandoned;
+	auto input=make_input(pan_viewport,pan_dim,pan_empty);
+	set_layer(input,viewport_visual_layer::center,at_one,pan_empty);
+	run_frame(abandoned,input,2000);
+	set_layer(input,viewport_visual_layer::center,at_two,at_one);
+	run_frame(abandoned,input,2016);
+	assert(abandoned.get_facing(pan_viewport,2,1)==visual_facingst::east);
+
+	// The buffers stay put, so the majority-match test fails every frame.
+	// It tolerates four before giving up on the fifth.
+	input.pan_x=1;
+	set_layer(input,viewport_visual_layer::center,at_two,at_two);
+	for(int32_t frame=0;frame<4;++frame)
+		{
+		run_frame(abandoned,input,2032+uint32_t(frame)*16);
+		// Still pending, so the facing survives.
+		// The assertion after the giving-up frame therefore tests the reset, not an empty grid.
+		assert(abandoned.get_facing(pan_viewport,2,1)==visual_facingst::east);
+		assert(abandoned.has_mirrored_facing(pan_viewport));
+		}
+	run_frame(abandoned,input,2096);
+	assert(abandoned.get_facing(pan_viewport,2,1)==native_sprite_facing);
+	assert(!abandoned.has_mirrored_facing(pan_viewport));
+	}
+	}
+
+	// Regression: A and B move in the same frame, chained -- A's target tile is B's source tile.
+	// A's write must not corrupt B's read of its own pre-frame facing.
+	// A is sent east first, so its facing differs from the default B carries and a swap shows.
+	{
+	constexpr int32_t chase_dim=5;
+	int32_t chase_empty[chase_dim*chase_dim]={};
+	int32_t frame_a[chase_dim*chase_dim]={};
+	int32_t frame_b[chase_dim*chase_dim]={};
+	int32_t frame_c[chase_dim*chase_dim]={};
+	const int chase_token=0;
+	const void *chase_viewport=&chase_token;
+
+	frame_a[1*chase_dim+1]=77;   // A at (1,1)
+	frame_a[2*chase_dim+2]=88;   // B at (2,2), stationary, keeps the default facing
+	frame_b[2*chase_dim+1]=77;   // A steps east: (1,1) -> (2,1), picks up an east facing
+	frame_b[2*chase_dim+2]=88;   // B unchanged
+
+	// Both step south in the same frame: shared_movement_delta needs two tiles on the same delta.
+	frame_c[2*chase_dim+2]=77;   // A: (2,1) -> (2,2)
+	frame_c[2*chase_dim+3]=88;   // B: (2,2) -> (2,3)
+
+	visual_animation_managerst manager;
+	auto input=make_input(chase_viewport,chase_dim,chase_empty);
+	set_layer(input,viewport_visual_layer::center,frame_a,chase_empty);
+	run_frame(manager,input,1000);
+	set_layer(input,viewport_visual_layer::center,frame_b,frame_a);
+	run_frame(manager,input,1016);
+	assert(manager.get_facing(chase_viewport,2,1)==visual_facingst::east);
+	assert(manager.get_facing(chase_viewport,2,2)==native_sprite_facing);
+
+	set_layer(input,viewport_visual_layer::center,frame_c,frame_b);
+	run_frame(manager,input,1032);
+	assert(manager.get_facing(chase_viewport,2,2)==visual_facingst::east);
+	// B carries its own default forward, not A's, though A wrote (2,2) earlier in the same pass.
+	assert(manager.get_facing(chase_viewport,2,3)==native_sprite_facing);
+	}
+
+	// Regression: a vacated source tile is reoccupied the same frame by an UNTRACKED creature.
+	// Nothing targets that tile, so no target write clears it, and it is not empty either.
+	// Only an explicit, order-independent source clear restores the default there.
+	{
+	constexpr int32_t gap_dim=5;
+	int32_t gap_empty[gap_dim*gap_dim]={};
+	int32_t frame_a[gap_dim*gap_dim]={};
+	int32_t frame_b[gap_dim*gap_dim]={};
+	int32_t frame_c[gap_dim*gap_dim]={};
+	const int gap_token=0;
+	const void *gap_viewport=&gap_token;
+
+	// E is a companion so that D's later departure shares a delta with E's own move.
+	// shared_movement_delta engages only once two tiles move on the same delta.
+	frame_a[1*gap_dim+1]=77;   // D at (1,1)
+	frame_a[2*gap_dim+2]=88;   // E at (2,2), stationary companion
+	frame_b[2*gap_dim+1]=77;   // D steps east: (1,1) -> (2,1), facing differs from the default
+	frame_b[2*gap_dim+2]=88;   // E unchanged
+
+	// D and E both step south, chained, and F appears at D's just-vacated tile the same frame.
+	// previous[(2,1)] was occupied by D, so the empty-cell fallback cannot see F.
+	// No shared-delta source matches F's texpos either, so its arrival registers no movement.
+	frame_c[2*gap_dim+2]=77;   // D: (2,1) -> (2,2)
+	frame_c[2*gap_dim+3]=88;   // E: (2,2) -> (2,3)
+	frame_c[2*gap_dim+1]=55;   // F appears at (2,1), untracked
+
+	visual_animation_managerst manager;
+	auto input=make_input(gap_viewport,gap_dim,gap_empty);
+	set_layer(input,viewport_visual_layer::center,frame_a,gap_empty);
+	run_frame(manager,input,1000);
+	set_layer(input,viewport_visual_layer::center,frame_b,frame_a);
+	run_frame(manager,input,1016);
+	assert(manager.get_facing(gap_viewport,2,1)==visual_facingst::east);
+
+	set_layer(input,viewport_visual_layer::center,frame_c,frame_b);
+	run_frame(manager,input,1032);
+	assert(!manager.get_movement(
+		gap_viewport,viewport_visual_layer::center,2,1).active);
+	// F must not inherit D's stale east facing, though the tile is occupied rather than empty.
+	assert(manager.get_facing(gap_viewport,2,1)==native_sprite_facing);
+	assert(manager.get_facing(gap_viewport,2,2)==visual_facingst::east);
+	assert(manager.get_facing(gap_viewport,2,3)==native_sprite_facing);
+	}
+
 	assert(animation_progress(100,0,100)==1.0f);
 	assert(inherited_visual_source_tile(0,0,1)==-1);
 	assert(inherited_visual_source_tile(2,0,1)==1);

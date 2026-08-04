@@ -9,15 +9,16 @@ ticks, saves, or gameplay state.
 
 ## Compatibility
 
-Development currently targets the DFHack `develop` branch and the SDL 2D
-renderer. DFHack C++ plugins are ABI-specific, so rebuild the plugin whenever
-the DFHack or Dwarf Fortress version changes.
+v0.3.0 requires DFHack 53.15-r3 or newer and the SDL 2D renderer. DFHack C++
+plugins are ABI-specific, so rebuild the plugin whenever the DFHack or Dwarf
+Fortress version changes.
 
 ## Install
 
 1. Download the release archive for your operating system and exact DFHack
    version.
-2. Extract it into the Dwarf Fortress installation directory. The resulting
+2. Extract it into the DFHack folder for a Steam DFHack installation, or into
+   the Dwarf Fortress folder for a manual DFHack installation. The resulting
    plugin must be:
    - Linux: `hack/plugins/smooth-movement.plug.so`
    - Windows: `hack/plugins/smooth-movement.plug.dll`
@@ -36,7 +37,8 @@ smooth-movement
 disable smooth-movement
 ```
 
-The status command prints the plugin version and whether it is enabled.
+The status command prints the plugin version, whether it is enabled, the free
+camera state, and whether sprite flipping is on.
 
 ## Build
 
@@ -101,6 +103,23 @@ cmake --build /path/to/dfhack-build --target smooth-movement-test
 - Main creature sprites crossing fire snap instead of being replayed over an
   unsafe layer reconstruction.
 - UI and menus are rendered after interpolated world sprites.
+
+## Directional sprite flipping (off by default)
+
+Creature sprites mirror horizontally to face their direction of travel.
+Dwarf Fortress creature art natively faces west; a creature moving east is
+mirrored, a creature moving west is left alone. Facing is sticky: only
+horizontal movement changes it, so walking north or south, and standing
+still, keep the last horizontal facing. Worn clothing, armour, and weapons
+flip with the creature automatically because Dwarf Fortress composites them
+into a single tile sprite before the plugin sees it. Multi-tile creatures
+mirror as one composite, reflected about their anchor tile. Items, vehicles,
+and designations are never mirrored.
+
+Turn it on with `smooth-movement flip on`; `smooth-movement flip` alone
+prints the current state. Turning it off restores every creature to its
+native orientation immediately and lets the plugin go back to idling rather
+than repainting tiles every frame for a feature that is switched off.
 
 ## Free camera (optional, off by default)
 

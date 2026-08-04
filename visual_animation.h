@@ -236,6 +236,34 @@ inline int32_t inherited_visual_source_tile(
 	return overlay_target+int32_t(std::lround(center_source-center_target));
 }
 
+enum class visual_facingst : int8_t
+{
+	east=0,
+	west=1
+};
+
+// DF creature art faces west: an unmirrored blit already faces west, so only east needs flipping.
+// Also the default and cleared value -- a tile nothing wrote must not be marked for mirroring.
+constexpr visual_facingst native_sprite_facing=visual_facingst::west;
+
+// Sticky facing: only a horizontal component changes it.
+// Vertical-only movement and standing still carry the previous facing, not the default.
+constexpr visual_facingst facing_after_move(
+	int32_t dx,
+	visual_facingst previous)
+{
+	if(dx>0)return visual_facingst::east;
+	if(dx<0)return visual_facingst::west;
+	return previous;
+}
+
+// The reflection is general, but the layer set is not: center_x is only -1, 0 or +1.
+// A creature is therefore at most three columns wide here; anything wider is not representable.
+constexpr int32_t mirrored_tile_x(int32_t piece_x,int32_t anchor_x)
+{
+	return anchor_x-(piece_x-anchor_x);
+}
+
 class visual_animation_managerst
 {
 	public:
@@ -294,6 +322,11 @@ class visual_animation_managerst
 		bool seen=false;
 		std::vector<movementst> movements;
 		std::vector<pinnedst> pinned;
+		// One facing per tile, keyed by tile rather than by unit.
+		// The viewport exposes one creature texpos per tile, so DF has already picked it.
+		std::vector<int8_t> facing;
+		// Stationary mirrored creatures are repainted every frame; this is the cheap pre-check.
+		bool has_mirrored=false;
 		int32_t pan_x=0;
 		int32_t pan_y=0;
 		bool has_pan=false;
@@ -380,6 +413,15 @@ class visual_animation_managerst
 						movement.target_y<0||movement.target_y>=state.dim_y;
 					}),
 			state.movements.end());
+		}
+
+	static void reset_facing(viewport_animationst &state)
+		{
+		std::fill(
+			state.facing.begin(),
+			state.facing.end(),
+			int8_t(native_sprite_facing));
+		state.has_mirrored=false;
 		}
 
 	static void reset_tracking(viewport_animationst &state)
@@ -475,6 +517,7 @@ class visual_animation_managerst
 				{
 				reset_tracking(state);
 				state.has_context=false;
+				state.has_mirrored=false;
 				return;
 				}
 
@@ -516,8 +559,18 @@ class visual_animation_managerst
 			state.pan_x=input.pan_x;
 			state.pan_y=input.pan_y;
 			state.has_pan=true;
+			if(context_changed)
+				{
+				state.facing.assign(
+					size_t(input.dim_x)*size_t(input.dim_y),
+					int8_t(native_sprite_facing));
+				state.has_mirrored=false;
+				}
 			if(context_changed||!allow_new_movements)
 				{
+				// Skips the recompute sweep, so clear has_mirrored here or a stale true survives.
+				// The grid stays: an inactive viewport is not drawn and its facings still hold.
+				state.has_mirrored=false;
 				reset_tracking(state);
 				return;
 				}
@@ -663,6 +716,7 @@ class visual_animation_managerst
 					{
 					// Nothing visible to anchor the test on: nothing to animate either.
 					abandon_pending(state);
+					reset_facing(state);
 					}
 				else if(matches*2>=considered)
 					{
@@ -682,6 +736,27 @@ class visual_animation_managerst
 									movement.target_y<0||movement.target_y>=input.dim_y;
 								}),
 						state.movements.end());
+					// Facing describes creatures still on screen, not motion in progress.
+					// A landed pan therefore translates it instead of dropping it.
+					if(state.facing.size()==
+						size_t(input.dim_x)*size_t(input.dim_y))
+						{
+						std::vector<int8_t> shifted(
+							state.facing.size(),int8_t(native_sprite_facing));
+						for(int32_t x=0;x<input.dim_x;++x)
+							{
+							const int32_t sx=x+dwx;
+							if(sx<0||sx>=input.dim_x)continue;
+							for(int32_t y=0;y<input.dim_y;++y)
+								{
+								const int32_t sy=y+dwy;
+								if(sy<0||sy>=input.dim_y)continue;
+								shifted[x*input.dim_y+y]=
+									state.facing[sx*input.dim_y+sy];
+								}
+							}
+						state.facing.swap(shifted);
+						}
 					clear_pending(state);
 					translated=true;
 					shift_x=dwx;
@@ -694,6 +769,8 @@ class visual_animation_managerst
 					// render, ...): fall back to the safe reset behavior.
 					++stats.resets;
 					abandon_pending(state);
+					// The delta was never identified, so the grid cannot be translated -- drop it.
+					reset_facing(state);
 					}
 				}
 				}
@@ -766,6 +843,16 @@ class visual_animation_managerst
 				const int32_t tile_count=input.dim_x*input.dim_y;
 				std::vector<uint8_t> claimed_sources(tile_count);
 				const size_t existing_movement_count=state.movements.size();
+				// Source facing is read from a frame-start snapshot.
+				// A chained movement's source may already have been rewritten earlier this frame.
+				const std::vector<int8_t> facing_at_frame_start=state.facing;
+				// Source clears are deferred until every movement this frame is registered.
+				// A source can be another movement's target in the same frame -- a chain.
+				// Clearing inline is order-dependent: it stomps that target write, or loses to it.
+				std::vector<uint8_t> facing_target_written;
+				std::vector<int32_t> pending_facing_source_clears;
+				if(state.facing.size()==size_t(input.dim_x)*size_t(input.dim_y))
+					facing_target_written.assign(state.facing.size(),0);
 				for(size_t layer=0;layer<input.current.size();++layer)
 					{
 					if(!visual_layer_tracks_own_movement(
@@ -889,10 +976,38 @@ class visual_animation_managerst
 								y,
 								frame_time_ms
 								});
+							if(static_cast<viewport_visual_layer>(layer)==
+									viewport_visual_layer::center&&
+								state.facing.size()==
+									size_t(input.dim_x)*size_t(input.dim_y)&&
+								!facing_at_frame_start.empty()&&
+								facing_at_frame_start.size()==state.facing.size())
+								{
+								const int32_t source_tile_x=source/input.dim_y;
+								const int32_t target_index=x*input.dim_y+y;
+								state.facing[target_index]=int8_t(
+									facing_after_move(
+										x-source_tile_x,
+										static_cast<visual_facingst>(
+											facing_at_frame_start[source])));
+								facing_target_written[size_t(target_index)]=1;
+								pending_facing_source_clears.push_back(source);
+								}
 							}
 						}
 						}
+				// A source vacates its tile only if no movement this frame claimed it as a target.
+				// That covers the in-pass chain and an untracked creature occupying the tile.
+				if(!facing_target_written.empty())
+					{
+					for(int32_t pending_source:pending_facing_source_clears)
+						{
+						if(!facing_target_written[size_t(pending_source)])
+							state.facing[size_t(pending_source)]=
+								int8_t(native_sprite_facing);
+						}
 					}
+				}
 			state.movements.erase(
 				std::remove_if(
 					state.movements.begin(),
@@ -932,6 +1047,22 @@ class visual_animation_managerst
 			stats.last_shift_y=translated?shift_y:0;
 			stats.last_pending_dx=state.pending_dx;
 			stats.last_pending_dy=state.pending_dy;
+			// has_mirrored is recomputed here rather than maintained at every write site.
+			if(state.facing.size()==size_t(input.dim_x)*size_t(input.dim_y))
+				{
+				const int32_t *center_current=
+					input.current[static_cast<size_t>(
+						viewport_visual_layer::center)];
+				bool any_mirrored=false;
+				for(size_t i=0;i<state.facing.size();++i)
+					{
+					if(center_current[i]==0)
+						state.facing[i]=int8_t(native_sprite_facing);
+					else if(state.facing[i]!=int8_t(native_sprite_facing))
+						any_mirrored=true;
+					}
+				state.has_mirrored=any_mirrored;
+				}
 			if(!state.movements.empty())force_full_redraw=true;
 			}
 
@@ -957,6 +1088,33 @@ class visual_animation_managerst
 		uint32_t get_frame_delta_ms() const
 			{
 			return frame_delta_ms;
+			}
+
+		visual_facingst get_facing(
+			const void *viewport,
+			int32_t x,
+			int32_t y) const
+			{
+			for(const viewport_animationst &state:viewports)
+				{
+				if(state.viewport!=viewport)continue;
+				if(x<0||x>=state.dim_x||y<0||y>=state.dim_y)break;
+				const size_t index=size_t(x)*size_t(state.dim_y)+size_t(y);
+				if(index>=state.facing.size())break;
+				return static_cast<visual_facingst>(state.facing[index]);
+				}
+			return native_sprite_facing;
+			}
+
+		// The render path must then keep painting with no movement in flight.
+		bool has_mirrored_facing(const void *viewport) const
+			{
+			for(const viewport_animationst &state:viewports)
+				{
+				if(state.viewport!=viewport)continue;
+				return state.has_mirrored;
+				}
+			return false;
 			}
 
 		bool requires_full_redraw() const
