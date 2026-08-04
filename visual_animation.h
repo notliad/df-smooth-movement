@@ -225,6 +225,30 @@ inline int32_t inherited_visual_source_tile(
 	return overlay_target+int32_t(std::lround(center_source-center_target));
 }
 
+enum class visual_facingst : int8_t
+{
+	east=0,
+	west=1
+};
+
+// Sticky facing: only a horizontal component changes it.
+// Vertical-only movement and standing still carry the previous facing, not the default.
+constexpr visual_facingst facing_after_move(
+	int32_t dx,
+	visual_facingst previous)
+{
+	if(dx>0)return visual_facingst::east;
+	if(dx<0)return visual_facingst::west;
+	return previous;
+}
+
+// The reflection is general, but the layer set is not: center_x is only -1, 0 or +1.
+// A creature is therefore at most three columns wide here; anything wider is not representable.
+constexpr int32_t mirrored_tile_x(int32_t piece_x,int32_t anchor_x)
+{
+	return anchor_x-(piece_x-anchor_x);
+}
+
 class visual_animation_managerst
 {
 	struct movementst

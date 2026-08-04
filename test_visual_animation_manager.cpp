@@ -80,6 +80,23 @@ int main()
 	assert(dug.previous_texpos==10&&dug.current_texpos==0);
 	assert(select_tile_transition(10,10,20,20).layer==
 		tile_transition_layer::none);
+
+	// Facing rule: only a horizontal component changes facing.
+	assert(facing_after_move(1,visual_facingst::west)==visual_facingst::east);
+	assert(facing_after_move(-1,visual_facingst::east)==visual_facingst::west);
+	// Diagonals use their horizontal component.
+	// Pure vertical and idle carry the previous facing (sticky).
+	assert(facing_after_move(0,visual_facingst::west)==visual_facingst::west);
+	assert(facing_after_move(0,visual_facingst::east)==visual_facingst::east);
+
+	assert(mirrored_tile_x(5,5)==5);   // anchor reflects to itself
+	assert(mirrored_tile_x(6,5)==4);   // right spill -> left
+	assert(mirrored_tile_x(4,5)==6);   // left spill -> right
+	assert(mirrored_tile_x(8,5)==2);   // width 6 needs no special case
+	// Reflection is self-inverse.
+	assert(mirrored_tile_x(mirrored_tile_x(6,5),5)==6);
+	assert(mirrored_tile_x(mirrored_tile_x(8,5),5)==8);
+
 	assert(animation_progress(100,0,100)==1.0f);
 	assert(inherited_visual_source_tile(0,0,1)==-1);
 	assert(inherited_visual_source_tile(2,0,1)==1);
