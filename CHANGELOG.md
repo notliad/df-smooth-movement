@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Mirror creature sprites horizontally so they face their direction of travel.
+  Dwarf Fortress creature art natively faces west, so only creatures moving
+  east are mirrored. Facing is sticky: only horizontal movement changes it,
+  so walking north or south, and standing still, keep the last facing. Worn
+  clothing and equipment flip with the creature because Dwarf Fortress
+  composites them into a single tile sprite. Multi-tile creatures mirror as
+  one composite, reflected about their anchor tile. Items, vehicles, and
+  designations are never mirrored. Off by default; turn it on with
+  `smooth-movement flip on`.
+
 ## 0.3.0 - 2026-08-03
 
 - Target DFHack `develop` and reuse DFHack's SDL library handle instead of
