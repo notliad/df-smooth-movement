@@ -44,14 +44,8 @@ REQUIRE_GLOBAL(window_z);
 namespace {
 
 constexpr const char *plugin_version="0.3.0";
-#ifdef WIN32
-constexpr const char *sdl_library="SDL2.dll";
-#else
-constexpr const char *sdl_library="libSDL2-2.0.so.0";
-#endif
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
-DFLibrary *sdl_handle=nullptr;
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
 decltype(&SDL_RenderCopyExF) render_copy_ex_f=nullptr;
 decltype(&SDL_RenderFillRect) render_fill_rect=nullptr;
@@ -76,7 +70,7 @@ int32_t previous_pan_x=0;
 int32_t previous_pan_y=0;
 bool has_pan_context=false;
 bool construction_transitions_enabled=false;
-bool flip_enabled=true;   // ON by default: creature sprites mirror to face travel direction.
+bool flip_enabled=false;
 
 // --- free camera -------------------------------------------------------------------------------
 // The camera is visually unbound from the tile grid. Two layered offsets:
@@ -1469,8 +1463,6 @@ void renderer_hook::interpose_fn_update_all()
 
 void clear_sdl_bindings()
 {
-	if(sdl_handle!=nullptr)ClosePlugin(sdl_handle);
-	sdl_handle=nullptr;
 	render_copy_f=nullptr;
 	render_copy_ex_f=nullptr;
 	render_fill_rect=nullptr;
@@ -1486,12 +1478,7 @@ void clear_sdl_bindings()
 bool load_sdl(color_ostream &out)
 {
 	clear_sdl_bindings();
-	sdl_handle=OpenPlugin(sdl_library);
-	if(sdl_handle==nullptr)
-		{
-		out.printerr("smooth-movement: could not load SDL2\n");
-		return false;
-		}
+	DFLibrary *sdl_handle=DFSDL::obtain_library_handle();
 	#define bind(name,target) \
 		target=reinterpret_cast<decltype(target)>(LookupPlugin(sdl_handle,#name)); \
 		if(target==nullptr) { \
@@ -1532,7 +1519,7 @@ void reset_state()
 	camera_has_prev=false;
 	camera_was_offset=false;
 	construction_transitions_enabled=false;
-	flip_enabled=true;
+	flip_enabled=false;
 }
 
 command_result status_command(

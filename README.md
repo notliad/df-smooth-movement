@@ -85,7 +85,7 @@ cmake --build /path/to/dfhack-build --target smooth-movement-test
   unsafe layer reconstruction.
 - UI and menus are rendered after interpolated world sprites.
 
-## Directional sprite flipping (on by default)
+## Directional sprite flipping (off by default)
 
 Creature sprites mirror horizontally to face their direction of travel.
 Dwarf Fortress creature art natively faces west; a creature moving east is
@@ -97,7 +97,7 @@ into a single tile sprite before the plugin sees it. Multi-tile creatures
 mirror as one composite, reflected about their anchor tile. Items, vehicles,
 and designations are never mirrored.
 
-Toggle it with `smooth-movement flip on|off`; `smooth-movement flip` alone
+Turn it on with `smooth-movement flip on`; `smooth-movement flip` alone
 prints the current state. Turning it off restores every creature to its
 native orientation immediately and lets the plugin go back to idling rather
 than repainting tiles every frame for a feature that is switched off.

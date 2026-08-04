@@ -9,8 +9,8 @@
   clothing and equipment flip with the creature because Dwarf Fortress
   composites them into a single tile sprite. Multi-tile creatures mirror as
   one composite, reflected about their anchor tile. Items, vehicles, and
-  designations are never mirrored. Enabled by default; toggle with
-  `smooth-movement flip on|off`.
+  designations are never mirrored. Off by default; turn it on with
+  `smooth-movement flip on`.
 
 ## 0.3.0 - 2026-08-03
 
