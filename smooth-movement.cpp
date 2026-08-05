@@ -488,6 +488,12 @@ viewport_visual_animation_inputst animation_input(df::graphic_viewportst *vp)
 		};
 }
 
+// The layer buffers are freed and nulled without clearing the active flag.
+bool viewport_readable(df::graphic_viewportst *vp)
+{
+	return vp!=nullptr&&vp->flag.bits.active&&animation_input(vp).valid();
+}
+
 int32_t tile_pixel(int32_t tile,int32_t origin,int32_t zoom)
 {
 	return zoom==128?32*tile+origin:(zoom*32*tile)/128+origin;
@@ -501,7 +507,8 @@ bool inside_clip(const df::graphic_viewportst *vp,int32_t x,int32_t y)
 
 bool has_fire(const df::graphic_viewportst *vp,int32_t x,int32_t y)
 {
-	return vp->screentexpos_spatter_flag[x*vp->dim_y+y]&fire_bits;
+	return vp->screentexpos_spatter_flag!=nullptr&&
+		(vp->screentexpos_spatter_flag[x*vp->dim_y+y]&fire_bits)!=0;
 }
 
 template<typename T>
@@ -670,11 +677,18 @@ void redraw_viewport_tile(
 void redraw_world_tile(
 	df::renderer_2d_base *renderer,
 	const std::vector<viewport_renderst> &viewports,
+	const tile_coveragest &staged,
 	int32_t x,
 	int32_t y)
 {
+	// The stage pass repaints everything above the lowest across the staged tiles, after the proxies.
+	const bool staged_tile=staged.count({x,y})!=0;
 	for(const viewport_renderst &viewport:viewports)
-		redraw_viewport_tile(renderer,viewport,x,y);
+		{
+		if(inside_clip(viewport.viewport,x,y))
+			redraw_viewport_tile(renderer,viewport,x,y);
+		if(staged_tile)break;
+		}
 }
 
 constexpr uint16_t visual_layers_through_group(visual_render_groupst group)
@@ -1044,9 +1058,9 @@ std::vector<df::graphic_viewportst *> active_viewports()
 	for(int32_t lower=7;lower>=0;--lower)
 		{
 		df::graphic_viewportst *vp=gps->lower_viewport[lower];
-		if(vp!=nullptr&&vp->flag.bits.active)viewports.push_back(vp);
+		if(viewport_readable(vp))viewports.push_back(vp);
 		}
-	if(gps->main_viewport!=nullptr&&gps->main_viewport->flag.bits.active)
+	if(viewport_readable(gps->main_viewport))
 		viewports.push_back(gps->main_viewport);
 	return viewports;
 }
@@ -1066,12 +1080,12 @@ std::vector<viewport_renderst> collect_viewport_renders(
 	return renders;
 }
 
-render_coveragest collect_viewport_coverage(
+tile_coveragest collect_viewport_coverage(
 	const std::vector<viewport_renderst> &viewports)
 {
-	render_coveragest coverage;
+	tile_coveragest coverage;
 	for(const viewport_renderst &viewport:viewports)
-		coverage.all.insert(
+		coverage.insert(
 			viewport.coverage.all.begin(),viewport.coverage.all.end());
 	return coverage;
 }
@@ -1139,15 +1153,10 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	const uint32_t now_ms=Core::getInstance().p->getTickCount();
 	animation_manager.begin_frame(now_ms);
 	for(df::graphic_viewportst *viewport:viewports)
-		{
-		const auto input=animation_input(viewport);
-		animation_manager.synchronize_viewport(
-			input,
-			true);
-		}
+		animation_manager.synchronize_viewport(animation_input(viewport));
 	animation_manager.end_frame();
 
-	if(vp==nullptr||!vp->flag.bits.active||renderer->sdl_renderer==nullptr)
+	if(!viewport_readable(vp)||renderer->sdl_renderer==nullptr)
 		return;
 	update_camera(renderer,vp,animation_manager.get_frame_delta_ms());
 	const double cam_tile=tile_px(renderer);
@@ -1167,7 +1176,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 
 	std::vector<viewport_renderst> viewport_renders=
 		collect_viewport_renders(renderer,viewports);
-	render_coveragest coverage=collect_viewport_coverage(viewport_renders);
+	tile_coveragest coverage=collect_viewport_coverage(viewport_renders);
 
 	SDL_Renderer *sdl_renderer=static_cast<SDL_Renderer *>(renderer->sdl_renderer);
 	const int32_t zoom=renderer->viewport_zoom_factor;
@@ -1203,10 +1212,9 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		for(int32_t x=vp->clipx[0];x<=vp->clipx[1];++x)
 			{
 			for(int32_t y=vp->clipy[0];y<=vp->clipy[1];++y)
-				redraw_world_tile(renderer,viewport_renders,x,y);
+				redraw_world_tile(renderer,viewport_renders,coverage,x,y);
 			}
-		draw_viewport_interpolation_stages(
-			renderer,viewport_renders,coverage.all);
+		draw_viewport_interpolation_stages(renderer,viewport_renders,coverage);
 		renderer->origin_x=saved_origin_x;
 		renderer->origin_y=saved_origin_y;
 		render_set_clip_rect(sdl_renderer,nullptr);
@@ -1216,7 +1224,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		return;
 		}
 
-	std::set<std::pair<int32_t,int32_t>> redraw_coverage=coverage.all;
+	tile_coveragest redraw_coverage=coverage;
 	redraw_coverage.insert(previous_coverage.begin(),previous_coverage.end());
 	Uint8 old_r=0,old_g=0,old_b=0,old_a=255;
 	get_render_draw_color(sdl_renderer,&old_r,&old_g,&old_b,&old_a);
@@ -1237,11 +1245,12 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 
 	for(const auto &[x,y]:redraw_coverage)
 		{
-		if(inside_clip(vp,x,y))redraw_world_tile(renderer,viewport_renders,x,y);
+		if(inside_clip(vp,x,y))
+			redraw_world_tile(renderer,viewport_renders,coverage,x,y);
 		}
-	draw_viewport_interpolation_stages(renderer,viewport_renders,coverage.all);
+	draw_viewport_interpolation_stages(renderer,viewport_renders,coverage);
 
-	previous_coverage=std::move(coverage.all);
+	previous_coverage=std::move(coverage);
 }
 
 struct renderer_hook : df::renderer_2d_base

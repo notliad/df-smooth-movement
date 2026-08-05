@@ -428,7 +428,7 @@ class visual_animation_managerst
 				}
 			}
 
-		void synchronize_viewport(const viewport_visual_animation_inputst &input,bool allow_new_movements)
+		void synchronize_viewport(const viewport_visual_animation_inputst &input)
 			{
 			if(input.viewport==nullptr)return;
 			viewport_animationst &state=get_viewport(input);
@@ -486,15 +486,14 @@ class visual_animation_managerst
 			state.buffer_signature=signature;
 			state.has_buffer_signature=true;
 
-			if(context_changed||!allow_new_movements)
+			if(context_changed)
 				{
 				// Skips the recompute sweep, so clear has_mirrored here or a stale true survives.
-				// The grid stays: an inactive viewport is not drawn and its facings still hold.
 				state.has_mirrored=false;
 				reset_tracking(state);
 				// window_z, zoom and resize change at input time; the buffers cross later.
 				// This reset covers only the input frame, not the crossing itself.
-				if(view_switched||!allow_new_movements)state.previous_view_stale=true;
+				if(view_switched)state.previous_view_stale=true;
 				return;
 				}
 
