@@ -544,6 +544,12 @@ class visual_animation_managerst
 
 		void synchronize_viewport(const viewport_visual_animation_inputst &input,bool allow_new_movements)
 			{
+			// Cleared up front rather than only on the paths that reach the landing test: the
+			// fortress free camera keys its glide compensation off last_shift, and an early
+			// return that left the PREVIOUS frame's landing standing would have it compensate
+			// the same scroll a second time.
+			stats.last_shift_x=0;
+			stats.last_shift_y=0;
 			if(input.viewport==nullptr)return;
 			viewport_animationst &state=get_viewport(input);
 			state.seen=true;

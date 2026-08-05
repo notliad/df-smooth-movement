@@ -91,10 +91,14 @@ bool flip_enabled=false;
 bool camera_enabled=false;                    // OFF by default: plain `enable smooth-movement`
                                               // keeps upstream behavior (creature interpolation
                                               // only); `smooth-movement camera on` opts in.
-constexpr int32_t camera_max_glide_tiles=3;   // per-jump snap threshold, tiles -- shared by both
-                                              // non-drag scrolls and drag steps (a fast mouse
-                                              // movement past this many tiles in one native frame
-                                              // snaps instead of gliding; see update_camera)
+constexpr int32_t camera_max_glide_tiles=3;   // snap threshold, in tiles of a single LANDED
+                                              // scroll: past this the view just steps. Note this
+                                              // counts buffer landings, not frames -- a landing is
+                                              // a real, already-drawn content jump, so the count is
+                                              // frame-rate independent by construction. (An earlier
+                                              // per-FRAME form of this, and a tiles-per-SECOND
+                                              // patch on top of it, were both measuring window_x
+                                              // deltas -- an announcement of intent, not a redraw.)
 constexpr double camera_tau_ms=90.0;          // transient catch-up (~95% done after ~270ms) --
                                               // double the prior 180 (halving tau doubles the
                                               // catch-up rate for exponential decay)
@@ -111,19 +115,9 @@ double transient_x=0.0;                       // decaying glide offset, pixels
 double transient_y=0.0;
 double rest_x=0.0;                            // persistent free-camera offset, tiles
 double rest_y=0.0;                            // (positive = view sits WEST/NORTH of window)
-int32_t camera_pending_dx=0;                  // scroll delta announced but not yet in the buffers
-int32_t camera_pending_dy=0;
-int32_t camera_pending_frames=0;
 int32_t self_scroll_x=0;                      // window deltas WE wrote: visual no-ops when landing
 int32_t self_scroll_y=0;
 bool camera_was_offset=false;                 // edge-detects offset->0 for one cleanup redraw
-int32_t camera_prev_wx=0;                     // window-scroll observation baseline
-int32_t camera_prev_wy=0;
-bool camera_has_prev=false;
-bool camera_excursion=false;                  // a SINGLE frame announced an excursion-sized
-                                              // jump; accumulated fast-scroll pending never
-                                              // arms this (freezing attribution reads as
-                                              // jitter)
 
 bool adventure_mode()
 {
@@ -153,8 +147,8 @@ int32_t slide_drag_cooldown=0;                // frames after a drag whose landi
 uint64_t stat_glide_frames=0;   // frames the world was drawn at a sub-tile offset
 uint64_t stat_mouse_shifts=0;   // input dispatches corrected for the visual offset
 uint64_t stat_visual_jumps=0;   // frames the drawn world moved > 0.6 tile at once
-double prev_visual_x=0.0;
-double prev_visual_y=0.0;
+int32_t prev_glide_x=0;         // last frame's drawn glide offset, for the continuity check
+int32_t prev_glide_y=0;
 bool has_prev_visual=false;
 uint64_t prev_visual_revision=0;
 float last_jump_x=0.0f;
@@ -181,7 +175,7 @@ struct trace_framest
 	float slide_px_x,slide_px_y;
 	float glide_px_x,glide_px_y;   // the offset actually rendered (camera or slide)
 	float rest_x_t,rest_y_t;       // camera rest, tiles
-	int32_t cam_pending_x,cam_pending_y;
+	int32_t shift_x,shift_y;       // scroll landed in the buffers this frame (drives the camera)
 	uint8_t flags;                 // 1=dragging 2=camera_active
 	float jump_x,jump_y;
 };
@@ -333,47 +327,14 @@ double tile_px(const df::renderer_2d_base *renderer)
 	return double(zoom==128?32:std::max(1,zoom*32/128));
 }
 
-// Match ratio of "buffers shifted by (dwx,dwy)" on the background layer: 0..1, or -1 when there
-// is nothing to compare (empty background).
-double background_match_ratio(const df::graphic_viewportst *vp,int32_t dwx,int32_t dwy)
-{
-	int32_t considered=0;
-	int32_t matches=0;
-	for(int32_t x=0;x<vp->dim_x;++x)
-		{
-		const int32_t sx=x+dwx;
-		if(sx<0||sx>=vp->dim_x)continue;
-		for(int32_t y=0;y<vp->dim_y;++y)
-			{
-			const int32_t sy=y+dwy;
-			if(sy<0||sy>=vp->dim_y)continue;
-			const int32_t cur=vp->screentexpos_background[x*vp->dim_y+y];
-			if(cur==0)continue;
-			++considered;
-			if(vp->screentexpos_background_old[sx*vp->dim_y+sy]==cur)++matches;
-			}
-		}
-	if(considered==0)return -1.0;
-	return double(matches)/double(considered);
-}
-
 // Cancel everything except the persistent rest offset (the camera keeps its sub-tile position
 // across zoom/z/resize; only the in-flight animation state is unfollowable).
-void clear_camera_pending()
-{
-	camera_pending_dx=0;
-	camera_pending_dy=0;
-	camera_pending_frames=0;
-	self_scroll_x=0;
-	self_scroll_y=0;
-}
-
 void cancel_camera_transients()
 {
-	camera_excursion=false;
 	transient_x=0.0;
 	transient_y=0.0;
-	clear_camera_pending();
+	self_scroll_x=0;
+	self_scroll_y=0;
 }
 
 void set_camera_enabled(bool enable)
@@ -383,7 +344,6 @@ void set_camera_enabled(bool enable)
 	cancel_camera_transients();
 	rest_x=0.0;
 	rest_y=0.0;
-	camera_has_prev=false;   // fresh observation baseline; no phantom scroll on re-enable
 	// camera_was_offset stays: the render path issues one cleanup redraw if we were mid-offset.
 }
 
@@ -443,158 +403,60 @@ void attribute_landed(int32_t ax,int32_t ay,double tile)
 	transient_y=std::clamp(transient_y,-cap,cap);
 }
 
-// Per-frame camera bookkeeping: observe window scrolls, attribute them when the buffers apply
-// them (glide vs our own normalization writes), drive the drag, decay the transient.
-void update_camera(
-	df::renderer_2d_base *renderer,
-	const df::graphic_viewportst *vp,
-	uint32_t delta_ms)
+// Per-frame camera bookkeeping: compensate scrolls on the frame their content actually lands in
+// the render buffers, and decay that compensation away.
+//
+// ATTRIBUTION IS KEYED TO BUFFER LANDINGS, NEVER TO window_x/window_y DELTAS. The distinction is
+// the whole correctness argument here, and getting it wrong is what every previous version of this
+// function did:
+//
+//   The drawn image is the viewport BUFFER content (redraw_world_tile -> update_viewport_tile,
+//   which reads vp->screentexpos_*) painted at renderer->origin plus our glide offset. window_x
+//   is not a term in it. window_x changes at INPUT time; DF recomputes the buffers on some LATER
+//   frame -- "far less often than this hook runs, and while paused hardly at all" (upstream
+//   c116b2d, the same observation that fixed the sprite jiggle). So window_x is an announcement of
+//   intent, and the buffers are the thing on screen.
+//
+//   Compensating on the window delta therefore shifts the world by a tile while the screen is
+//   still showing pre-scroll content -- a visible jump AGAINST the direction of travel -- and then
+//   jumps again when the buffer finally lands. Unpaused this is invisible: the buffers recompute
+//   nearly every frame, so window delta and buffer shift coincide and the wrong model happens to
+//   give the right answer. Paused, they come apart, and that gap IS the "camera jitters while
+//   paused" bug. (It is also the original "camera jumps the opposite direction as motion starts"
+//   report, which was misdiagnosed as a since-removed 2-frame hold buffer. A fixed frame delay was
+//   never the fix either: the correct delay is "until the buffers advance", which is not a number.)
+//
+// animation_manager.stats.last_shift_x/y is exactly that landing: the tile shift the manager
+// confirmed against buffer content THIS frame, zero on frames nothing landed. It is gated on the
+// buffer fingerprint actually changing, resolves fast scrolls piecewise (the buffers may apply
+// only +1 of a pending +3), handles view crossings, and ages by wall clock -- machinery this
+// function used to duplicate, worse, in a private background_match_ratio search with a fistful of
+// magic frame counts. synchronize_viewport runs earlier in the same frame, so the value is fresh.
+//
+// The world-tile slide already worked this way (see the last_shift_x consumer in the render path);
+// the camera was the outlier.
+void update_camera(df::renderer_2d_base *renderer,uint32_t delta_ms)
 {
 	if(!camera_enabled||adventure_mode())return;   // adventure smoothing = the world slide
 	const double tile=tile_px(renderer);
-	const int32_t wx=window_x?*window_x:0;
-	const int32_t wy=window_y?*window_y:0;
-	// A middle-mouse drag moves window_x/window_y through DF's OWN native stepping -- unlike
-	// the retired pixel-anchored approach (which computed a position straight from raw mouse
-	// pixels, in parallel with DF's stepping, and inevitably diverged from it: a divergence
-	// clamp lurching every dragged tile, and a camera stranded off-grid on release that skewed
-	// every corrected click), this never has an opinion of its own -- it only reacts to
-	// positions DF already committed to. No content-match landing search and no multi-frame
-	// pending queue: that machinery exists to cope with scroll changes the render buffers have
-	// not caught up to yet, which a live drag does not exhibit.
-	//
-	// Every observed delta is attributed to transient IMMEDIATELY, same frame -- it must be:
-	// window_x/window_y are read live below (rec.wx/wy, and the render's -window*tile term) with
-	// no delay of their own, so any delay on the transient side that COMPENSATES for them opens a
-	// gap where the render sees the new window position but the old, uncompensated transient. A
-	// held-for-N-frames version of this was tried and measured live (2026-08) to cause EXACTLY
-	// that: the instant a drag delta landed, the screen would already reflect the new window_y
-	// while transient_y hadn't caught up yet, producing a real, immediate jump in the WRONG
-	// direction, followed by a second jump back once the hold finally committed, and only then
-	// the intended smooth glide -- three motions where there should be one. That is what "camera
-	// jumps opposite the direction of motion as it starts" was. Immediate attribution has no such
-	// gap: window and transient update in the same frame, so the two terms in the render formula
-	// never disagree about which frame they're describing.
-	//
-	// LARGE deltas (fast mouse movement covering several tiles in one native step -- measured
-	// live, 2026-08, up to 13-14 tiles in one frame) still snap instantly instead of gliding: the
-	// mouse is already at the new position, so animating a slow chase across that whole distance
-	// just looks like the camera flying after the cursor, and if the user reverses just as fast,
-	// two such glides collide mid-flight. Same call the non-drag teleport snap makes below.
-	const bool dragging_now=enabler!=nullptr&&enabler->mouse_mbut;
-	if(camera_has_prev&&(wx!=camera_prev_wx||wy!=camera_prev_wy))
+	const int32_t shift_x=animation_manager.stats.last_shift_x;
+	const int32_t shift_y=animation_manager.stats.last_shift_y;
+	if(shift_x!=0||shift_y!=0)
 		{
-		const int32_t dx=wx-camera_prev_wx;
-		const int32_t dy=wy-camera_prev_wy;
-		if(dragging_now&&(std::abs(dx)>camera_max_glide_tiles||std::abs(dy)>camera_max_glide_tiles))
+		if(std::abs(shift_x)>camera_max_glide_tiles||std::abs(shift_y)>camera_max_glide_tiles)
 			{
-			camera_excursion=false;
-			cancel_camera_transients();   // fast drag step: snap, don't chase
-			}
-		else if(dragging_now)
-			{
-			camera_excursion=false;
-			clear_camera_pending();
-			attribute_landed(dx,dy,tile);
-			}
-		else if(std::abs(dx)>6||std::abs(dy)>6)
-			{
-			// Almost certainly a one-frame window excursion (combat/announcement camera
-			// flick) whose reversal arrives a frame or two later: park it for the wait
-			// below instead of cancelling.
-			camera_excursion=true;
-			camera_pending_dx+=dx;
-			camera_pending_dy+=dy;
-			camera_pending_frames=0;
-			}
-		else if(std::abs(dx)>camera_max_glide_tiles||std::abs(dy)>camera_max_glide_tiles)
-			cancel_camera_transients();   // teleport-like jump (recenter/minimap): snap
-		else
-			{
-			camera_pending_dx+=dx;
-			camera_pending_dy+=dy;
-			camera_pending_frames=0;
-			}
-		if(camera_excursion&&
-			std::abs(camera_pending_dx)<=6&&std::abs(camera_pending_dy)<=6)
-			camera_excursion=false;   // the excursion reversed
-		}
-	camera_prev_wx=wx;
-	camera_prev_wy=wy;
-	camera_has_prev=true;
-
-	if(camera_pending_dx!=0||camera_pending_dy!=0)
-		{
-		if(camera_excursion)
-			{
-			// One-frame window excursion: the reversal usually collapses the delta on
-			// its own -- attribute nothing meanwhile so the glide keeps decaying
-			// untouched. A delta that never collapses is a genuine teleport: snap
-			// (keep rest, drop the animation debt).
-			if(++camera_pending_frames>4)
-				{
-				transient_x=0.0;
-				transient_y=0.0;
-				clear_camera_pending();
-				camera_excursion=false;
-				}
+			// A big landing means the content already jumped that far in one redraw: a recenter,
+			// a minimap warp, or a drag flicked faster than the buffers refresh. Chasing it would
+			// animate the camera flying across the map long after the view arrived, so take the
+			// step and drop the outstanding debt with it.
+			cancel_camera_transients();
 			}
 		else
 			{
-			// Fast scrolling applies the pending delta PIECEMEAL: the buffers may hold +1 of a
-			// pending +3 this frame. Testing only the total made landings miss, time out, and
-			// snap -- the fast-scroll jitter. Instead, find the LARGEST applied prefix of the
-			// pending scroll and attribute just that; the rest keeps pending. Ties between
-			// qualifying shifts only happen on uniform terrain, where mistiming is invisible.
-			const int32_t stepx=(camera_pending_dx>0)-(camera_pending_dx<0);
-			const int32_t stepy=(camera_pending_dy>0)-(camera_pending_dy<0);
-			const int32_t span_x=std::min(std::abs(camera_pending_dx),8);
-			const int32_t span_y=std::min(std::abs(camera_pending_dy),8);
-			int32_t best_ax=0,best_ay=0,best_mag=-1;
-			double best_score=-1.0;
-			bool no_data=false;
-			for(int32_t ix=0;ix<=span_x;++ix)
-				{
-				for(int32_t iy=0;iy<=span_y;++iy)
-					{
-					const double score=background_match_ratio(vp,ix*stepx,iy*stepy);
-					if(score<0.0){no_data=true;break;}
-					const int32_t mag=ix+iy;
-					if(score>=0.6&&(mag>best_mag||(mag==best_mag&&score>best_score)))
-						{
-						best_mag=mag;
-						best_score=score;
-						best_ax=ix*stepx;
-						best_ay=iy*stepy;
-						}
-					}
-				if(no_data)break;
-				}
-			if(no_data)
-				{
-				// Nothing to compare against (empty background): give up on attribution.
-				clear_camera_pending();
-				}
-			else if(best_mag>0)
-				{
-				attribute_landed(best_ax,best_ay,tile);
-				camera_pending_dx-=best_ax;
-				camera_pending_dy-=best_ay;
-				camera_pending_frames=0;
-				}
-			else if(best_mag==0)
-				{
-				// Content demonstrably hasn't moved yet -- but a scroll masked by an
-				// excursion frame never diffs, and a phantom delta never renders at all.
-				// Absorb either after a grace period instead of poisoning attribution.
-				if(++camera_pending_frames>6)clear_camera_pending();
-				}
-			else if(++camera_pending_frames>4)
-				{
-				// Neither static nor any prefix recognizable (heavy simultaneous change):
-				// drop the debt without touching the in-flight glide.
-				clear_camera_pending();
-				}
+			// The content jumped shift tiles on screen this frame; hold it where it was and let
+			// the decay below carry it the rest of the way. Our own normalization writes are
+			// filtered out inside attribute_landed -- they move into rest, not into the glide.
+			attribute_landed(shift_x,shift_y,tile);
 			}
 		}
 
@@ -1606,7 +1468,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 
 	if(vp==nullptr||!vp->flag.bits.active||renderer->sdl_renderer==nullptr)
 		return;
-	update_camera(renderer,vp,animation_manager.get_frame_delta_ms());
+	update_camera(renderer,animation_manager.get_frame_delta_ms());
 	const double cam_tile=tile_px(renderer);
 	const bool camera_active=camera_enabled&&!adventure_mode();
 
@@ -1676,18 +1538,22 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		int32_t(std::lround(slide_now_y));
 	const bool glide=glide_x!=0||glide_y!=0;
 
-	// Visual continuity check: the drawn world offset is -window*tile + glide. Any
-	// one-frame move above 0.6 tile is a visible jump -- an intended snap or a bug.
+	// Visual continuity check. What is on screen is BUFFER content drawn at origin+glide, so the
+	// world position it depicts moves by -last_shift tiles whenever a scroll lands in the buffers,
+	// plus whatever the glide changed by. window_x is deliberately absent: it changes at input
+	// time, frames before the buffers cross, so a -window*tile term (which this check used to use,
+	// and which appears nowhere in the actual draw path) reports large jumps on frames where
+	// nothing moved on screen at all -- and reports none on the later frame where it really did.
+	// Traces taken against that formula are what sent the paused-jitter hunt chasing drag speed.
 	{
-	const double visual_x=-double(window_x?*window_x:0)*cam_tile+double(glide_x);
-	const double visual_y=-double(window_y?*window_y:0)*cam_tile+double(glide_y);
+	const double dvx=-double(animation_manager.stats.last_shift_x)*cam_tile+
+		double(glide_x-prev_glide_x);
+	const double dvy=-double(animation_manager.stats.last_shift_y)*cam_tile+
+		double(glide_y-prev_glide_y);
 	last_jump_x=0.0f;
 	last_jump_y=0.0f;
-	if(has_prev_visual&&prev_visual_revision==visual_context_revision&&
-		!dragging&&slide_drag_cooldown==0)
+	if(has_prev_visual&&prev_visual_revision==visual_context_revision)
 		{
-		const double dvx=visual_x-prev_visual_x;
-		const double dvy=visual_y-prev_visual_y;
 		if(std::abs(dvx)>0.6*cam_tile||std::abs(dvy)>0.6*cam_tile)
 			{
 			++stat_visual_jumps;
@@ -1695,8 +1561,8 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 			last_jump_y=float(dvy);
 			}
 		}
-	prev_visual_x=visual_x;
-	prev_visual_y=visual_y;
+	prev_glide_x=glide_x;
+	prev_glide_y=glide_y;
 	prev_visual_revision=visual_context_revision;
 	has_prev_visual=true;
 	}
@@ -1998,8 +1864,8 @@ void record_trace_frame()
 		float(transient_y+rest_y*tile):rec.slide_px_y;
 	rec.rest_x_t=float(rest_x);
 	rec.rest_y_t=float(rest_y);
-	rec.cam_pending_x=camera_pending_dx;
-	rec.cam_pending_y=camera_pending_dy;
+	rec.shift_x=animation_manager.stats.last_shift_x;
+	rec.shift_y=animation_manager.stats.last_shift_y;
 	rec.flags=uint8_t((enabler!=nullptr&&enabler->mouse_mbut?1:0)|(cam_active?2:0));
 	rec.jump_x=last_jump_x;
 	rec.jump_y=last_jump_y;
@@ -2099,7 +1965,6 @@ void reset_state()
 	rest_x=0.0;
 	rest_y=0.0;
 	camera_enabled=false;
-	camera_has_prev=false;
 	camera_was_offset=false;
 	construction_transitions_enabled=false;
 	flip_enabled=false;
@@ -2186,7 +2051,7 @@ command_result status_command(
 			bool interesting=rec.jump_x!=0.0f||rec.jump_y!=0.0f||rec.sig_diff!=0||
 				rec.pending_dx!=0||rec.pending_dy!=0||
 				(rec.flags&1)!=0||
-				rec.cam_pending_x!=0||rec.cam_pending_y!=0||
+				rec.shift_x!=0||rec.shift_y!=0||
 				std::abs(rec.glide_px_x)>0.5f||std::abs(rec.glide_px_y)>0.5f||
 				std::abs(rec.slide_px_x)>0.5f||std::abs(rec.slide_px_y)>0.5f;
 			std::string delta;
@@ -2224,7 +2089,7 @@ command_result status_command(
 					jump=" JUMP="+std::to_string(int(rec.jump_x))+","+
 						std::to_string(int(rec.jump_y));
 				out.print(
-					"f={} w={},{},{}{}{}{}{}{} pend={},{} cpend={},{} glide={:.1f},{:.1f}"
+					"f={} w={},{},{}{}{}{}{}{} pend={},{} land={},{} glide={:.1f},{:.1f}"
 					" rest={:.2f},{:.2f}\n",
 					rec.frame,rec.wx,rec.wy,rec.wz,
 					sig.empty()?"":(" sig="+sig),
@@ -2233,7 +2098,7 @@ command_result status_command(
 					(rec.flags&1)?" DRAG":"",
 					(rec.flags&2)?"":" noCam",
 					rec.pending_dx,rec.pending_dy,
-					rec.cam_pending_x,rec.cam_pending_y,
+					rec.shift_x,rec.shift_y,
 					rec.glide_px_x,rec.glide_px_y,
 					rec.rest_x_t,rec.rest_y_t);
 				++printed;
