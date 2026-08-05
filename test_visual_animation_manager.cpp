@@ -193,6 +193,33 @@ int main()
 	assert(manager.get_facing(viewport,dim,0)==native_sprite_facing);
 	assert(manager.get_facing(nullptr,0,0)==native_sprite_facing);
 	}
+
+	// Each rendered z-level has its own viewport buffers; tracking one must not suppress another.
+	{
+	const int lower_token=0;
+	const int main_token=0;
+	const void *lower_viewport=&lower_token;
+	const void *main_viewport=&main_token;
+	visual_animation_managerst z_levels;
+	auto lower_input=make_input(lower_viewport,dim,empty);
+	auto main_input=make_input(main_viewport,dim,empty);
+	set_layer(lower_input,viewport_visual_layer::center,before,empty);
+	set_layer(main_input,viewport_visual_layer::center,before,empty);
+	z_levels.begin_frame(1000);
+	z_levels.synchronize_viewport(lower_input,true);
+	z_levels.synchronize_viewport(main_input,true);
+	z_levels.end_frame();
+	set_layer(lower_input,viewport_visual_layer::center,west_after,before);
+	set_layer(main_input,viewport_visual_layer::center,west_after,before);
+	z_levels.begin_frame(1016);
+	z_levels.synchronize_viewport(lower_input,true);
+	z_levels.synchronize_viewport(main_input,true);
+	z_levels.end_frame();
+	assert(z_levels.get_movement(
+		lower_viewport,viewport_visual_layer::center,1,2).active);
+	assert(z_levels.get_movement(
+		main_viewport,viewport_visual_layer::center,1,2).active);
+	}
 	}
 
 	// All four diagonals through the manager, so every step carries a real dy as well as a dx.
@@ -251,11 +278,15 @@ int main()
 	int32_t pan_empty[pan_dim*pan_dim]={};
 	int32_t at_one[pan_dim*pan_dim]={};
 	int32_t at_two[pan_dim*pan_dim]={};
+	int32_t unmatched_a[pan_dim*pan_dim]={};
+	int32_t unmatched_b[pan_dim*pan_dim]={};
 	const int pan_token=0;
 	const void *pan_viewport=&pan_token;
 
 	at_one[1*pan_dim+1]=77;
 	at_two[2*pan_dim+1]=77;   // steps east, x 1 -> 2, so it faces east
+	unmatched_a[2*pan_dim+1]=78;
+	unmatched_b[2*pan_dim+1]=79;
 
 	// LANDED: the shift is recognized, so facing follows the buffers.
 	{
@@ -294,18 +325,20 @@ int main()
 	run_frame(abandoned,input,2016);
 	assert(abandoned.get_facing(pan_viewport,2,1)==visual_facingst::east);
 
-	// The buffers stay put, so the majority-match test fails every frame.
+	// Changed buffers keep the failed majority-match test running every frame.
 	// It tolerates four before giving up on the fifth.
 	input.pan_x=1;
-	set_layer(input,viewport_visual_layer::center,at_two,at_two);
 	for(int32_t frame=0;frame<4;++frame)
 		{
+		set_layer(input,viewport_visual_layer::center,at_two,
+			frame%2==0?unmatched_a:unmatched_b);
 		run_frame(abandoned,input,2032+uint32_t(frame)*16);
 		// Still pending, so the facing survives.
 		// The assertion after the giving-up frame therefore tests the reset, not an empty grid.
 		assert(abandoned.get_facing(pan_viewport,2,1)==visual_facingst::east);
 		assert(abandoned.has_mirrored_facing(pan_viewport));
 		}
+	set_layer(input,viewport_visual_layer::center,at_two,unmatched_a);
 	run_frame(abandoned,input,2096);
 	assert(abandoned.get_facing(pan_viewport,2,1)==native_sprite_facing);
 	assert(!abandoned.has_mirrored_facing(pan_viewport));
