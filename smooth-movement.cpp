@@ -80,9 +80,8 @@ bool flip_enabled=false;
 
 // --- free camera -------------------------------------------------------------------------------
 // The camera is visually unbound from the tile grid. Two layered offsets:
-//   rest      -- a PERSISTENT sub-tile offset in tiles: the free camera. Set by pixel-perfect
-//                middle-mouse drag panning (the view rests wherever released, mid-tile or not)
-//                and by the `smooth-movement camera <fx> <fy>` console command. Survives zoom
+//   rest      -- a PERSISTENT sub-tile offset in tiles: the free camera. Set only by the
+//                `smooth-movement camera <fx> <fy>` console command. Survives zoom
 //                and z-level changes. Kept in [-0.5,0.5] by normalization: whole-tile parts are
 //                folded into window_x/window_y (a plain UI scroll write -- NEVER the viewport
 //                dims, which crash DF; the sub-tile strip this leaves at one screen edge has no
@@ -92,8 +91,22 @@ bool flip_enabled=false;
 bool camera_enabled=false;                    // OFF by default: plain `enable smooth-movement`
                                               // keeps upstream behavior (creature interpolation
                                               // only); `smooth-movement camera on` opts in.
-constexpr int32_t camera_max_glide_tiles=3;   // per-jump: farther than this snaps instantly
-constexpr double camera_tau_ms=35.0;          // transient catch-up (~95% done after 100ms)
+constexpr int32_t camera_max_glide_tiles=3;   // per-jump snap threshold, tiles -- shared by both
+                                              // non-drag scrolls and drag steps (a fast mouse
+                                              // movement past this many tiles in one native frame
+                                              // snaps instead of gliding; see update_camera)
+constexpr double camera_tau_ms=90.0;          // transient catch-up (~95% done after ~270ms) --
+                                              // double the prior 180 (halving tau doubles the
+                                              // catch-up rate for exponential decay)
+constexpr double camera_glide_clamp_tiles=16.0;   // safety cap on outstanding glide debt. Generous
+                                              // on purpose: a fast drag can rack up several tiles of
+                                              // debt before it decays, and clamping that down to a
+                                              // small cap mid-glide is a discontinuous SNAP, not a
+                                              // lerp -- it was the actual source of the visible
+                                              // "over-correction" under fast dragging, not the decay
+                                              // itself (exponential decay cannot overshoot by
+                                              // construction). This is a backstop for a genuinely
+                                              // runaway state, not a normal operating limit.
 double transient_x=0.0;                       // decaying glide offset, pixels
 double transient_y=0.0;
 double rest_x=0.0;                            // persistent free-camera offset, tiles
@@ -103,7 +116,6 @@ int32_t camera_pending_dy=0;
 int32_t camera_pending_frames=0;
 int32_t self_scroll_x=0;                      // window deltas WE wrote: visual no-ops when landing
 int32_t self_scroll_y=0;
-bool drag_active=false;                       // kept for cancel bookkeeping; never set now
 bool camera_was_offset=false;                 // edge-detects offset->0 for one cleanup redraw
 int32_t camera_prev_wx=0;                     // window-scroll observation baseline
 int32_t camera_prev_wy=0;
@@ -362,7 +374,6 @@ void cancel_camera_transients()
 	transient_x=0.0;
 	transient_y=0.0;
 	clear_camera_pending();
-	drag_active=false;
 }
 
 void set_camera_enabled(bool enable)
@@ -394,9 +405,21 @@ void normalize_rest()
 		}
 }
 
+// Exponential lerp toward zero: shrinks `value` by a FIXED FRACTION of its remaining distance to
+// zero every tau_ms, independent of frame rate -- the standard framerate-independent damped
+// approach. This is what makes the glide catch-up provably overshoot-proof: every call multiplies
+// `value` by a factor in (0,1), so it can shrink and change magnitude but can never cross zero or
+// reverse sign in a single step -- there is no way for the result to land on the far side of the
+// target. (Contrast with clamping a value to a fixed cap right after an unrelated jump, which IS a
+// discontinuous snap -- that was the actual source of the visible "over-correction" under fast
+// dragging, not this decay.)
+double decay_toward_zero(double value,double tau_ms,uint32_t delta_ms)
+{
+	return value*std::exp(-double(delta_ms)/tau_ms);
+}
+
 // A scroll of (ax,ay) tiles has landed in the buffers: our own normalization writes are visual
-// no-ops (they move into rest); the remainder is a real scroll and glides -- unless a drag is
-// driving the position directly, in which case it folds into rest wholesale.
+// no-ops (they move into rest); the remainder is a real scroll and adds to the glide debt.
 void attribute_landed(int32_t ax,int32_t ay,double tile)
 {
 	int32_t sx=0;
@@ -411,19 +434,13 @@ void attribute_landed(int32_t ax,int32_t ay,double tile)
 	rest_y+=sy;
 	const int32_t gx=ax-sx;
 	const int32_t gy=ay-sy;
-	if(drag_active)
-		{
-		rest_x+=gx;
-		rest_y+=gy;
-		}
-	else
-		{
-		transient_x+=gx*tile;
-		transient_y+=gy*tile;
-		const double cap=tile*(camera_max_glide_tiles+0.5);
-		transient_x=std::clamp(transient_x,-cap,cap);
-		transient_y=std::clamp(transient_y,-cap,cap);
-		}
+	transient_x+=gx*tile;
+	transient_y+=gy*tile;
+	// Safety backstop only -- see camera_glide_clamp_tiles. A well-behaved lerp does not need a
+	// magnitude clamp to avoid overshoot; this exists purely to bound a genuinely runaway state.
+	const double cap=tile*camera_glide_clamp_tiles;
+	transient_x=std::clamp(transient_x,-cap,cap);
+	transient_y=std::clamp(transient_y,-cap,cap);
 }
 
 // Per-frame camera bookkeeping: observe window scrolls, attribute them when the buffers apply
@@ -434,27 +451,53 @@ void update_camera(
 	uint32_t delta_ms)
 {
 	if(!camera_enabled||adventure_mode())return;   // adventure smoothing = the world slide
-	// Middle-mouse drags are DF's own: its drag pans with its own stepping and rate, and a
-	// pixel-anchored drag inevitably diverges from it (clamp -> lurch -> rest stranded at
-	// half a tile, skewing the world and every corrected click). While the button is held
-	// the camera stands down entirely -- crisp native drag -- and re-baselines on release.
-	if(enabler!=nullptr&&enabler->mouse_mbut)
-		{
-		cancel_camera_transients();
-		camera_excursion=false;
-		camera_prev_wx=window_x?*window_x:0;
-		camera_prev_wy=window_y?*window_y:0;
-		camera_has_prev=true;
-		return;
-		}
 	const double tile=tile_px(renderer);
 	const int32_t wx=window_x?*window_x:0;
 	const int32_t wy=window_y?*window_y:0;
+	// A middle-mouse drag moves window_x/window_y through DF's OWN native stepping -- unlike
+	// the retired pixel-anchored approach (which computed a position straight from raw mouse
+	// pixels, in parallel with DF's stepping, and inevitably diverged from it: a divergence
+	// clamp lurching every dragged tile, and a camera stranded off-grid on release that skewed
+	// every corrected click), this never has an opinion of its own -- it only reacts to
+	// positions DF already committed to. No content-match landing search and no multi-frame
+	// pending queue: that machinery exists to cope with scroll changes the render buffers have
+	// not caught up to yet, which a live drag does not exhibit.
+	//
+	// Every observed delta is attributed to transient IMMEDIATELY, same frame -- it must be:
+	// window_x/window_y are read live below (rec.wx/wy, and the render's -window*tile term) with
+	// no delay of their own, so any delay on the transient side that COMPENSATES for them opens a
+	// gap where the render sees the new window position but the old, uncompensated transient. A
+	// held-for-N-frames version of this was tried and measured live (2026-08) to cause EXACTLY
+	// that: the instant a drag delta landed, the screen would already reflect the new window_y
+	// while transient_y hadn't caught up yet, producing a real, immediate jump in the WRONG
+	// direction, followed by a second jump back once the hold finally committed, and only then
+	// the intended smooth glide -- three motions where there should be one. That is what "camera
+	// jumps opposite the direction of motion as it starts" was. Immediate attribution has no such
+	// gap: window and transient update in the same frame, so the two terms in the render formula
+	// never disagree about which frame they're describing.
+	//
+	// LARGE deltas (fast mouse movement covering several tiles in one native step -- measured
+	// live, 2026-08, up to 13-14 tiles in one frame) still snap instantly instead of gliding: the
+	// mouse is already at the new position, so animating a slow chase across that whole distance
+	// just looks like the camera flying after the cursor, and if the user reverses just as fast,
+	// two such glides collide mid-flight. Same call the non-drag teleport snap makes below.
+	const bool dragging_now=enabler!=nullptr&&enabler->mouse_mbut;
 	if(camera_has_prev&&(wx!=camera_prev_wx||wy!=camera_prev_wy))
 		{
 		const int32_t dx=wx-camera_prev_wx;
 		const int32_t dy=wy-camera_prev_wy;
-		if(std::abs(dx)>6||std::abs(dy)>6)
+		if(dragging_now&&(std::abs(dx)>camera_max_glide_tiles||std::abs(dy)>camera_max_glide_tiles))
+			{
+			camera_excursion=false;
+			cancel_camera_transients();   // fast drag step: snap, don't chase
+			}
+		else if(dragging_now)
+			{
+			camera_excursion=false;
+			clear_camera_pending();
+			attribute_landed(dx,dy,tile);
+			}
+		else if(std::abs(dx)>6||std::abs(dy)>6)
 			{
 			// Almost certainly a one-frame window excursion (combat/announcement camera
 			// flick) whose reversal arrives a frame or two later: park it for the wait
@@ -464,8 +507,7 @@ void update_camera(
 			camera_pending_dy+=dy;
 			camera_pending_frames=0;
 			}
-		else if((std::abs(dx)>camera_max_glide_tiles||std::abs(dy)>camera_max_glide_tiles)&&
-			!drag_active)
+		else if(std::abs(dx)>camera_max_glide_tiles||std::abs(dy)>camera_max_glide_tiles)
 			cancel_camera_transients();   // teleport-like jump (recenter/minimap): snap
 		else
 			{
@@ -556,16 +598,10 @@ void update_camera(
 			}
 		}
 
-	// (The former pixel-anchored middle-drag lived here. It fought DF's native drag --
-	// divergence, clamps, and a camera stranded half a tile off-grid -- so drags are now
-	// fully native: the camera stands down at the top of this function while the middle
-	// button is held.)
-
 	if(transient_x!=0.0||transient_y!=0.0)
 		{
-		const double k=std::exp(-double(delta_ms)/camera_tau_ms);
-		transient_x*=k;
-		transient_y*=k;
+		transient_x=decay_toward_zero(transient_x,camera_tau_ms,delta_ms);
+		transient_y=decay_toward_zero(transient_y,camera_tau_ms,delta_ms);
 		if(std::abs(transient_x)<0.5&&std::abs(transient_y)<0.5)
 			{
 			transient_x=0.0;
@@ -1818,33 +1854,27 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 }
 
 // --- mouse dispatch under a visual offset ------------------------------------------------------
-// While the world is drawn at a visual offset (fort camera glide/rest, or the adventure world
-// slide), DF's mouse->map-tile math still resolves precise_mouse against the snapped grid, so
-// clicks dispatch to the tile under the grid instead of the tile the user sees. The map screens'
-// input (and the engine's hover-highlight stage) run with precise_mouse shifted into the
-// displayed frame, scoped and restored; the interface-grid mouse is untouched.
+// While the world is drawn at a visual offset, DF's mouse->map-tile math still resolves
+// precise_mouse against the snapped grid, so clicks dispatch to the tile under the grid instead
+// of the tile the user sees. The map screens' input (and the engine's hover-highlight stage) run
+// with precise_mouse shifted into the displayed frame, scoped and restored; the interface-grid
+// mouse is untouched.
+//
+// The fort CAMERA is deliberately excluded from this correction (it used to be included). Its
+// glide is now driven purely by window_x/window_y -- DF's own grid-snapped tile camera -- and
+// never by raw mouse pixels (see update_camera), so at rest it is ALWAYS exactly grid-snapped;
+// only a brief, self-decaying transient ever separates render position from grid position. Also
+// correcting the mouse for that same transient fed it straight back into whatever the mouse was
+// doing (DF's own drag-panning reads the mouse too), producing a visible feedback wobble that
+// looked like the glide was overshooting. The adventure world SLIDE does not have this problem --
+// its offset is not derived from window_x/window_y at a grid-snapped rest state the same way --
+// so it keeps the correction.
 bool visual_mouse_shift(int32_t &shift_px_x,int32_t &shift_px_y)
 {
-	if(gps==nullptr)return false;
-	// Never correct the mouse while the middle button is held: DF's native drag reads the
-	// mouse too, and feeding it shifted coordinates while our pixel-drag moves the offset
-	// creates a feedback loop -- the camera visibly jitters under the drag.
-	if(enabler!=nullptr&&enabler->mouse_mbut)return false;
-	const int32_t zoom=gps->viewport_zoom_factor;
-	const double tile=double(zoom==128?32:std::max(1,zoom*32/128));
-	if(camera_enabled&&!adventure_mode())
-		{
-		shift_px_x=int32_t(std::lround(transient_x+rest_x*tile));
-		shift_px_y=int32_t(std::lround(transient_y+rest_y*tile));
-		}
-	else if(slide_active)
-		{
-		const uint32_t now_ms=Core::getInstance().p->getTickCount();
-		shift_px_x=int32_t(std::lround(slide_offset_now(now_ms,slide_from_x)));
-		shift_px_y=int32_t(std::lround(slide_offset_now(now_ms,slide_from_y)));
-		}
-	else
-		return false;
+	if(gps==nullptr||!slide_active)return false;
+	const uint32_t now_ms=Core::getInstance().p->getTickCount();
+	shift_px_x=int32_t(std::lround(slide_offset_now(now_ms,slide_from_x)));
+	shift_px_y=int32_t(std::lround(slide_offset_now(now_ms,slide_from_y)));
 	return shift_px_x!=0||shift_px_y!=0;
 }
 
