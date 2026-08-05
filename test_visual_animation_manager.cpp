@@ -68,19 +68,6 @@ int main()
 	rollover.begin_frame(std::numeric_limits<uint32_t>::max()-5);
 	rollover.begin_frame(3);
 	assert(rollover.get_frame_delta_ms()==9);
-	assert(select_tile_transition(10,9,20,19).layer==
-		tile_transition_layer::building_one);
-	assert(select_tile_transition(10,9,20,19).previous_texpos==19);
-	assert(select_tile_transition(10,9,20,19).current_texpos==20);
-	const auto mined=select_tile_transition(10,9,0,20);
-	assert(mined.layer==tile_transition_layer::building_one);
-	assert(mined.previous_texpos==20&&mined.current_texpos==0);
-	const auto dug=select_tile_transition(0,10,0,0);
-	assert(dug.layer==tile_transition_layer::background);
-	assert(dug.previous_texpos==10&&dug.current_texpos==0);
-	assert(select_tile_transition(10,10,20,20).layer==
-		tile_transition_layer::none);
-
 	// Facing rule: only a horizontal component changes facing.
 	assert(facing_after_move(1,visual_facingst::west)==visual_facingst::east);
 	assert(facing_after_move(-1,visual_facingst::east)==visual_facingst::west);

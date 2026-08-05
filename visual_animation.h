@@ -156,41 +156,6 @@ struct visual_movement_renderst
 	bool inherited=false;
 };
 
-enum class tile_transition_layer : uint8_t
-{
-	none,
-	background,
-	building_one
-};
-
-struct tile_transition_candidatest
-{
-	tile_transition_layer layer=tile_transition_layer::none;
-	int32_t previous_texpos=0;
-	int32_t current_texpos=0;
-};
-
-inline tile_transition_candidatest select_tile_transition(
-	int32_t current_background,
-	int32_t previous_background,
-	int32_t current_building_one,
-	int32_t previous_building_one)
-{
-	if(current_building_one!=previous_building_one)
-		return {
-			tile_transition_layer::building_one,
-			previous_building_one,
-			current_building_one
-			};
-	if(current_background!=previous_background)
-		return {
-			tile_transition_layer::background,
-			previous_background,
-			current_background
-			};
-	return {};
-}
-
 inline float animation_progress(
 	uint32_t now_ms,
 	uint32_t start_time_ms,
