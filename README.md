@@ -9,7 +9,7 @@ ticks, saves, or gameplay state.
 
 ## Compatibility
 
-v0.3.0 requires DFHack 53.15-r3 or newer and the SDL 2D renderer. DFHack C++
+v0.3.0 requires DFHack 53.16-r1 or newer and the SDL 2D renderer. DFHack C++
 plugins are ABI-specific, so rebuild the plugin whenever the DFHack or Dwarf
 Fortress version changes.
 
