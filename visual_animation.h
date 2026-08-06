@@ -167,41 +167,6 @@ struct visual_movement_renderst
 	bool inherited=false;
 };
 
-enum class tile_transition_layer : uint8_t
-{
-	none,
-	background,
-	building_one
-};
-
-struct tile_transition_candidatest
-{
-	tile_transition_layer layer=tile_transition_layer::none;
-	int32_t previous_texpos=0;
-	int32_t current_texpos=0;
-};
-
-inline tile_transition_candidatest select_tile_transition(
-	int32_t current_background,
-	int32_t previous_background,
-	int32_t current_building_one,
-	int32_t previous_building_one)
-{
-	if(current_building_one!=previous_building_one)
-		return {
-			tile_transition_layer::building_one,
-			previous_building_one,
-			current_building_one
-			};
-	if(current_background!=previous_background)
-		return {
-			tile_transition_layer::background,
-			previous_background,
-			current_background
-			};
-	return {};
-}
-
 inline float animation_progress(
 	uint32_t now_ms,
 	uint32_t start_time_ms,
@@ -287,8 +252,8 @@ class visual_animation_managerst
 			                         // masked/phantom scrolls that never diffed
 			int32_t last_pending_dx=0;
 			int32_t last_pending_dy=0;
-			int32_t last_shift_x=0;  // scroll landed THIS synchronize call (drives the
-			int32_t last_shift_y=0;  // renderer's world-tile slide)
+			int32_t last_shift_x=0;  // scroll landed on the last synchronize call of the
+			int32_t last_shift_y=0;  // frame -- diagnostic only, see get_last_shift
 		};
 		statisticst stats;
 
@@ -314,6 +279,12 @@ class visual_animation_managerst
 		bool seen=false;
 		std::vector<movementst> movements;
 		std::vector<pinnedst> pinned;
+		// The scroll that landed in THIS viewport's buffers on the current synchronize call.
+		// Per-viewport rather than global: lower z-level viewports are synchronized too, and
+		// the renderer's glide compensation must read the main viewport's landing specifically,
+		// not whichever viewport happened to be synchronized last.
+		int32_t last_shift_x=0;
+		int32_t last_shift_y=0;
 		// One facing per tile, not per unit: the viewport exposes one creature texpos per tile.
 		std::vector<int8_t> facing;
 		// Stationary mirrored creatures are repainted every frame; this is the cheap pre-check.
@@ -394,6 +365,21 @@ class visual_animation_managerst
 				{
 				hash=(hash^uint64_t(uint32_t(input.current[layer][i])))*fnv_prime;
 				hash=(hash^uint64_t(uint32_t(input.previous[layer][i])))*fnv_prime;
+				}
+			}
+		// The background oracle, when supplied, is world-anchored, and it is what the landing
+		// test actually reads. Sprite layers alone can be byte-identical across a real scroll --
+		// the adventure camera follows the player, so the player rides along unmoved and may be
+		// the only sprite on screen. Fingerprinting the sprites only would report "buffers
+		// unchanged" for precisely the frames a landing needs to be attributed on. Terrain lives
+		// in the same viewport recompute, so this does not make the detector fire any more often
+		// than DF actually redraws.
+		if(input.background!=nullptr&&input.background_old!=nullptr)
+			{
+			for(int32_t i=0;i<tile_count;++i)
+				{
+				hash=(hash^uint64_t(uint32_t(input.background[i])))*fnv_prime;
+				hash=(hash^uint64_t(uint32_t(input.background_old[i])))*fnv_prime;
 				}
 			}
 		return hash;
@@ -542,17 +528,18 @@ class visual_animation_managerst
 				}
 			}
 
-		void synchronize_viewport(const viewport_visual_animation_inputst &input,bool allow_new_movements)
+		void synchronize_viewport(const viewport_visual_animation_inputst &input)
 			{
-			// Cleared up front rather than only on the paths that reach the landing test: the
-			// fortress free camera keys its glide compensation off last_shift, and an early
-			// return that left the PREVIOUS frame's landing standing would have it compensate
-			// the same scroll a second time.
 			stats.last_shift_x=0;
 			stats.last_shift_y=0;
 			if(input.viewport==nullptr)return;
 			viewport_animationst &state=get_viewport(input);
 			state.seen=true;
+			// Cleared up front rather than only on the paths that reach the landing test below:
+			// the renderer keys its glide compensation off this, and an early return that left
+			// the PREVIOUS frame's landing standing would compensate the same scroll twice.
+			state.last_shift_x=0;
+			state.last_shift_y=0;
 
 			if(!input.valid())
 				{
@@ -607,15 +594,14 @@ class visual_animation_managerst
 			state.buffer_signature=signature;
 			state.has_buffer_signature=true;
 
-			if(context_changed||!allow_new_movements)
+			if(context_changed)
 				{
 				// Skips the recompute sweep, so clear has_mirrored here or a stale true survives.
-				// The grid stays: an inactive viewport is not drawn and its facings still hold.
 				state.has_mirrored=false;
 				reset_tracking(state);
 				// window_z, zoom and resize change at input time; the buffers cross later.
 				// This reset covers only the input frame, not the crossing itself.
-				if(view_switched||!allow_new_movements)state.previous_view_stale=true;
+				if(view_switched)state.previous_view_stale=true;
 				return;
 				}
 
@@ -816,6 +802,20 @@ class visual_animation_managerst
 			if(!suppress)
 				{
 				const int32_t tile_count=input.dim_x*input.dim_y;
+				// Sprites pinned THIS frame rode the camera: they held the same SCREEN tile
+				// across the landing, and the renderer draws them without the world slide. The
+				// rebased previous buffer above reframes exactly those as having moved by
+				// -landed_shift, so left alone they would also be detected as a movement --
+				// drawn twice, and animated sliding against the world they are anchored to.
+				std::vector<uint16_t> pinned_this_frame;
+				for(const pinnedst &pin:state.pinned)
+					{
+					if(pin.start_time_ms!=frame_time_ms)continue;
+					if(pinned_this_frame.empty())
+						pinned_this_frame.assign(size_t(tile_count),0);
+					pinned_this_frame[size_t(pin.x)*size_t(input.dim_y)+size_t(pin.y)]|=
+						uint16_t(1U<<static_cast<size_t>(pin.layer));
+					}
 				std::vector<uint8_t> claimed_sources(tile_count);
 				const size_t existing_movement_count=state.movements.size();
 				// A chained movement's source may already have been rewritten this frame.
@@ -845,6 +845,9 @@ class visual_animation_managerst
 							const int32_t target=x*input.dim_y+y;
 							const int32_t texpos=current[target];
 							if(texpos==0)continue;
+							if(!pinned_this_frame.empty()&&
+								(pinned_this_frame[size_t(target)]&
+									uint16_t(1U<<layer))!=0)continue;
 							if(static_cast<viewport_visual_layer>(layer)==
 								viewport_visual_layer::item&&
 								previous_layers[static_cast<size_t>(
@@ -984,8 +987,10 @@ class visual_animation_managerst
 							!visual_layer_matches(pin.layer,current,pin.texpos);
 						}),
 				state.pinned.end());
-			stats.last_shift_x=translated?landed_shift[0]:0;
-			stats.last_shift_y=translated?landed_shift[1]:0;
+			state.last_shift_x=translated?landed_shift[0]:0;
+			state.last_shift_y=translated?landed_shift[1]:0;
+			stats.last_shift_x=state.last_shift_x;
+			stats.last_shift_y=state.last_shift_y;
 			{
 			int32_t pending_sum_x=0,pending_sum_y=0;
 			for(const auto &shift:state.pending)
@@ -1068,6 +1073,17 @@ class visual_animation_managerst
 		bool requires_full_redraw() const
 			{
 			return force_full_redraw;
+			}
+
+		// The scroll that landed in this viewport's buffers this frame, {0,0} if none did.
+		std::array<int32_t,2> get_last_shift(const void *viewport) const
+			{
+			for(const viewport_animationst &state:viewports)
+				{
+				if(state.viewport==viewport)
+					return {state.last_shift_x,state.last_shift_y};
+				}
+			return {0,0};
 			}
 
 		static inline const std::vector<pinnedst> empty_pinned{};

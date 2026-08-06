@@ -1,0 +1,63 @@
+name: Build release
+
+on:
+  push:
+    tags:
+      - '*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Get the latest DFHack release
+        id: dfhack
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "tag=$(gh api repos/DFHack/dfhack/releases/latest --jq .tag_name)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build gcc-11 g++-11 libxml-libxslt-perl zip
+
+      - name: Check out DFHack
+        env:
+          DFHACK_TAG: ${{ steps.dfhack.outputs.tag }}
+        run: git clone --depth 1 --branch "$DFHACK_TAG" --recurse-submodules https://github.com/DFHack/dfhack.git dfhack
+
+      - name: Add the plugin to DFHack
+        run: |
+          mkdir -p dfhack/plugins/external/smooth-movement
+          cp CMakeLists.txt smooth-movement.cpp test_visual_animation_manager.cpp visual_animation.h dfhack/plugins/external/smooth-movement/
+
+      - name: Build Linux plugin
+        run: |
+          cmake -S dfhack -B dfhack/build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_DOCS=OFF
+          cmake --build dfhack/build/linux --target smooth-movement
+
+      - name: Build Windows plugin
+        run: (cd dfhack/build && ./build-win64-from-linux.sh)
+
+      - name: Package plugins
+        env:
+          DFHACK_TAG: ${{ steps.dfhack.outputs.tag }}
+        run: |
+          release_tag="$GITHUB_REF_NAME-dfhack-$DFHACK_TAG"
+          mkdir -p release/linux/hack/plugins release/windows/hack/plugins
+          install -m755 dfhack/build/linux/plugins/external/smooth-movement/smooth-movement.plug.so release/linux/hack/plugins/
+          install -m755 dfhack/build/win64-cross/output/hack/plugins/smooth-movement.plug.dll release/windows/hack/plugins/
+          (cd release/linux && zip -q -r "../smooth-movement-$release_tag-linux-x86_64.zip" hack)
+          (cd release/windows && zip -q -r "../smooth-movement-$release_tag-windows-x86_64.zip" hack)
+          for archive in release/*.zip; do unzip -t "$archive"; done
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --generate-notes --title "$GITHUB_REF_NAME"
+          gh release upload "$GITHUB_REF_NAME" release/*.zip --clobber

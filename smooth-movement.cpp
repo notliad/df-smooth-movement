@@ -6,7 +6,6 @@
 #include "VTableInterpose.h"
 
 #include "modules/DFSDL.h"
-#include "modules/Maps.h"
 
 #include "df/enabler.h"
 #include "df/game_mode.h"
@@ -18,7 +17,6 @@
 #include "df/viewscreen_dungeonmodest.h"
 #include "df/viewscreen_dwarfmodest.h"
 
-#include "TileTypes.h"
 #include "visual_animation.h"
 
 #include <SDL_render.h>
@@ -58,10 +56,6 @@ decltype(&SDL_RenderFillRect) render_fill_rect=nullptr;
 decltype(&SDL_RenderSetClipRect) render_set_clip_rect=nullptr;
 decltype(&SDL_GetRenderDrawColor) get_render_draw_color=nullptr;
 decltype(&SDL_SetRenderDrawColor) set_render_draw_color=nullptr;
-decltype(&SDL_GetTextureAlphaMod) get_texture_alpha_mod=nullptr;
-decltype(&SDL_SetTextureAlphaMod) set_texture_alpha_mod=nullptr;
-decltype(&SDL_GetTextureBlendMode) get_texture_blend_mode=nullptr;
-decltype(&SDL_SetTextureBlendMode) set_texture_blend_mode=nullptr;
 
 visual_animation_managerst animation_manager;
 std::set<std::pair<int32_t,int32_t>> previous_coverage;
@@ -75,7 +69,6 @@ bool has_view_signature=false;
 int32_t previous_pan_x=0;
 int32_t previous_pan_y=0;
 bool has_pan_context=false;
-bool construction_transitions_enabled=false;
 bool flip_enabled=false;
 
 // --- free camera -------------------------------------------------------------------------------
@@ -426,21 +419,23 @@ void attribute_landed(int32_t ax,int32_t ay,double tile)
 //   report, which was misdiagnosed as a since-removed 2-frame hold buffer. A fixed frame delay was
 //   never the fix either: the correct delay is "until the buffers advance", which is not a number.)
 //
-// animation_manager.stats.last_shift_x/y is exactly that landing: the tile shift the manager
+// animation_manager.get_last_shift(vp) is exactly that landing: the tile shift the manager
 // confirmed against buffer content THIS frame, zero on frames nothing landed. It is gated on the
 // buffer fingerprint actually changing, resolves fast scrolls piecewise (the buffers may apply
 // only +1 of a pending +3), handles view crossings, and ages by wall clock -- machinery this
 // function used to duplicate, worse, in a private background_match_ratio search with a fistful of
 // magic frame counts. synchronize_viewport runs earlier in the same frame, so the value is fresh.
 //
-// The world-tile slide already worked this way (see the last_shift_x consumer in the render path);
+// The world-tile slide already worked this way (see the get_last_shift consumer in the render path);
 // the camera was the outlier.
-void update_camera(df::renderer_2d_base *renderer,uint32_t delta_ms)
+void update_camera(
+	df::renderer_2d_base *renderer,
+	uint32_t delta_ms,
+	int32_t shift_x,
+	int32_t shift_y)
 {
 	if(!camera_enabled||adventure_mode())return;   // adventure smoothing = the world slide
 	const double tile=tile_px(renderer);
-	const int32_t shift_x=animation_manager.stats.last_shift_x;
-	const int32_t shift_y=animation_manager.stats.last_shift_y;
 	if(shift_x!=0||shift_y!=0)
 		{
 		if(std::abs(shift_x)>camera_max_glide_tiles||std::abs(shift_y)>camera_max_glide_tiles)
@@ -614,182 +609,11 @@ viewport_visual_animation_inputst animation_input(df::graphic_viewportst *vp)
 		};
 }
 
-struct tile_transitionst
+// The layer buffers are freed and nulled without clearing the active flag.
+bool viewport_readable(df::graphic_viewportst *vp)
 {
-	tile_transition_layer layer;
-	int32_t previous_texpos;
-	int32_t current_texpos;
-	uint32_t start_time_ms;
-};
-
-bool is_tile_construction_or_destruction(
-	df::tiletype previous,
-	df::tiletype current)
-{
-	if(previous==current)return false;
-	if(tileMaterial(previous)==df::tiletype_material::CONSTRUCTION||
-		tileMaterial(current)==df::tiletype_material::CONSTRUCTION)
-		return true;
-	if(!isGroundMaterial(previous)||
-		tileShape(previous)==tileShape(current))return false;
-	return isWallTerrain(previous)||
-		isFloorTerrain(previous)||
-		isRampTerrain(previous)||
-		isStairTerrain(previous);
+	return vp!=nullptr&&vp->flag.bits.active&&animation_input(vp).valid();
 }
-
-class tile_transition_managerst
-{
-	const void *viewport=nullptr;
-	int32_t dim_x=0;
-	int32_t dim_y=0;
-	uint64_t context_revision=0;
-	int32_t pan_x=0;
-	int32_t pan_y=0;
-	bool has_context=false;
-	std::unordered_map<int32_t,tile_transitionst> transitions;
-	std::vector<df::tiletype> previous_tiletypes;
-	std::vector<uint8_t> has_previous_tiletype;
-
-	static constexpr uint32_t transition_duration_ms=120;
-
-	void snapshot_tiletypes(df::graphic_viewportst *vp)
-		{
-		const int32_t tile_count=vp->dim_x*vp->dim_y;
-		previous_tiletypes.resize(tile_count);
-		has_previous_tiletype.assign(tile_count,0);
-		const int32_t map_x=window_x?*window_x:0;
-		const int32_t map_y=window_y?*window_y:0;
-		const int32_t map_z=window_z?*window_z:0;
-		for(int32_t x=0;x<vp->dim_x;++x)
-			{
-			for(int32_t y=0;y<vp->dim_y;++y)
-				{
-				const int32_t index=x*vp->dim_y+y;
-				const df::tiletype *tiletype=
-					Maps::getTileType(map_x+x,map_y+y,map_z);
-				if(tiletype==nullptr)continue;
-				previous_tiletypes[index]=*tiletype;
-				has_previous_tiletype[index]=1;
-				}
-			}
-		}
-
-	public:
-		void clear()
-			{
-			transitions.clear();
-			previous_tiletypes.clear();
-			has_previous_tiletype.clear();
-			has_context=false;
-			}
-
-		void reset()
-			{
-			clear();
-			}
-
-		void synchronize(df::graphic_viewportst *vp,uint32_t now_ms)
-			{
-			const int32_t current_pan_x=window_x?*window_x:0;
-			const int32_t current_pan_y=window_y?*window_y:0;
-			const bool context_changed=!has_context||viewport!=vp||
-				dim_x!=vp->dim_x||dim_y!=vp->dim_y||
-				context_revision!=visual_context_revision||
-				pan_x!=current_pan_x||pan_y!=current_pan_y;
-			viewport=vp;
-			dim_x=vp->dim_x;
-			dim_y=vp->dim_y;
-			context_revision=visual_context_revision;
-			pan_x=current_pan_x;
-			pan_y=current_pan_y;
-			has_context=true;
-			if(context_changed)
-				{
-				transitions.clear();
-				snapshot_tiletypes(vp);
-				return;
-				}
-
-			const int32_t map_x=window_x?*window_x:0;
-			const int32_t map_y=window_y?*window_y:0;
-			const int32_t map_z=window_z?*window_z:0;
-			for(int32_t x=0;x<dim_x;++x)
-				{
-				for(int32_t y=0;y<dim_y;++y)
-					{
-					const int32_t index=x*dim_y+y;
-					const df::tiletype *tiletype=
-						Maps::getTileType(map_x+x,map_y+y,map_z);
-					const bool gameplay_change=tiletype!=nullptr&&
-						has_previous_tiletype[index]&&
-						is_tile_construction_or_destruction(
-							previous_tiletypes[index],*tiletype);
-					if(tiletype!=nullptr)
-						{
-						previous_tiletypes[index]=*tiletype;
-						has_previous_tiletype[index]=1;
-						}
-					else
-						has_previous_tiletype[index]=0;
-					if(!gameplay_change)continue;
-					const auto candidate=select_tile_transition(
-						vp->screentexpos_background[index],
-						vp->screentexpos_background_old[index],
-						vp->screentexpos_building_one[index],
-						vp->screentexpos_building_one_old[index]);
-					if(candidate.layer!=tile_transition_layer::none)
-						{
-						const auto existing=transitions.find(index);
-						if(existing==transitions.end()||
-							existing->second.layer!=candidate.layer||
-							existing->second.previous_texpos!=candidate.previous_texpos||
-							existing->second.current_texpos!=candidate.current_texpos)
-							{
-							transitions[index]={
-								candidate.layer,
-								candidate.previous_texpos,
-								candidate.current_texpos,
-								now_ms
-								};
-							}
-						}
-					}
-				}
-			for(auto it=transitions.begin();it!=transitions.end();)
-				{
-				if(now_ms-it->second.start_time_ms>=transition_duration_ms)
-					it=transitions.erase(it);
-				else
-					++it;
-				}
-			}
-
-		bool active() const
-			{
-			return !transitions.empty();
-			}
-
-		const tile_transitionst *get(int32_t index) const
-			{
-			const auto found=transitions.find(index);
-			return found==transitions.end()?nullptr:&found->second;
-			}
-
-		float progress(const tile_transitionst &transition,uint32_t now_ms) const
-			{
-			return animation_progress(
-				now_ms,transition.start_time_ms,transition_duration_ms);
-			}
-
-		const std::unordered_map<int32_t,tile_transitionst> &entries() const
-			{
-			return transitions;
-			}
-
-};
-
-tile_transition_managerst tile_transition_manager;
 
 int32_t tile_pixel(int32_t tile,int32_t origin,int32_t zoom)
 {
@@ -804,7 +628,8 @@ bool inside_clip(const df::graphic_viewportst *vp,int32_t x,int32_t y)
 
 bool has_fire(const df::graphic_viewportst *vp,int32_t x,int32_t y)
 {
-	return vp->screentexpos_spatter_flag[x*vp->dim_y+y]&fire_bits;
+	return vp->screentexpos_spatter_flag!=nullptr&&
+		(vp->screentexpos_spatter_flag[x*vp->dim_y+y]&fire_bits)!=0;
 }
 
 template<typename T>
@@ -858,6 +683,22 @@ struct render_proxyst
 	bool mirrored=false;
 	int32_t mirror_shift=0;
 	std::set<std::pair<int32_t,int32_t>> coverage;
+};
+
+using tile_coveragest=std::set<std::pair<int32_t,int32_t>>;
+
+struct render_coveragest
+{
+	tile_coveragest all;
+	std::array<tile_coveragest,static_cast<size_t>(visual_render_groupst::count)> groups;
+	std::unordered_map<int32_t,uint16_t> selected;
+};
+
+struct viewport_renderst
+{
+	df::graphic_viewportst *viewport;
+	std::vector<render_proxyst> proxies;
+	render_coveragest coverage;
 };
 
 constexpr uint16_t visual_layer_bit(viewport_visual_layer layer)
@@ -940,47 +781,100 @@ void with_upper_suppressed(
 		});
 }
 
-template<typename Callback>
-void with_incoming_tile_suppressed(
-	df::graphic_viewportst *vp,
-	int32_t index,
-	const Callback &callback)
+void redraw_viewport_tile(
+	df::renderer_2d_base *renderer,
+	const viewport_renderst &viewport,
+	int32_t x,
+	int32_t y,
+	bool defer_interface)
 {
-	const tile_transitionst *transition=tile_transition_manager.get(index);
-	if(transition==nullptr||transition->current_texpos==0)
+	df::graphic_viewportst *vp=viewport.viewport;
+	const int32_t index=x*vp->dim_y+y;
+	const auto redraw=[&]{renderer->update_viewport_tile(vp,x,y);};
+	const auto stage=[&]
 		{
-		callback();
-		return;
-		}
-	if(transition->layer==tile_transition_layer::background)
-		with_zeroed_values(callback,vp->screentexpos_background[index]);
-	else
-		with_zeroed_values(callback,vp->screentexpos_building_one[index]);
+		with_suppressed_visual_layers(
+			visual_layers(vp),index,
+			selected_mask(viewport.coverage.selected,index),redraw);
+		};
+	// The interface layer is the shading for levels below the camera.
+	// A staged tile has a sprite drawn over it afterwards, so draw_interface_only places it instead.
+	if(!defer_interface||vp->screentexpos_interface==nullptr)stage();
+	else with_zeroed_values(stage,vp->screentexpos_interface[index]);
+}
+
+// Every buffer the interface-only pass zeroes has to exist before it can be zeroed.
+bool interface_pass_readable(const df::graphic_viewportst *vp)
+{
+	return vp!=nullptr&&
+		vp->screentexpos_interface!=nullptr&&
+		vp->screentexpos_background!=nullptr&&
+		vp->screentexpos_floor_flag!=nullptr&&
+		vp->screentexpos_background_two!=nullptr&&
+		vp->screentexpos_liquid_flag!=nullptr&&
+		vp->screentexpos_spatter_flag!=nullptr&&
+		vp->screentexpos_spatter!=nullptr&&
+		vp->screentexpos_ramp_flag!=nullptr&&
+		vp->screentexpos_shadow_flag!=nullptr&&
+		vp->screentexpos_building_one!=nullptr&&
+		vp->screentexpos_vermin!=nullptr&&
+		vp->screentexpos_building_two!=nullptr&&
+		vp->screentexpos_projectile!=nullptr&&
+		vp->screentexpos_high_flow!=nullptr&&
+		vp->screentexpos_signpost!=nullptr;
+}
+
+// Runs after the proxies so the shading covers them rather than sitting underneath.
+void draw_interface_only(
+	df::renderer_2d_base *renderer,
+	df::graphic_viewportst *vp,
+	int32_t x,
+	int32_t y)
+{
+	if(!interface_pass_readable(vp))return;
+	const int32_t index=x*vp->dim_y+y;
+	const auto redraw=[&]{renderer->update_viewport_tile(vp,x,y);};
+	const auto without_visuals=[&]
+		{
+		with_suppressed_visual_layers(
+			visual_layers(vp),
+			index,
+			uint16_t((1U<<visual_layer_count)-1),
+			redraw);
+		};
+	with_zeroed_values(
+		without_visuals,
+		vp->screentexpos_background[index],
+		vp->screentexpos_floor_flag[index],
+		vp->screentexpos_background_two[index],
+		vp->screentexpos_liquid_flag[index],
+		vp->screentexpos_spatter_flag[index],
+		vp->screentexpos_spatter[index],
+		vp->screentexpos_ramp_flag[index],
+		vp->screentexpos_shadow_flag[index],
+		vp->screentexpos_building_one[index],
+		vp->screentexpos_vermin[index],
+		vp->screentexpos_building_two[index],
+		vp->screentexpos_projectile[index],
+		vp->screentexpos_high_flow[index],
+		vp->screentexpos_signpost[index]);
 }
 
 void redraw_world_tile(
 	df::renderer_2d_base *renderer,
-	df::graphic_viewportst *vp,
+	const std::vector<viewport_renderst> &viewports,
+	const tile_coveragest &staged,
 	int32_t x,
-	int32_t y,
-	const std::unordered_map<int32_t,uint16_t> &selected)
+	int32_t y)
 {
-	const int32_t index=x*vp->dim_y+y;
-	const auto redraw=[&]
+	// The stage pass repaints everything above the lowest across the staged tiles, after the proxies.
+	const bool staged_tile=staged.count({x,y})!=0;
+	for(const viewport_renderst &viewport:viewports)
 		{
-		for(int32_t lower=7;lower>=0;--lower)
-			{
-			df::graphic_viewportst *lower_vp=gps->lower_viewport[lower];
-			if(lower_vp!=nullptr&&lower_vp->flag.bits.active)
-				renderer->update_viewport_tile(lower_vp,x,y);
-			}
-		renderer->update_viewport_tile(vp,x,y);
-		};
-	with_incoming_tile_suppressed(vp,index,[&]
-		{
-		with_suppressed_visual_layers(
-			visual_layers(vp),index,selected_mask(selected,index),redraw);
-		});
+		if(inside_clip(viewport.viewport,x,y))
+			redraw_viewport_tile(renderer,viewport,x,y,staged_tile);
+		if(staged_tile)break;
+		}
 }
 
 constexpr uint16_t visual_layers_through_group(visual_render_groupst group)
@@ -1005,11 +899,18 @@ void redraw_above(
 	const auto redraw=[&]{renderer->update_viewport_tile(vp,x,y);};
 	const auto suppress_visuals=[&]
 		{
-		with_suppressed_visual_layers(
-			visual_layers(vp),
-			index,
-			selected_mask(selected,index)|visual_layers_through_group(group),
-			redraw);
+		const auto stage=[&]
+			{
+			with_suppressed_visual_layers(
+				visual_layers(vp),
+				index,
+				selected_mask(selected,index)|visual_layers_through_group(group),
+				redraw);
+			};
+		// The interface layer sits above every group, so each group's redraw would paint it again.
+		// draw_interface_only places it once, after the sprites.
+		if(vp->screentexpos_interface==nullptr)stage();
+		else with_zeroed_values(stage,vp->screentexpos_interface[index]);
 		};
 	if(group==visual_render_groupst::item||group==visual_render_groupst::vehicle)
 		with_base_suppressed(vp,index,suppress_visuals);
@@ -1038,14 +939,6 @@ SDL_Texture *cached_texture(
 		static_cast<SDL_Texture *>(texture->second);
 }
 
-SDL_Texture *cached_tile_texture(
-	df::renderer_2d_base *renderer,
-	int32_t texpos)
-{
-	SDL_Texture *texture=cached_texture(renderer,texpos,false);
-	return texture!=nullptr?texture:cached_texture(renderer,texpos);
-}
-
 // The render_copy_ex_f null check is defensive only, not a graceful-degradation path.
 // `bind` aborts load_sdl on any missing symbol and plugin_enable then refuses the render hook.
 void render_copy_maybe_mirrored(
@@ -1062,29 +955,6 @@ void render_copy_maybe_mirrored(
 		return;
 		}
 	render_copy_f(renderer,texture,nullptr,&destination);
-}
-
-void draw_texture_with_alpha(
-	SDL_Renderer *renderer,
-	SDL_Texture *texture,
-	const SDL_FRect &destination,
-	float opacity,
-	bool mirrored)
-{
-	if(opacity<=0.0f)return;
-	Uint8 saved_alpha=255;
-	SDL_BlendMode saved_blend=SDL_BLENDMODE_NONE;
-	if(get_texture_alpha_mod(texture,&saved_alpha)!=0||
-		get_texture_blend_mode(texture,&saved_blend)!=0)
-		{
-		render_copy_maybe_mirrored(renderer,texture,destination,mirrored);
-		return;
-		}
-	set_texture_blend_mode(texture,SDL_BLENDMODE_BLEND);
-	set_texture_alpha_mod(texture,Uint8(std::lround(saved_alpha*opacity)));
-	render_copy_maybe_mirrored(renderer,texture,destination,mirrored);
-	set_texture_alpha_mod(texture,saved_alpha);
-	set_texture_blend_mode(texture,saved_blend);
 }
 
 void draw_proxy(df::renderer_2d_base *renderer,const render_proxyst &proxy)
@@ -1358,15 +1228,6 @@ std::vector<render_proxyst> collect_proxies(
 	return proxies;
 }
 
-using tile_coveragest=std::set<std::pair<int32_t,int32_t>>;
-
-struct render_coveragest
-{
-	tile_coveragest all;
-	std::array<tile_coveragest,static_cast<size_t>(visual_render_groupst::count)> groups;
-	std::unordered_map<int32_t,uint16_t> selected;
-};
-
 render_coveragest collect_coverage(
 	const std::vector<render_proxyst> &proxies,
 	int32_t dim_y)
@@ -1383,48 +1244,43 @@ render_coveragest collect_coverage(
 	return coverage;
 }
 
-void add_tile_transition_coverage(
-	render_coveragest &coverage,
-	int32_t dim_y)
+std::vector<df::graphic_viewportst *> active_viewports()
 {
-	for(const auto &entry:tile_transition_manager.entries())
-		coverage.all.emplace(entry.first/dim_y,entry.first%dim_y);
+	std::vector<df::graphic_viewportst *> viewports;
+	if(gps==nullptr)return viewports;
+	for(int32_t lower=7;lower>=0;--lower)
+		{
+		df::graphic_viewportst *vp=gps->lower_viewport[lower];
+		if(viewport_readable(vp))viewports.push_back(vp);
+		}
+	if(viewport_readable(gps->main_viewport))
+		viewports.push_back(gps->main_viewport);
+	return viewports;
 }
 
-void draw_tile_transitions(
+std::vector<viewport_renderst> collect_viewport_renders(
 	df::renderer_2d_base *renderer,
-	df::graphic_viewportst *vp)
+	const std::vector<df::graphic_viewportst *> &viewports)
 {
-	SDL_Renderer *sdl_renderer=static_cast<SDL_Renderer *>(renderer->sdl_renderer);
-	const int32_t zoom=renderer->viewport_zoom_factor;
-	const int32_t tile_size=zoom==128?32:std::max(1,zoom*32/128);
-	const uint32_t now_ms=animation_manager.get_frame_time_ms();
-	for(const auto &[index,transition]:tile_transition_manager.entries())
+	std::vector<viewport_renderst> renders;
+	renders.reserve(viewports.size());
+	for(df::graphic_viewportst *vp:viewports)
 		{
-		const int32_t x=index/vp->dim_y;
-		const int32_t y=index%vp->dim_y;
-		if(!inside_clip(vp,x,y))continue;
-		const int32_t target_x=tile_pixel(x,renderer->origin_x,zoom);
-		const int32_t target_y=tile_pixel(y,renderer->origin_y,zoom);
-		const float progress=tile_transition_manager.progress(transition,now_ms);
-		const SDL_FRect destination=
-			{
-			float(target_x),
-			float(target_y),
-			float(tile_size),
-			float(tile_size)
-			};
-		SDL_Texture *previous=cached_tile_texture(renderer,transition.previous_texpos);
-		SDL_Texture *current=cached_tile_texture(renderer,transition.current_texpos);
-		if(previous==nullptr&&current==nullptr)
-			{
-			continue;
-			}
-		if(previous!=nullptr)
-			draw_texture_with_alpha(sdl_renderer,previous,destination,1.0f-progress,false);
-		if(current!=nullptr)
-			draw_texture_with_alpha(sdl_renderer,current,destination,progress,false);
+		viewport_renderst render={vp,collect_proxies(renderer,vp),{}};
+		render.coverage=collect_coverage(render.proxies,vp->dim_y);
+		renders.push_back(std::move(render));
 		}
+	return renders;
+}
+
+tile_coveragest collect_viewport_coverage(
+	const std::vector<viewport_renderst> &viewports)
+{
+	tile_coveragest coverage;
+	for(const viewport_renderst &viewport:viewports)
+		coverage.insert(
+			viewport.coverage.all.begin(),viewport.coverage.all.end());
+	return coverage;
 }
 
 void draw_interpolation_stages(
@@ -1444,31 +1300,68 @@ void draw_interpolation_stages(
 		}
 }
 
+void redraw_viewport_tiles(
+	df::renderer_2d_base *renderer,
+	const viewport_renderst &viewport,
+	const tile_coveragest &coverage)
+{
+	df::graphic_viewportst *vp=viewport.viewport;
+	for(const auto &[x,y]:coverage)
+		{
+		if(!inside_clip(vp,x,y))continue;
+		redraw_viewport_tile(renderer,viewport,x,y,true);
+		}
+}
+
+void draw_viewport_interpolation_stages(
+	df::renderer_2d_base *renderer,
+	const std::vector<viewport_renderst> &viewports,
+	const tile_coveragest &coverage)
+{
+	for(size_t index=0;index<viewports.size();++index)
+		{
+		// A lower z-level's proxy must be covered by the next viewport's fog and terrain.
+		// Reapply that viewport before its own proxies, matching DF's lower-to-main draw order.
+		if(index>0)redraw_viewport_tiles(renderer,viewports[index],coverage);
+		const viewport_renderst &viewport=viewports[index];
+		draw_interpolation_stages(
+			renderer,viewport.viewport,viewport.proxies,viewport.coverage);
+		// A viewport shades everything drawn beneath it, so this covers every staged tile.
+		// Restricting it to the tiles this viewport has sprites on would not deepen with distance.
+		for(const auto &[x,y]:coverage)
+			{
+			if(inside_clip(viewport.viewport,x,y))
+				draw_interface_only(renderer,viewport.viewport,x,y);
+			}
+		}
+}
+
+bool has_mirrored_viewport_facing(
+	const std::vector<df::graphic_viewportst *> &viewports)
+{
+	for(const df::graphic_viewportst *vp:viewports)
+		if(animation_manager.has_mirrored_facing(vp))return true;
+	return false;
+}
+
 void render_interpolated_world(df::renderer_2d_base *renderer)
 {
 	df::graphic_viewportst *vp=gps?gps->main_viewport:nullptr;
+	const std::vector<df::graphic_viewportst *> viewports=active_viewports();
 
 	if(vp!=nullptr)update_visual_context(renderer,vp);
 	const uint32_t now_ms=Core::getInstance().p->getTickCount();
 	animation_manager.begin_frame(now_ms);
-	if(vp!=nullptr)
-		{
-		const auto input=animation_input(vp);
-		animation_manager.synchronize_viewport(
-			input,
-			vp->flag.bits.active);
-		if(vp->flag.bits.active&&construction_transitions_enabled)
-			tile_transition_manager.synchronize(vp,now_ms);
-		else
-			tile_transition_manager.clear();
-		}
-	else
-		tile_transition_manager.clear();
+	for(df::graphic_viewportst *viewport:viewports)
+		animation_manager.synchronize_viewport(animation_input(viewport));
 	animation_manager.end_frame();
 
-	if(vp==nullptr||!vp->flag.bits.active||renderer->sdl_renderer==nullptr)
+	if(!viewport_readable(vp)||renderer->sdl_renderer==nullptr)
 		return;
-	update_camera(renderer,animation_manager.get_frame_delta_ms());
+	// The MAIN viewport's landing, read once: lower z-level viewports are synchronized too, and
+	// everything below is about what the player is looking at.
+	const std::array<int32_t,2> landed=animation_manager.get_last_shift(vp);
+	update_camera(renderer,animation_manager.get_frame_delta_ms(),landed[0],landed[1]);
 	const double cam_tile=tile_px(renderer);
 	const bool camera_active=camera_enabled&&!adventure_mode();
 
@@ -1499,23 +1392,20 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		slide_now_x=0.0;
 		slide_now_y=0.0;
 		}
-	if((animation_manager.stats.last_shift_x!=0||animation_manager.stats.last_shift_y!=0)&&
+	if((landed[0]!=0||landed[1]!=0)&&
 		(slide_enabled||camera_active))
 		{
-		strip_cache_update(
-			vp,
-			animation_manager.stats.last_shift_x,
-			animation_manager.stats.last_shift_y);
+		strip_cache_update(vp,landed[0],landed[1]);
 		if(slide_enabled&&!camera_active&&!dragging&&slide_drag_cooldown==0)
 			{
 			// A scroll landed: the content jumped by -shift tiles on screen. Start (or
 			// retarget from the current fractional offset) a slide back to the grid.
 			const double cap=slide_max_tiles*cam_tile;
 			slide_from_x=std::clamp(
-				slide_now_x+double(animation_manager.stats.last_shift_x)*cam_tile,
+				slide_now_x+double(landed[0])*cam_tile,
 				-cap,cap);
 			slide_from_y=std::clamp(
-				slide_now_y+double(animation_manager.stats.last_shift_y)*cam_tile,
+				slide_now_y+double(landed[1])*cam_tile,
 				-cap,cap);
 			slide_start_ms=now_ms;
 			slide_active=true;
@@ -1546,10 +1436,8 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	// nothing moved on screen at all -- and reports none on the later frame where it really did.
 	// Traces taken against that formula are what sent the paused-jitter hunt chasing drag speed.
 	{
-	const double dvx=-double(animation_manager.stats.last_shift_x)*cam_tile+
-		double(glide_x-prev_glide_x);
-	const double dvy=-double(animation_manager.stats.last_shift_y)*cam_tile+
-		double(glide_y-prev_glide_y);
+	const double dvx=-double(landed[0])*cam_tile+double(glide_x-prev_glide_x);
+	const double dvy=-double(landed[1])*cam_tile+double(glide_y-prev_glide_y);
 	last_jump_x=0.0f;
 	last_jump_y=0.0f;
 	if(has_prev_visual&&prev_visual_revision==visual_context_revision)
@@ -1574,13 +1462,12 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		}
 	if(glide)camera_was_offset=true;
 	if(!glide&&!animation_manager.requires_full_redraw()&&
-		!tile_transition_manager.active()&&
-		(!flip_enabled||!animation_manager.has_mirrored_facing(vp)))
+		(!flip_enabled||!has_mirrored_viewport_facing(viewports)))
 		return;
 
-	std::vector<render_proxyst> proxies=collect_proxies(renderer,vp);
-	render_coveragest coverage=collect_coverage(proxies,vp->dim_y);
-	add_tile_transition_coverage(coverage,vp->dim_y);
+	std::vector<viewport_renderst> viewport_renders=
+		collect_viewport_renders(renderer,viewports);
+	tile_coveragest coverage=collect_viewport_coverage(viewport_renders);
 
 	SDL_Renderer *sdl_renderer=static_cast<SDL_Renderer *>(renderer->sdl_renderer);
 	const int32_t zoom=renderer->viewport_zoom_factor;
@@ -1592,11 +1479,19 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		++stat_glide_frames;
 		// Camera-carried sprites (screen-static across a landing: the adventure player and
 		// its overlays) are masked out of the sliding repaint and drawn pinned afterwards.
+		// The suppression mask is per-viewport now that lower z-levels render too, and pinning
+		// only concerns what the player is looking at, so mask on the main viewport's render.
 		const auto &pinned=camera_active?
 			visual_animation_managerst::empty_pinned:
 			animation_manager.get_pinned(vp);
-		for(const auto &pin:pinned)
-			coverage.selected[pin.x*vp->dim_y+pin.y]|=visual_layer_bit(pin.layer);
+		for(viewport_renderst &render:viewport_renders)
+			{
+			if(render.viewport!=vp)continue;
+			for(const auto &pin:pinned)
+				render.coverage.selected[pin.x*vp->dim_y+pin.y]|=
+					visual_layer_bit(pin.layer);
+			break;
+			}
 		// Camera mid-glide: repaint the WHOLE map rect at the shifted origin so the world (and
 		// the creature proxies, which read origin at draw time) renders between tiles. The engine
 		// already drew this frame at the snapped position; everything here overdraws it, clipped
@@ -1625,7 +1520,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		for(int32_t x=vp->clipx[0];x<=vp->clipx[1];++x)
 			{
 			for(int32_t y=vp->clipy[0];y<=vp->clipy[1];++y)
-				redraw_world_tile(renderer,vp,x,y,coverage.selected);
+				redraw_world_tile(renderer,viewport_renders,coverage,x,y);
 			}
 		// Trailing edge: the band uncovered by the glide has no viewport data any more --
 		// draw it from the outgoing-tile cache so departed world stays visible (the clip
@@ -1651,8 +1546,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 				}
 			}
 		}
-		draw_tile_transitions(renderer,vp);
-		draw_interpolation_stages(renderer,vp,proxies,coverage);
+		draw_viewport_interpolation_stages(renderer,viewport_renders,coverage);
 		renderer->origin_x=saved_origin_x;
 		renderer->origin_y=saved_origin_y;
 		// The pinned sprites render at their true screen tiles, WITHOUT the slide: the
@@ -1690,7 +1584,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		return;
 		}
 
-	std::set<std::pair<int32_t,int32_t>> redraw_coverage=coverage.all;
+	tile_coveragest redraw_coverage=coverage;
 	redraw_coverage.insert(previous_coverage.begin(),previous_coverage.end());
 	Uint8 old_r=0,old_g=0,old_b=0,old_a=255;
 	get_render_draw_color(sdl_renderer,&old_r,&old_g,&old_b,&old_a);
@@ -1711,12 +1605,12 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 
 	for(const auto &[x,y]:redraw_coverage)
 		{
-		if(inside_clip(vp,x,y))redraw_world_tile(renderer,vp,x,y,coverage.selected);
+		if(inside_clip(vp,x,y))
+			redraw_world_tile(renderer,viewport_renders,coverage,x,y);
 		}
-	draw_tile_transitions(renderer,vp);
-	draw_interpolation_stages(renderer,vp,proxies,coverage);
+	draw_viewport_interpolation_stages(renderer,viewport_renders,coverage);
 
-	previous_coverage=std::move(coverage.all);
+	previous_coverage=std::move(coverage);
 }
 
 // --- mouse dispatch under a visual offset ------------------------------------------------------
@@ -1864,8 +1758,10 @@ void record_trace_frame()
 		float(transient_y+rest_y*tile):rec.slide_px_y;
 	rec.rest_x_t=float(rest_x);
 	rec.rest_y_t=float(rest_y);
-	rec.shift_x=animation_manager.stats.last_shift_x;
-	rec.shift_y=animation_manager.stats.last_shift_y;
+	const std::array<int32_t,2> rec_landed=
+		animation_manager.get_last_shift(gps!=nullptr?gps->main_viewport:nullptr);
+	rec.shift_x=rec_landed[0];
+	rec.shift_y=rec_landed[1];
 	rec.flags=uint8_t((enabler!=nullptr&&enabler->mouse_mbut?1:0)|(cam_active?2:0));
 	rec.jump_x=last_jump_x;
 	rec.jump_y=last_jump_y;
@@ -1898,10 +1794,6 @@ void clear_sdl_bindings()
 	render_set_clip_rect=nullptr;
 	get_render_draw_color=nullptr;
 	set_render_draw_color=nullptr;
-	get_texture_alpha_mod=nullptr;
-	set_texture_alpha_mod=nullptr;
-	get_texture_blend_mode=nullptr;
-	set_texture_blend_mode=nullptr;
 }
 
 bool load_sdl(color_ostream &out)
@@ -1921,10 +1813,6 @@ bool load_sdl(color_ostream &out)
 	bind(SDL_RenderSetClipRect,render_set_clip_rect);
 	bind(SDL_GetRenderDrawColor,get_render_draw_color);
 	bind(SDL_SetRenderDrawColor,set_render_draw_color);
-	bind(SDL_GetTextureAlphaMod,get_texture_alpha_mod);
-	bind(SDL_SetTextureAlphaMod,set_texture_alpha_mod);
-	bind(SDL_GetTextureBlendMode,get_texture_blend_mode);
-	bind(SDL_SetTextureBlendMode,set_texture_blend_mode);
 	#undef bind
 	return true;
 }
@@ -1952,7 +1840,6 @@ void reset_state()
 	trace_frames=0;
 	last_sig_diff=0;
 	animation_manager=visual_animation_managerst();
-	tile_transition_manager.reset();
 	previous_coverage.clear();
 	visual_context_revision=0;
 	previous_viewport=nullptr;
@@ -1966,7 +1853,6 @@ void reset_state()
 	rest_y=0.0;
 	camera_enabled=false;
 	camera_was_offset=false;
-	construction_transitions_enabled=false;
 	flip_enabled=false;
 }
 
@@ -1990,8 +1876,6 @@ command_result status_command(
 			slide_offset_now(now_ms,slide_from_x),
 			slide_offset_now(now_ms,slide_from_y));
 		}
-		out.print("construction transitions: {}\n",
-			construction_transitions_enabled?"on":"off");
 		out.print(
 			"stats: movements {} landings {} suppressed {} resets {}\n",
 			animation_manager.stats.movements,
@@ -2107,27 +1991,6 @@ command_result status_command(
 			}
 		out.print("({} of {} frames interesting)\n",printed,have);
 		return CR_OK;
-		}
-	if(parameters[0]=="construction")
-		{
-		if(parameters.size()==1)
-			{
-			out.print("construction transitions: {}\n",
-				construction_transitions_enabled?"on":"off");
-			return CR_OK;
-			}
-		if(parameters.size()==2&&parameters[1]=="on")
-			{
-			construction_transitions_enabled=true;
-			return CR_OK;
-			}
-		if(parameters.size()==2&&parameters[1]=="off")
-			{
-			construction_transitions_enabled=false;
-			tile_transition_manager.clear();
-			return CR_OK;
-			}
-		return CR_WRONG_USAGE;
 		}
 	if(parameters[0]=="camera")
 		{

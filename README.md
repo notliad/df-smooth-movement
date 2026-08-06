@@ -1,153 +1,70 @@
 # DF Smooth Movement
 
-Smooth, render-only creature, hauled-item, and vehicle movement for Dwarf Fortress through DFHack.
+A visual plugin for Dwarf Fortress that makes movement smoother.
 
-The plugin interpolates matching creature, moving-item, and vehicle sprites
-between adjacent tiles. Creature status icons follow the same interpolation as
-their creature. It does not change unit positions, pathfinding, simulation
-ticks, saves, or gameplay state.
+## Features
 
-## Compatibility
+- **Smooth movement:** creatures, hauled items, and vehicles glide between tiles.
+- **Synced icons:** status icons follow their creature while it moves.
+- **Animated carts:** wheelbarrows and minecarts move smoothly too.
+- **Sprites flip** creatures can optionally face the direction they are walking.
+- **Free camera:** the camera can optionally glide and be dragged with the mouse (WIP).
+- **World slide:** in adventure mode the world can glide under the adventurer
+  instead of the adventurer snapping between tiles.
 
-v0.3.0 requires DFHack 53.15-r3 or newer and the SDL 2D renderer. DFHack C++
-plugins are ABI-specific, so rebuild the plugin whenever the DFHack or Dwarf
-Fortress version changes.
+## Installation
 
-## Install
-
-1. Download the release archive for your operating system and exact DFHack
-   version.
-2. Extract it into the DFHack folder for a Steam DFHack installation, or into
-   the Dwarf Fortress folder for a manual DFHack installation. The resulting
-   plugin must be:
+1. Download the release archive for your operating system and DFHack version.
+2. Extract it into the Dwarf Fortress/DFHack folder.
+3. Check that the plugin is in one of these locations:
    - Linux: `hack/plugins/smooth-movement.plug.so`
    - Windows: `hack/plugins/smooth-movement.plug.dll`
-3. Start Dwarf Fortress through DFHack.
-4. Run these commands in the DFHack console:
+4. Start Dwarf Fortress through DFHack and run this in the console:
 
 ```text
 load smooth-movement
 enable smooth-movement
 ```
 
-Check or disable the plugin with:
+## Useful commands
 
 ```text
-smooth-movement
-disable smooth-movement
+smooth-movement             # show plugin status
+disable smooth-movement     # disable the plugin
+smooth-movement flip on     # enable sprites flip
+smooth-movement camera on   # enable the free camera
+smooth-movement slide on    # enable the adventure-mode world slide
 ```
 
-The status command prints the plugin version, whether it is enabled, the free
-camera state, and whether sprite flipping is on.
+## Compatibility
 
-## Build
+Requires DFHack 53.16-r1 or newer and the SDL 2D renderer. Always download the plugin version that matches your DFHack version.
 
-Check out DFHack's `develop` branch and clone this repository under
-`plugins/external/df-smooth-movement`. Add this line to
-`plugins/external/CMakeLists.txt`:
+## Adventure mode
 
-```cmake
-add_subdirectory(df-smooth-movement)
-```
+The camera follows the adventurer, so every step is a map scroll. Instead of
+interpolating the player, the plugin holds it where it is and slides the WORLD
+beneath it with the same 100 ms smoothstep -- a step reads as the map moving
+rather than the character snapping a tile ahead of it. Other creatures still
+animate normally across the scroll. Tiles that leave the viewport mid-slide are
+drawn from a small cache instead of flashing black, and mouse clicks land on the
+tile shown under the cursor while the world is moving.
 
-Configure DFHack normally, then build:
+Off by default -- the offset repaint costs a full extra map render per animated
+frame. Turn it on with `smooth-movement slide on`.
 
-```sh
-cmake --build /path/to/dfhack-build --target smooth-movement
-```
+## Free camera
 
-Windows builds require the MSVC 2022 toolchain used by DFHack. From Linux, the
-official DFHack Docker build environment can cross-compile the plugin with
-`build/build-win64-from-linux.sh`.
+`smooth-movement camera on` unbinds the view from the tile grid. It is
+render-only: the game's own tile camera is never written to.
 
-The plugin uses a vmethod interpose, so its CMake target links to DFHack's Lua
-library as required by the DFHack build system.
-
-The animation manager has a dependency-free test target:
-
-```sh
-cmake --build /path/to/dfhack-build --target smooth-movement-test
-/path/to/dfhack-build/plugins/external/df-smooth-movement/smooth-movement-test
-```
-
-## Behavior
-
-- Movement uses a 100 ms smoothstep interpolation.
-- Adventure mode: the camera follows the player, so every step is a map scroll.
-  Scroll landings are attributed on the background layer, and creatures moving
-  during a scroll animate relative to the world (shift-aware detection). The
-  player is deliberately NOT interpolated: it is screen-static across each
-  landing ("pinned"), and instead the WORLD TILES slide -- the whole map glides
-  to its new position with the same 100 ms smoothstep, moving beneath the
-  pinned player. One-frame window excursions (combat camera flicks) are ridden
-  out without resets, and scrolls that never render as a buffer diff are
-  absorbed instead of poisoning later attribution.
-- Middle-mouse drag panning is direct: the slide sits out while the button is
-  held (and briefly after), so the view tracks the mouse crisply.
-- The slide's trailing edge stays visible: tiles that scroll out of the
-  viewport buffers are kept in a small world-anchored cache (rebuilt from the
-  engine's previous-frame buffers at each landing) and drawn under the
-  uncovered band until the slide lands, instead of flashing black.
-- While the world slides, mouse clicks and the hover highlight dispatch to the
-  tile displayed under the cursor (the map screens' input runs with the pixel
-  mouse shifted into the displayed frame; the interface-grid mouse and UI
-  widgets are unaffected).
-- Creature status icons move with their creature, including while flashing.
-- Item-layer wheelbarrows and vehicle-layer minecarts are interpolated.
-- Camera panning is followed: in-flight interpolations are translated by the
-  scroll delta so sprites track the world, and drop once they scroll off-screen.
-- Zoom, Z-level changes, resize, and viewport changes reset interpolation for one
-  frame.
-
-- Ambiguous movements between identical sprites snap to the destination.
-- Main creature sprites crossing fire snap instead of being replayed over an
-  unsafe layer reconstruction.
-- UI and menus are rendered after interpolated world sprites.
-
-## Directional sprite flipping (off by default)
-
-Creature sprites mirror horizontally to face their direction of travel.
-Dwarf Fortress creature art natively faces west; a creature moving east is
-mirrored, a creature moving west is left alone. Facing is sticky: only
-horizontal movement changes it, so walking north or south, and standing
-still, keep the last horizontal facing. Worn clothing, armour, and weapons
-flip with the creature automatically because Dwarf Fortress composites them
-into a single tile sprite before the plugin sees it. Multi-tile creatures
-mirror as one composite, reflected about their anchor tile. Items, vehicles,
-and designations are never mirrored.
-
-Turn it on with `smooth-movement flip on`; `smooth-movement flip` alone
-prints the current state. Turning it off restores every creature to its
-native orientation immediately and lets the plugin go back to idling rather
-than repainting tiles every frame for a feature that is switched off.
-
-## Free camera (optional, off by default)
-
-`smooth-movement camera on` unbinds the camera from the tile grid — render-only,
-the game's own tile camera (`window_x`/`window_y`) is untouched:
-
-- Map scrolls glide: the view exponentially catches up to the new position
-  (~100 ms) instead of stepping, drawing the world at sub-tile pixel offsets.
-  Jumps larger than 3 tiles (recenter, minimap) snap instantly.
-- Middle-mouse drag panning is native and crisp: the camera stands down while
-  the button is held (a pixel-anchored drag fights DF's own drag stepping and
-  strands the view off-grid), and re-engages for glides on release.
-- `smooth-movement camera <fx> <fy>` sets a persistent sub-tile offset directly
-  (positive = view east/south of the grid, up to ±0.99 tiles);
-  `smooth-movement camera reset` returns to the grid; `smooth-movement camera`
-  prints the state. Setting an offset implies `camera on`.
-- While the view rests off-grid, a sub-tile strip at one screen edge has no
-  viewport data and renders black, and the map rect is repainted every frame.
-  Whole tiles of offset are folded into the game camera automatically so the
-  strip never exceeds half a tile.
-
-Plain `enable smooth-movement` never activates the free camera; the toggle also
-resets to off whenever the plugin is re-enabled.
-
-## Scope
-
-This is a visual renderer plugin. It does not serialize animation state or
-read or modify gameplay units, jobs, movement paths, or saves.
+Map scrolls glide instead of stepping, and `smooth-movement camera <fx> <fy>`
+parks the view at a persistent sub-tile offset (positive = east/south, up to
+±0.99 tiles); `smooth-movement camera reset` returns to the grid. While the view
+rests off-grid a sub-tile strip at one screen edge has no viewport data and
+renders black. Middle-mouse drag panning is native: the glide compensates each
+scroll on the frame its content lands in the render buffers, so it neither
+fights DF's own drag stepping nor strands the view off-grid on release.
 
 ## License
 
