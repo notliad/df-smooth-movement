@@ -41,7 +41,7 @@ REQUIRE_GLOBAL(window_z);
 
 namespace {
 
-constexpr const char *plugin_version="0.3.0";
+constexpr const char *plugin_version="0.4.2";
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -64,6 +64,9 @@ int32_t previous_pan_x=0;
 int32_t previous_pan_y=0;
 bool has_pan_context=false;
 bool flip_enabled=false;
+bool lower_z_levels_enabled=false;
+bool previous_middle_mouse=false;
+bool has_middle_mouse=false;
 
 // --- free camera -------------------------------------------------------------------------------
 // The camera is visually unbound from the tile grid. Two layered offsets:
@@ -473,7 +476,9 @@ auto visual_layers(Viewport *vp,bool previous=false)
 	return layers;
 }
 
-viewport_visual_animation_inputst animation_input(df::graphic_viewportst *vp)
+viewport_visual_animation_inputst animation_input(
+	df::graphic_viewportst *vp,
+	bool pan_finished=false)
 {
 	const df::graphic_viewportst *const_viewport=vp;
 	return {
@@ -484,7 +489,8 @@ viewport_visual_animation_inputst animation_input(df::graphic_viewportst *vp)
 		visual_layers(const_viewport),
 		visual_layers(const_viewport,true),
 		window_x?*window_x:0,
-		window_y?*window_y:0
+		window_y?*window_y:0,
+		pan_finished
 		};
 }
 
@@ -1127,11 +1133,12 @@ std::vector<df::graphic_viewportst *> active_viewports()
 {
 	std::vector<df::graphic_viewportst *> viewports;
 	if(gps==nullptr)return viewports;
-	for(int32_t lower=7;lower>=0;--lower)
-		{
-		df::graphic_viewportst *vp=gps->lower_viewport[lower];
-		if(viewport_readable(vp))viewports.push_back(vp);
-		}
+	if(lower_z_levels_enabled)
+		for(int32_t lower=7;lower>=0;--lower)
+			{
+			df::graphic_viewportst *vp=gps->lower_viewport[lower];
+			if(viewport_readable(vp))viewports.push_back(vp);
+			}
 	if(viewport_readable(gps->main_viewport))
 		viewports.push_back(gps->main_viewport);
 	return viewports;
@@ -1227,12 +1234,16 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 {
 	df::graphic_viewportst *vp=gps?gps->main_viewport:nullptr;
 	const std::vector<df::graphic_viewportst *> viewports=active_viewports();
+	const bool middle_mouse=enabler!=nullptr&&enabler->mouse_mbut;
+	const bool pan_finished=has_middle_mouse&&previous_middle_mouse&&!middle_mouse;
+	previous_middle_mouse=middle_mouse;
+	has_middle_mouse=true;
 
 	if(vp!=nullptr)update_visual_context(renderer,vp);
 	const uint32_t now_ms=Core::getInstance().p->getTickCount();
 	animation_manager.begin_frame(now_ms);
 	for(df::graphic_viewportst *viewport:viewports)
-		animation_manager.synchronize_viewport(animation_input(viewport));
+		animation_manager.synchronize_viewport(animation_input(viewport,pan_finished));
 	animation_manager.end_frame();
 
 	if(!viewport_readable(vp)||renderer->sdl_renderer==nullptr)
@@ -1396,6 +1407,9 @@ void reset_state()
 	camera_has_prev=false;
 	camera_was_offset=false;
 	flip_enabled=false;
+	lower_z_levels_enabled=false;
+	previous_middle_mouse=false;
+	has_middle_mouse=false;
 }
 
 command_result status_command(
@@ -1412,6 +1426,8 @@ command_result status_command(
 			camera_enabled?"on":"off",-rest_x,-rest_y);
 		out.print("sprite flipping: {}\n",
 			flip_enabled?"on":"off");
+		out.print("lower z-level animation: {}\n",
+			lower_z_levels_enabled?"on":"off");
 		return CR_OK;
 		}
 	if(parameters[0]=="camera")
@@ -1491,6 +1507,24 @@ command_result status_command(
 			}
 		return CR_WRONG_USAGE;
 		}
+	if(parameters[0]=="zlevels")
+		{
+		if(parameters.size()==1)
+			{
+			out.print("lower z-level animation: {}\n",
+				lower_z_levels_enabled?"on":"off");
+			return CR_OK;
+			}
+		if(parameters.size()==2&&
+			(parameters[1]=="on"||parameters[1]=="off"))
+			{
+			lower_z_levels_enabled=parameters[1]=="on";
+			if(gps!=nullptr)++gps->force_full_display_count;
+			out.print("smooth-movement: lower z-level animation {}\n",parameters[1]);
+			return CR_OK;
+			}
+		return CR_WRONG_USAGE;
+		}
 	return CR_WRONG_USAGE;
 }
 
@@ -1502,7 +1536,7 @@ plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 	commands.emplace_back(
 		"smooth-movement",
 		"Smooth movement status; free camera: camera on|off|reset|<fx> <fy>; "
-		"sprite flipping: flip on|off.",
+		"sprite flipping: flip on|off; lower z-levels: zlevels on|off.",
 		status_command);
 	return CR_OK;
 }

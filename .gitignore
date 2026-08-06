@@ -4,3 +4,4 @@ dist/
 
 # internal script
 /build-install.sh
+/build-upload.sh
