@@ -44,7 +44,7 @@ void run_frame(
 	uint32_t now_ms)
 {
 	manager.begin_frame(now_ms);
-	manager.synchronize_viewport(input,true);
+	manager.synchronize_viewport(input);
 	manager.end_frame();
 }
 
@@ -193,14 +193,14 @@ int main()
 	set_layer(lower_input,viewport_visual_layer::center,before,empty);
 	set_layer(main_input,viewport_visual_layer::center,before,empty);
 	z_levels.begin_frame(1000);
-	z_levels.synchronize_viewport(lower_input,true);
-	z_levels.synchronize_viewport(main_input,true);
+	z_levels.synchronize_viewport(lower_input);
+	z_levels.synchronize_viewport(main_input);
 	z_levels.end_frame();
 	set_layer(lower_input,viewport_visual_layer::center,west_after,before);
 	set_layer(main_input,viewport_visual_layer::center,west_after,before);
 	z_levels.begin_frame(1016);
-	z_levels.synchronize_viewport(lower_input,true);
-	z_levels.synchronize_viewport(main_input,true);
+	z_levels.synchronize_viewport(lower_input);
+	z_levels.synchronize_viewport(main_input);
 	z_levels.end_frame();
 	assert(z_levels.get_movement(
 		lower_viewport,viewport_visual_layer::center,1,2).active);
