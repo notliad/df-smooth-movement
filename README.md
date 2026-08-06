@@ -28,7 +28,6 @@ enable smooth-movement
 
 ```text
 smooth-movement             # show plugin status
-enable smooth-movement      # enable the plugin
 disable smooth-movement     # disable the plugin
 smooth-movement flip on     # enable sprites flip
 smooth-movement camera on   # enable the free camera
