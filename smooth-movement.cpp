@@ -664,14 +664,79 @@ void redraw_viewport_tile(
 	df::renderer_2d_base *renderer,
 	const viewport_renderst &viewport,
 	int32_t x,
-	int32_t y)
+	int32_t y,
+	bool defer_interface)
 {
 	df::graphic_viewportst *vp=viewport.viewport;
 	const int32_t index=x*vp->dim_y+y;
 	const auto redraw=[&]{renderer->update_viewport_tile(vp,x,y);};
-	with_suppressed_visual_layers(
-		visual_layers(vp),index,
-		selected_mask(viewport.coverage.selected,index),redraw);
+	const auto stage=[&]
+		{
+		with_suppressed_visual_layers(
+			visual_layers(vp),index,
+			selected_mask(viewport.coverage.selected,index),redraw);
+		};
+	// The interface layer is the shading for levels below the camera.
+	// A staged tile has a sprite drawn over it afterwards, so draw_interface_only places it instead.
+	if(!defer_interface||vp->screentexpos_interface==nullptr)stage();
+	else with_zeroed_values(stage,vp->screentexpos_interface[index]);
+}
+
+// Every buffer the interface-only pass zeroes has to exist before it can be zeroed.
+bool interface_pass_readable(const df::graphic_viewportst *vp)
+{
+	return vp!=nullptr&&
+		vp->screentexpos_interface!=nullptr&&
+		vp->screentexpos_background!=nullptr&&
+		vp->screentexpos_floor_flag!=nullptr&&
+		vp->screentexpos_background_two!=nullptr&&
+		vp->screentexpos_liquid_flag!=nullptr&&
+		vp->screentexpos_spatter_flag!=nullptr&&
+		vp->screentexpos_spatter!=nullptr&&
+		vp->screentexpos_ramp_flag!=nullptr&&
+		vp->screentexpos_shadow_flag!=nullptr&&
+		vp->screentexpos_building_one!=nullptr&&
+		vp->screentexpos_vermin!=nullptr&&
+		vp->screentexpos_building_two!=nullptr&&
+		vp->screentexpos_projectile!=nullptr&&
+		vp->screentexpos_high_flow!=nullptr&&
+		vp->screentexpos_signpost!=nullptr;
+}
+
+// Runs after the proxies so the shading covers them rather than sitting underneath.
+void draw_interface_only(
+	df::renderer_2d_base *renderer,
+	df::graphic_viewportst *vp,
+	int32_t x,
+	int32_t y)
+{
+	if(!interface_pass_readable(vp))return;
+	const int32_t index=x*vp->dim_y+y;
+	const auto redraw=[&]{renderer->update_viewport_tile(vp,x,y);};
+	const auto without_visuals=[&]
+		{
+		with_suppressed_visual_layers(
+			visual_layers(vp),
+			index,
+			uint16_t((1U<<visual_layer_count)-1),
+			redraw);
+		};
+	with_zeroed_values(
+		without_visuals,
+		vp->screentexpos_background[index],
+		vp->screentexpos_floor_flag[index],
+		vp->screentexpos_background_two[index],
+		vp->screentexpos_liquid_flag[index],
+		vp->screentexpos_spatter_flag[index],
+		vp->screentexpos_spatter[index],
+		vp->screentexpos_ramp_flag[index],
+		vp->screentexpos_shadow_flag[index],
+		vp->screentexpos_building_one[index],
+		vp->screentexpos_vermin[index],
+		vp->screentexpos_building_two[index],
+		vp->screentexpos_projectile[index],
+		vp->screentexpos_high_flow[index],
+		vp->screentexpos_signpost[index]);
 }
 
 void redraw_world_tile(
@@ -686,7 +751,7 @@ void redraw_world_tile(
 	for(const viewport_renderst &viewport:viewports)
 		{
 		if(inside_clip(viewport.viewport,x,y))
-			redraw_viewport_tile(renderer,viewport,x,y);
+			redraw_viewport_tile(renderer,viewport,x,y,staged_tile);
 		if(staged_tile)break;
 		}
 }
@@ -713,11 +778,18 @@ void redraw_above(
 	const auto redraw=[&]{renderer->update_viewport_tile(vp,x,y);};
 	const auto suppress_visuals=[&]
 		{
-		with_suppressed_visual_layers(
-			visual_layers(vp),
-			index,
-			selected_mask(selected,index)|visual_layers_through_group(group),
-			redraw);
+		const auto stage=[&]
+			{
+			with_suppressed_visual_layers(
+				visual_layers(vp),
+				index,
+				selected_mask(selected,index)|visual_layers_through_group(group),
+				redraw);
+			};
+		// The interface layer sits above every group, so each group's redraw would paint it again.
+		// draw_interface_only places it once, after the sprites.
+		if(vp->screentexpos_interface==nullptr)stage();
+		else with_zeroed_values(stage,vp->screentexpos_interface[index]);
 		};
 	if(group==visual_render_groupst::item||group==visual_render_groupst::vehicle)
 		with_base_suppressed(vp,index,suppress_visuals);
@@ -1116,7 +1188,7 @@ void redraw_viewport_tiles(
 	for(const auto &[x,y]:coverage)
 		{
 		if(!inside_clip(vp,x,y))continue;
-		redraw_viewport_tile(renderer,viewport,x,y);
+		redraw_viewport_tile(renderer,viewport,x,y,true);
 		}
 }
 
@@ -1133,6 +1205,13 @@ void draw_viewport_interpolation_stages(
 		const viewport_renderst &viewport=viewports[index];
 		draw_interpolation_stages(
 			renderer,viewport.viewport,viewport.proxies,viewport.coverage);
+		// A viewport shades everything drawn beneath it, so this covers every staged tile.
+		// Restricting it to the tiles this viewport has sprites on would not deepen with distance.
+		for(const auto &[x,y]:coverage)
+			{
+			if(inside_clip(viewport.viewport,x,y))
+				draw_interface_only(renderer,viewport.viewport,x,y);
+			}
 		}
 }
 
