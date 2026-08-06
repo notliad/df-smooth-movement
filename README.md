@@ -9,7 +9,7 @@ ticks, saves, or gameplay state.
 
 ## Compatibility
 
-v0.3.0 requires DFHack 53.15-r3 or newer and the SDL 2D renderer. DFHack C++
+v0.3.0 requires DFHack 53.16-r1 or newer and the SDL 2D renderer. DFHack C++
 plugins are ABI-specific, so rebuild the plugin whenever the DFHack or Dwarf
 Fortress version changes.
 
@@ -74,6 +74,7 @@ cmake --build /path/to/dfhack-build --target smooth-movement-test
 
 - Movement uses a 100 ms smoothstep interpolation.
 - Creature status icons move with their creature, including while flashing.
+- Creatures visible above or below the camera z-level animate in their own render layer.
 - Item-layer wheelbarrows and vehicle-layer minecarts are interpolated.
 - Camera panning is followed: in-flight interpolations are translated by the
   scroll delta so sprites track the world, and drop once they scroll off-screen.
