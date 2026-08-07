@@ -562,9 +562,19 @@ class visual_animation_managerst
 				{
 				if(state.pending.size()>=max_pending_shifts)
 					{
-					// Same give-up as the other two sites: the owed shifts are unknowable now.
-					abandon_pending(state);
-					reset_facing(state);
+					// The queue is bounded, but its TOTAL is a debt: every tile queued here
+					// eventually moves the world on screen, and a consumer that compensates
+					// scrolls (the fortress free camera) needs it attributed or that motion
+					// happens with nothing cancelling it -- a visible jump. Discarding the
+					// queue here was measured doing exactly that: every unaccounted shift in
+					// a drag capture came from this site, during stretches where the window
+					// kept stepping while the buffers had not recomputed for eight frames.
+					// Coalesce the two oldest instead. Granularity is what the bound has to
+					// cost; the debt is not. The pair can no longer land separately, only
+					// together, which at worst delays one attribution.
+					state.pending[1][0]+=state.pending[0][0];
+					state.pending[1][1]+=state.pending[0][1];
+					state.pending.erase(state.pending.begin());
 					}
 				state.pending.push_back(
 					{input.pan_x-state.pan_x,input.pan_y-state.pan_y});
@@ -1073,6 +1083,18 @@ class visual_animation_managerst
 		bool requires_full_redraw() const
 			{
 			return force_full_redraw;
+			}
+
+		// Scrolls queued but not yet observed in this viewport's buffers. Zero means the
+		// manager believes it owes nothing, which is the point the renderer's shift accounting
+		// must balance: anything unattributed at that moment moved on screen uncompensated.
+		size_t get_pending_count(const void *viewport) const
+			{
+			for(const viewport_animationst &state:viewports)
+				{
+				if(state.viewport==viewport)return state.pending.size();
+				}
+			return 0;
 			}
 
 		// The scroll that landed in this viewport's buffers this frame, {0,0} if none did.

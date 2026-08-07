@@ -95,15 +95,31 @@ constexpr int32_t camera_max_glide_tiles=3;   // snap threshold, in tiles of a s
 constexpr double camera_tau_ms=90.0;          // transient catch-up (~95% done after ~270ms) --
                                               // double the prior 180 (halving tau doubles the
                                               // catch-up rate for exponential decay)
-constexpr double camera_glide_clamp_tiles=16.0;   // safety cap on outstanding glide debt. Generous
-                                              // on purpose: a fast drag can rack up several tiles of
-                                              // debt before it decays, and clamping that down to a
-                                              // small cap mid-glide is a discontinuous SNAP, not a
-                                              // lerp -- it was the actual source of the visible
-                                              // "over-correction" under fast dragging, not the decay
-                                              // itself (exponential decay cannot overshoot by
-                                              // construction). This is a backstop for a genuinely
-                                              // runaway state, not a normal operating limit.
+constexpr double camera_glide_clamp_tiles=1.0;    // cap on outstanding glide debt, in tiles.
+                                              // The glide exists to hide the one-tile content jump
+                                              // a landing makes, so a debt beyond about a tile is
+                                              // not smoothing -- it is the view sitting that far
+                                              // behind where the buffers actually are.
+                                              //
+                                              // Under SUSTAINED scrolling (a held drag lands a tile
+                                              // most frames) compensate-then-decay has a nonzero
+                                              // steady state: debt grows by a tile per landing and
+                                              // decay removes only a fraction of it, settling where
+                                              // the two balance. At tau=90ms and ~60fps that is
+                                              // ~17% per frame, so a tile per frame settles near
+                                              // SIX tiles -- measured live, 2026-08: glide ran to
+                                              // -100..-230px through every sustained drag, the view
+                                              // trailing the cursor and lurching back on release.
+                                              // That is what "the map jumps around randomly" was.
+                                              //
+                                              // Capping at one tile bounds the lag to one tile
+                                              // without touching the case the glide is for: a
+                                              // single landing is one tile, so an isolated scroll
+                                              // never reaches the cap and animates exactly as
+                                              // before. Only stacked landings clip, and clipping
+                                              // them is the point. (A previous 16-tile value was
+                                              // chosen when attribution ran off window_x deltas and
+                                              // the debt it bounded was largely fictitious.)
 double transient_x=0.0;                       // decaying glide offset, pixels
 double transient_y=0.0;
 double rest_x=0.0;                            // persistent free-camera offset, tiles
@@ -142,6 +158,19 @@ uint64_t stat_mouse_shifts=0;   // input dispatches corrected for the visual off
 uint64_t stat_visual_jumps=0;   // frames the drawn world moved > 0.6 tile at once
 int32_t prev_glide_x=0;         // last frame's drawn glide offset, for the continuity check
 int32_t prev_glide_y=0;
+// Shift accounting. Every tile window_x/window_y moves must eventually come back as an
+// attributed landing; the glide compensates landings, so a landing the manager never attributes
+// is content that moved on screen with nothing cancelling it -- a visible jump the continuity
+// check above CANNOT see (it measures glide against the attributed shift, so an unattributed one
+// reads as zero on both sides). owed tracks window movement minus attributed landings; whenever
+// the manager says it has nothing left pending, owed must be zero or shifts were dropped.
+int32_t owed_x=0;
+int32_t owed_y=0;
+int32_t diag_prev_wx=0;
+int32_t diag_prev_wy=0;
+uint64_t stat_lost_shifts=0;    // times the accounting failed to balance
+int32_t last_lost_x=0;          // the imbalance, for the trace
+int32_t last_lost_y=0;
 bool has_prev_visual=false;
 uint64_t prev_visual_revision=0;
 float last_jump_x=0.0f;
@@ -169,10 +198,12 @@ struct trace_framest
 	float glide_px_x,glide_px_y;   // the offset actually rendered (camera or slide)
 	float rest_x_t,rest_y_t;       // camera rest, tiles
 	int32_t shift_x,shift_y;       // scroll landed in the buffers this frame (drives the camera)
+	int32_t lost_x,lost_y;         // window movement that never came back as a landing
 	uint8_t flags;                 // 1=dragging 2=camera_active
 	float jump_x,jump_y;
 };
-constexpr size_t trace_capacity=2700;
+constexpr size_t trace_capacity=20000;   // ~5 min at 60fps: an intermittent fault has to be
+                                         // readable well after it happens, not within 45s.
 std::array<trace_framest,trace_capacity> trace_ring{};
 uint32_t trace_frames=0;
 
@@ -1449,6 +1480,32 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 			last_jump_y=float(dvy);
 			}
 		}
+	// Shift accounting (see owed_x). Same guards as the check above: a context change is a
+	// legitimate desync, not a dropped shift.
+	const int32_t wx_now=window_x?*window_x:0;
+	const int32_t wy_now=window_y?*window_y:0;
+	last_lost_x=0;
+	last_lost_y=0;
+	if(has_prev_visual&&prev_visual_revision==visual_context_revision)
+		{
+		owed_x+=wx_now-diag_prev_wx-landed[0];
+		owed_y+=wy_now-diag_prev_wy-landed[1];
+		if(animation_manager.get_pending_count(vp)==0&&(owed_x!=0||owed_y!=0))
+			{
+			++stat_lost_shifts;
+			last_lost_x=owed_x;
+			last_lost_y=owed_y;
+			owed_x=0;
+			owed_y=0;
+			}
+		}
+	else
+		{
+		owed_x=0;
+		owed_y=0;
+		}
+	diag_prev_wx=wx_now;
+	diag_prev_wy=wy_now;
 	prev_glide_x=glide_x;
 	prev_glide_y=glide_y;
 	prev_visual_revision=visual_context_revision;
@@ -1762,6 +1819,8 @@ void record_trace_frame()
 		animation_manager.get_last_shift(gps!=nullptr?gps->main_viewport:nullptr);
 	rec.shift_x=rec_landed[0];
 	rec.shift_y=rec_landed[1];
+	rec.lost_x=last_lost_x;
+	rec.lost_y=last_lost_y;
 	rec.flags=uint8_t((enabler!=nullptr&&enabler->mouse_mbut?1:0)|(cam_active?2:0));
 	rec.jump_x=last_jump_x;
 	rec.jump_y=last_jump_y;
@@ -1884,6 +1943,8 @@ command_result status_command(
 			animation_manager.stats.resets);
 		out.print("glide frames: {}, shifted input dispatches: {}, visual jumps: {}\n",
 			stat_glide_frames,stat_mouse_shifts,stat_visual_jumps);
+		out.print("lost shifts (window moved, no landing attributed): {}\n",
+			stat_lost_shifts);
 		out.print("strip: draws {} cache-misses {}\n",stat_strip_draws,stat_strip_misses);
 		out.print("glide frame cost: {:.2f} ms avg, {:.2f} ms max\n",
 			glide_ms_ema,glide_ms_max);
@@ -1933,6 +1994,7 @@ command_result status_command(
 			const trace_framest &rec=
 				trace_ring[(trace_frames-have+i)%trace_capacity];
 			bool interesting=rec.jump_x!=0.0f||rec.jump_y!=0.0f||rec.sig_diff!=0||
+				rec.lost_x!=0||rec.lost_y!=0||
 				rec.pending_dx!=0||rec.pending_dy!=0||
 				(rec.flags&1)!=0||
 				rec.shift_x!=0||rec.shift_y!=0||
@@ -1972,6 +2034,9 @@ command_result status_command(
 				if(rec.jump_x!=0.0f||rec.jump_y!=0.0f)
 					jump=" JUMP="+std::to_string(int(rec.jump_x))+","+
 						std::to_string(int(rec.jump_y));
+				if(rec.lost_x!=0||rec.lost_y!=0)
+					jump+=" LOST="+std::to_string(rec.lost_x)+","+
+						std::to_string(rec.lost_y);
 				out.print(
 					"f={} w={},{},{}{}{}{}{}{} pend={},{} land={},{} glide={:.1f},{:.1f}"
 					" rest={:.2f},{:.2f}\n",
