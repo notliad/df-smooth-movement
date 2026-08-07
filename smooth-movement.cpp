@@ -84,32 +84,20 @@ bool flip_enabled=false;
 bool camera_enabled=false;                    // OFF by default: plain `enable smooth-movement`
                                               // keeps upstream behavior (creature interpolation
                                               // only); `smooth-movement camera on` opts in.
-constexpr int32_t camera_max_glide_tiles=10;  // snap threshold, in tiles of a single LANDED
-                                              // scroll: past this the view just steps. Note this
-                                              // counts buffer landings, not frames -- a landing is
-                                              // a real, already-drawn content jump, so the count is
-                                              // frame-rate independent by construction. (An earlier
-                                              // per-FRAME form of this, and a tiles-per-SECOND
-                                              // patch on top of it, were both measuring window_x
-                                              // deltas -- an announcement of intent, not a redraw.)
-                                              //
-                                              // Reserved for genuine teleports (recenter, minimap
-                                              // warp), which is all it was ever meant for. It sat
-                                              // at 3, which ordinary fast scrolling now reaches:
-                                              // landings coalesce when the buffers lag the window,
-                                              // so a quick drag lands several tiles at once and was
-                                              // taking the hard step. Big landings no longer need
-                                              // heading off anyway -- glide_tau_ms decays a large
-                                              // debt proportionally faster, so a ten-tile landing
-                                              // is back under a tile within a few frames instead of
-                                              // chasing the view across the map.
 constexpr double camera_tau_ms=90.0;          // transient catch-up (~95% done after ~270ms) --
                                               // double the prior 180 (halving tau doubles the
                                               // catch-up rate for exponential decay)
 constexpr double camera_glide_knee_tiles=1.0; // debt past this decays proportionally faster --
-                                              // see glide_tau_ms. One landing is one tile, so an
-                                              // isolated scroll sits at or under the knee and eases
-                                              // out at the base tau, unchanged.
+                                              // see glide_tau_ms. Applies ONLY during sustained
+                                              // scrolling (camera_glide_sustained): the knee
+                                              // exists to keep the equilibrium debt low while
+                                              // landings keep arriving, where the fast catch-up
+                                              // blends into the motion already on screen. An
+                                              // ISOLATED landing has no such cover -- the screen
+                                              // is otherwise still, so knee-rate decay reads as a
+                                              // snap -- and multi-tile isolated landings are the
+                                              // NORM while paused, where DF recomputes the
+                                              // buffers lazily and scrolls coalesce.
 constexpr double camera_tau_min_ms=20.0;      // floor on the shortened tau: below this the
                                               // catch-up stops reading as motion and becomes a snap
 constexpr double camera_glide_clamp_tiles=8.0;    // runaway backstop ONLY, not an operating limit.
@@ -123,8 +111,14 @@ constexpr double camera_glide_clamp_tiles=8.0;    // runaway backstop ONLY, not 
                                               // moved quickly). The knee above bounds the debt
                                               // instead, by decaying it faster rather than
                                               // throwing it away.
+constexpr uint32_t camera_sustained_gap_ms=150;  // landings closer together than this are one
+                                              // continuous scroll (a drag lands every frame or
+                                              // two); further apart they are isolated actions
 double transient_x=0.0;                       // decaying glide offset, pixels
 double transient_y=0.0;
+uint32_t camera_last_landing_ms=0;            // when the previous landing was attributed
+bool camera_glide_sustained=false;            // last landing followed another within the gap:
+                                              // the knee (fast catch-up) may engage
 double rest_x=0.0;                            // persistent free-camera offset, tiles
 double rest_y=0.0;                            // (positive = view sits WEST/NORTH of window)
 int32_t self_scroll_x=0;                      // window deltas WE wrote: visual no-ops when landing
@@ -362,6 +356,9 @@ void cancel_camera_transients()
 	transient_y=0.0;
 	self_scroll_x=0;
 	self_scroll_y=0;
+	// The scroll context is gone with the debt; without this a post-cancel landing could decay
+	// one frame at the knee tau off a stale flag before resampling it.
+	camera_glide_sustained=false;
 }
 
 void set_camera_enabled(bool enable)
@@ -420,6 +417,12 @@ double decay_toward_zero(double value,double tau_ms,uint32_t delta_ms)
 double glide_tau_ms(double debt_px,double tile)
 {
 	if(tile<=0.0)return camera_tau_ms;
+	// The knee is an equilibrium tool, not a presentation upgrade: only sustained scrolling has
+	// an equilibrium to bound. For an isolated landing the shortened tau -- floored at 20ms,
+	// about one render frame -- discards more than half the debt per frame, which on an
+	// otherwise-still screen is a visible snap, not a glide. Isolated multi-tile landings are
+	// exactly the paused case (coalesced scrolls, recenters), so they ease out at the base tau.
+	if(!camera_glide_sustained)return camera_tau_ms;
 	const double tiles=std::abs(debt_px)/tile;
 	if(tiles<=camera_glide_knee_tiles)return camera_tau_ms;
 	return std::max(camera_tau_min_ms,camera_tau_ms*camera_glide_knee_tiles/tiles);
@@ -484,31 +487,22 @@ void attribute_landed(int32_t ax,int32_t ay,double tile)
 // the camera was the outlier.
 void update_camera(
 	df::renderer_2d_base *renderer,
+	uint32_t now_ms,
 	uint32_t delta_ms,
 	int32_t shift_x,
 	int32_t shift_y)
 {
 	if(!camera_enabled||adventure_mode())return;   // adventure smoothing = the world slide
 	const double tile=tile_px(renderer);
-	if(shift_x!=0||shift_y!=0)
-		{
-		if(std::abs(shift_x)>camera_max_glide_tiles||std::abs(shift_y)>camera_max_glide_tiles)
-			{
-			// A big landing means the content already jumped that far in one redraw: a recenter,
-			// a minimap warp, or a drag flicked faster than the buffers refresh. Chasing it would
-			// animate the camera flying across the map long after the view arrived, so take the
-			// step and drop the outstanding debt with it.
-			cancel_camera_transients();
-			}
-		else
-			{
-			// The content jumped shift tiles on screen this frame; hold it where it was and let
-			// the decay below carry it the rest of the way. Our own normalization writes are
-			// filtered out inside attribute_landed -- they move into rest, not into the glide.
-			attribute_landed(shift_x,shift_y,tile);
-			}
-		}
 
+	// Decay BEFORE attributing, so the landing frame renders its compensation IN FULL. The
+	// landing frame is the one frame the glide exists for: the content just jumped -shift on
+	// screen and the offset must cancel exactly that. Decaying after attributing leaked
+	// (1-exp(-dt/tau)) of the landing before it was ever drawn once -- ~18% of a tile at the
+	// base tau, and at the knee-shortened tau MOST of it (a five-tile landing rendered barely a
+	// third of its compensation; the missing two-thirds was the paused-scroll jump). The sprite
+	// and world-slide paths already render full compensation on their landing frame (a
+	// smoothstep at t=0 is the whole offset); this makes the camera match them.
 	if(transient_x!=0.0||transient_y!=0.0)
 		{
 		transient_x=decay_toward_zero(
@@ -520,6 +514,31 @@ void update_camera(
 			transient_x=0.0;
 			transient_y=0.0;
 			}
+		}
+
+	// EVERY landing is animated. There is no size above which the glide stands down: a landing
+	// is content that has already moved on screen, so declining to compensate it is not "taking
+	// the step cleanly", it is choosing to show the jump. The old threshold could only ever
+	// convert a smooth catch-up into a visible one, and judging when that trade was worth making
+	// from the landing size alone proved unreliable in play -- it fired on ordinary fast
+	// scrolling, which is exactly when the smoothing matters most.
+	//
+	// Nothing needs the threshold any more. A genuinely huge landing (recenter, minimap warp) is
+	// bounded by camera_glide_clamp_tiles and eased out at the base tau (isolated landings never
+	// engage the knee), a fast quarter-second slide rather than a chase across the map.
+	//
+	// Our own normalization writes are filtered out inside attribute_landed -- they move into
+	// rest, not into the glide.
+	if(shift_x!=0||shift_y!=0)
+		{
+		attribute_landed(shift_x,shift_y,tile);
+		// Landings arriving back-to-back are one continuous scroll: the knee may engage to keep
+		// the trailing debt bounded (see glide_tau_ms). The flag is sampled here, on landings
+		// only, so the decay of an isolated landing stays at the base tau for its whole tail --
+		// it cannot speed up mid-glide.
+		camera_glide_sustained=
+			now_ms-camera_last_landing_ms<=camera_sustained_gap_ms;
+		camera_last_landing_ms=now_ms;
 		}
 }
 
@@ -1417,7 +1436,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	// The MAIN viewport's landing, read once: lower z-level viewports are synchronized too, and
 	// everything below is about what the player is looking at.
 	const std::array<int32_t,2> landed=animation_manager.get_last_shift(vp);
-	update_camera(renderer,animation_manager.get_frame_delta_ms(),landed[0],landed[1]);
+	update_camera(renderer,now_ms,animation_manager.get_frame_delta_ms(),landed[0],landed[1]);
 	const double cam_tile=tile_px(renderer);
 	const bool camera_active=camera_enabled&&!adventure_mode();
 
@@ -1937,6 +1956,8 @@ void reset_state()
 	rest_y=0.0;
 	camera_enabled=false;
 	camera_was_offset=false;
+	camera_last_landing_ms=0;
+	camera_glide_sustained=false;
 	flip_enabled=false;
 }
 
