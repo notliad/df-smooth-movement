@@ -84,7 +84,7 @@ bool flip_enabled=false;
 bool camera_enabled=false;                    // OFF by default: plain `enable smooth-movement`
                                               // keeps upstream behavior (creature interpolation
                                               // only); `smooth-movement camera on` opts in.
-constexpr int32_t camera_max_glide_tiles=3;   // snap threshold, in tiles of a single LANDED
+constexpr int32_t camera_max_glide_tiles=10;  // snap threshold, in tiles of a single LANDED
                                               // scroll: past this the view just steps. Note this
                                               // counts buffer landings, not frames -- a landing is
                                               // a real, already-drawn content jump, so the count is
@@ -92,34 +92,37 @@ constexpr int32_t camera_max_glide_tiles=3;   // snap threshold, in tiles of a s
                                               // per-FRAME form of this, and a tiles-per-SECOND
                                               // patch on top of it, were both measuring window_x
                                               // deltas -- an announcement of intent, not a redraw.)
+                                              //
+                                              // Reserved for genuine teleports (recenter, minimap
+                                              // warp), which is all it was ever meant for. It sat
+                                              // at 3, which ordinary fast scrolling now reaches:
+                                              // landings coalesce when the buffers lag the window,
+                                              // so a quick drag lands several tiles at once and was
+                                              // taking the hard step. Big landings no longer need
+                                              // heading off anyway -- glide_tau_ms decays a large
+                                              // debt proportionally faster, so a ten-tile landing
+                                              // is back under a tile within a few frames instead of
+                                              // chasing the view across the map.
 constexpr double camera_tau_ms=90.0;          // transient catch-up (~95% done after ~270ms) --
                                               // double the prior 180 (halving tau doubles the
                                               // catch-up rate for exponential decay)
-constexpr double camera_glide_clamp_tiles=1.0;    // cap on outstanding glide debt, in tiles.
-                                              // The glide exists to hide the one-tile content jump
-                                              // a landing makes, so a debt beyond about a tile is
-                                              // not smoothing -- it is the view sitting that far
-                                              // behind where the buffers actually are.
-                                              //
-                                              // Under SUSTAINED scrolling (a held drag lands a tile
-                                              // most frames) compensate-then-decay has a nonzero
-                                              // steady state: debt grows by a tile per landing and
-                                              // decay removes only a fraction of it, settling where
-                                              // the two balance. At tau=90ms and ~60fps that is
-                                              // ~17% per frame, so a tile per frame settles near
-                                              // SIX tiles -- measured live, 2026-08: glide ran to
-                                              // -100..-230px through every sustained drag, the view
-                                              // trailing the cursor and lurching back on release.
-                                              // That is what "the map jumps around randomly" was.
-                                              //
-                                              // Capping at one tile bounds the lag to one tile
-                                              // without touching the case the glide is for: a
-                                              // single landing is one tile, so an isolated scroll
-                                              // never reaches the cap and animates exactly as
-                                              // before. Only stacked landings clip, and clipping
-                                              // them is the point. (A previous 16-tile value was
-                                              // chosen when attribution ran off window_x deltas and
-                                              // the debt it bounded was largely fictitious.)
+constexpr double camera_glide_knee_tiles=1.0; // debt past this decays proportionally faster --
+                                              // see glide_tau_ms. One landing is one tile, so an
+                                              // isolated scroll sits at or under the knee and eases
+                                              // out at the base tau, unchanged.
+constexpr double camera_tau_min_ms=20.0;      // floor on the shortened tau: below this the
+                                              // catch-up stops reading as motion and becomes a snap
+constexpr double camera_glide_clamp_tiles=8.0;    // runaway backstop ONLY, not an operating limit.
+                                              // A hard cap is a bad tool for bounding this: when it
+                                              // bites it discards a tile of compensation, so the
+                                              // content moves a tile with nothing cancelling it --
+                                              // it manufactures exactly the jump the glide exists
+                                              // to hide, once per landing, which at speed is every
+                                              // frame. A 1-tile cap was tried and did that
+                                              // (smoothing visibly gave up as soon as the view
+                                              // moved quickly). The knee above bounds the debt
+                                              // instead, by decaying it faster rather than
+                                              // throwing it away.
 double transient_x=0.0;                       // decaying glide offset, pixels
 double transient_y=0.0;
 double rest_x=0.0;                            // persistent free-camera offset, tiles
@@ -402,6 +405,26 @@ double decay_toward_zero(double value,double tau_ms,uint32_t delta_ms)
 	return value*std::exp(-double(delta_ms)/tau_ms);
 }
 
+// Tau for the debt currently outstanding. Up to the knee the glide eases out at the base rate --
+// the ordinary case, a single landing, is one tile and never exceeds it, so isolated scrolls
+// animate exactly as before. Past the knee tau shortens in proportion, so every extra tile of debt
+// buys a faster catch-up instead of being discarded.
+//
+// This is what lets the glide keep animating when the view moves fast. Compensate-then-decay under
+// SUSTAINED scrolling settles where new debt and decay balance; at a fixed tau that is
+// rate*tau/frame, about six tiles at a tile per frame -- far enough behind that the view visibly
+// trails and lurches. Shortening tau in proportion to the debt makes the balance point
+// sqrt(rate*knee*tau/frame) instead: ~1.6 tiles at half a tile per frame, ~2.3 at one, ~3.3 at two.
+// Sub-linear in scroll rate, so it stays bounded at any speed without ever dropping a tile of
+// compensation, which is the part a hard cap cannot do.
+double glide_tau_ms(double debt_px,double tile)
+{
+	if(tile<=0.0)return camera_tau_ms;
+	const double tiles=std::abs(debt_px)/tile;
+	if(tiles<=camera_glide_knee_tiles)return camera_tau_ms;
+	return std::max(camera_tau_min_ms,camera_tau_ms*camera_glide_knee_tiles/tiles);
+}
+
 // A scroll of (ax,ay) tiles has landed in the buffers: our own normalization writes are visual
 // no-ops (they move into rest); the remainder is a real scroll and adds to the glide debt.
 void attribute_landed(int32_t ax,int32_t ay,double tile)
@@ -488,8 +511,10 @@ void update_camera(
 
 	if(transient_x!=0.0||transient_y!=0.0)
 		{
-		transient_x=decay_toward_zero(transient_x,camera_tau_ms,delta_ms);
-		transient_y=decay_toward_zero(transient_y,camera_tau_ms,delta_ms);
+		transient_x=decay_toward_zero(
+			transient_x,glide_tau_ms(transient_x,tile),delta_ms);
+		transient_y=decay_toward_zero(
+			transient_y,glide_tau_ms(transient_y,tile),delta_ms);
 		if(std::abs(transient_x)<0.5&&std::abs(transient_y)<0.5)
 			{
 			transient_x=0.0;
