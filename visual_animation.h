@@ -136,16 +136,13 @@ struct viewport_visual_animation_inputst
 	int32_t pan_x=0;
 	int32_t pan_y=0;
 	// Optional scroll-landing oracle: the background layer (current and last frame). The
-	// visual layers alone cannot confirm a landing when the visible sprites move WITH the
-	// camera -- the normal case in adventure mode, where the camera follows the player on
-	// every step. Background content is world-anchored, so it identifies the frame (and,
-	// under fast scrolling, the partial prefix) a pending scroll actually lands. May be
-	// left null: the manager then falls back to the layer majority test with suppression.
+	// visual layers alone cannot confirm a landing when they are sparse or empty -- a scroll
+	// over creature-free terrain has no sprites to match. Background content is world-anchored
+	// and always populated, so it identifies the frame (and, under fast scrolling, the partial
+	// prefix) a pending scroll actually lands. May be left null: the manager then falls back
+	// to the layer majority test with suppression.
 	const int32_t *background=nullptr;
 	const int32_t *background_old=nullptr;
-	// The renderer only draws pinned sprites under the world-tile slide; when something
-	// else owns smoothing (the fortress free camera), skip the per-landing pin scan.
-	bool want_pinned=true;
 
 	bool valid() const
 		{
@@ -223,41 +220,6 @@ constexpr int32_t mirrored_tile_x(int32_t piece_x,int32_t anchor_x)
 
 class visual_animation_managerst
 {
-	public:
-		// A sprite that stayed at the same SCREEN position across a landed scroll: it is
-		// being carried by the camera (the adventure-mode player, primarily). The renderer
-		// pins these -- draws them WITHOUT the world-tile slide -- so the world visibly
-		// moves under them instead of them snapping ahead of it.
-		struct pinnedst
-		{
-			viewport_visual_layer layer;
-			int32_t texpos;
-			int32_t x;
-			int32_t y;
-			uint32_t start_time_ms;
-		};
-
-		// Diagnostic counters, readable via the console status command.
-		struct statisticst
-		{
-			uint64_t movements=0;    // movements detected and started
-			uint64_t landings=0;     // frames a scroll landing was attributed
-			uint64_t suppressed=0;   // frames detection was suppressed
-			uint64_t resets=0;       // safe resets (unattributable buffers)
-			uint64_t pan_frames=0;   // frames a new pan delta was observed
-			uint64_t static_frames=0;    // pending scroll, background static
-			uint64_t identical_frames=0; // pending scroll, background EXACTLY equals _old
-			uint64_t unrecognized_frames=0;  // pending scroll, no prefix qualifies
-			uint64_t absorbed=0;     // deltas written off: reversed excursions and
-			                         // masked/phantom scrolls that never diffed
-			int32_t last_pending_dx=0;
-			int32_t last_pending_dy=0;
-			int32_t last_shift_x=0;  // scroll landed on the last synchronize call of the
-			int32_t last_shift_y=0;  // frame -- diagnostic only, see get_last_shift
-		};
-		statisticst stats;
-
-	private:
 	struct movementst
 	{
 		viewport_visual_layer layer;
@@ -278,7 +240,6 @@ class visual_animation_managerst
 		bool has_context=false;
 		bool seen=false;
 		std::vector<movementst> movements;
-		std::vector<pinnedst> pinned;
 		// The scroll that landed in THIS viewport's buffers on the current synchronize call.
 		// Per-viewport rather than global: lower z-level viewports are synchronized too, and
 		// the renderer's glide compensation must read the main viewport's landing specifically,
@@ -330,7 +291,6 @@ class visual_animation_managerst
 	static void abandon_pending(viewport_animationst &state)
 		{
 		state.movements.clear();
-		state.pinned.clear();
 		clear_pending(state);
 		}
 
@@ -369,11 +329,10 @@ class visual_animation_managerst
 			}
 		// The background oracle, when supplied, is world-anchored, and it is what the landing
 		// test actually reads. Sprite layers alone can be byte-identical across a real scroll --
-		// the adventure camera follows the player, so the player rides along unmoved and may be
-		// the only sprite on screen. Fingerprinting the sprites only would report "buffers
-		// unchanged" for precisely the frames a landing needs to be attributed on. Terrain lives
-		// in the same viewport recompute, so this does not make the detector fire any more often
-		// than DF actually redraws.
+		// a creature-free view has nothing on them at all. Fingerprinting the sprites only would
+		// report "buffers unchanged" for precisely the frames a landing needs to be attributed
+		// on. Terrain lives in the same viewport recompute, so this does not make the detector
+		// fire any more often than DF actually redraws.
 		if(input.background!=nullptr&&input.background_old!=nullptr)
 			{
 			for(int32_t i=0;i<tile_count;++i)
@@ -423,9 +382,8 @@ class visual_animation_managerst
 		}
 
 	// Match ratio for a hypothesized shift: prefers the background-layer oracle when supplied
-	// (adventure mode -- the visible sprites move WITH the camera there, so the sprite-only
-	// test above cannot tell a landed scroll from one still pending), falling back to the
-	// sprite majority test otherwise (fortress mode, where no background oracle is given).
+	// (world-anchored and always populated, so it can attribute a landing even when the sprite
+	// layers are sparse or empty), falling back to the sprite majority test otherwise.
 	static double landing_match_ratio(
 		const viewport_visual_animation_inputst &input,
 		int32_t dwx,
@@ -530,8 +488,6 @@ class visual_animation_managerst
 
 		void synchronize_viewport(const viewport_visual_animation_inputst &input)
 			{
-			stats.last_shift_x=0;
-			stats.last_shift_y=0;
 			if(input.viewport==nullptr)return;
 			viewport_animationst &state=get_viewport(input);
 			state.seen=true;
@@ -580,7 +536,6 @@ class visual_animation_managerst
 					{input.pan_x-state.pan_x,input.pan_y-state.pan_y});
 				state.pending_frames=0;
 				state.suppress_frames=2;
-				++stats.pan_frames;
 				}
 			state.context_revision=input.context_revision;
 			state.dim_x=input.dim_x;
@@ -655,7 +610,6 @@ class visual_animation_managerst
 				if(!any_data)
 					{
 					// Nothing visible to anchor the test on: nothing to animate either.
-					++stats.resets;
 					abandon_pending(state);
 					reset_facing(state);
 					}
@@ -707,19 +661,16 @@ class visual_animation_managerst
 					state.suppress_frames=0;
 					landed_shift=landed;
 					translated=true;
-					++stats.landings;
 					}
 				else if(landing_match_ratio(input,0,0)>=0.5&&
 					++state.pending_age<=max_pending_age_frames)
 					{
 					// The buffers have not moved yet, so the scroll is still in flight.
 					state.pending_frames=0;
-					++stats.static_frames;
 					}
 				else if(++state.pending_frames>4)
 					{
 					// The shift never showed up recognizably: fall back to the safe reset.
-					++stats.resets;
 					abandon_pending(state);
 					// The delta was never identified, so the grid cannot be translated.
 					reset_facing(state);
@@ -732,54 +683,6 @@ class visual_animation_managerst
 				!state.pending.empty()||state.suppress_frames>0;
 			// The countdown measures redraws, not frames, so a repeated viewport must not spend it.
 			if(buffers_advanced&&state.suppress_frames>0)--state.suppress_frames;
-			if(suppress)++stats.suppressed;
-
-			if(translated&&(landed_shift[0]!=0||landed_shift[1]!=0)&&!suppress&&
-				input.want_pinned)
-				{
-				// Record screen-static sprites on every layer as PINNED: they ride the
-				// camera (the adventure player), so the renderer draws them without the
-				// world-tile slide.
-				for(size_t layer=0;layer<input.current.size();++layer)
-					{
-					const int32_t *current=input.current[layer];
-					const int32_t *previous=input.previous[layer];
-					for(int32_t x=0;x<input.dim_x;++x)
-						{
-						for(int32_t y=0;y<input.dim_y;++y)
-							{
-							const int32_t index=x*input.dim_y+y;
-							const int32_t texpos=current[index];
-							if(texpos==0)continue;
-							if(!visual_layer_matches(
-								static_cast<viewport_visual_layer>(layer),
-								texpos,previous[index]))continue;
-							bool found=false;
-							for(pinnedst &pin:state.pinned)
-								{
-								if(pin.layer==
-										static_cast<viewport_visual_layer>(layer)&&
-									pin.x==x&&pin.y==y)
-									{
-									pin.texpos=texpos;
-									pin.start_time_ms=frame_time_ms;
-									found=true;
-									break;
-									}
-								}
-							if(!found)
-								state.pinned.push_back(
-									{
-									static_cast<viewport_visual_layer>(layer),
-									texpos,
-									x,
-									y,
-									frame_time_ms
-									});
-							}
-						}
-					}
-				}
 
 			// On the landing frame `previous` is still framed on the pre-scroll view.
 			// Rebasing it by the landed delta keeps a creature that walked during the scroll.
@@ -812,20 +715,6 @@ class visual_animation_managerst
 			if(!suppress)
 				{
 				const int32_t tile_count=input.dim_x*input.dim_y;
-				// Sprites pinned THIS frame rode the camera: they held the same SCREEN tile
-				// across the landing, and the renderer draws them without the world slide. The
-				// rebased previous buffer above reframes exactly those as having moved by
-				// -landed_shift, so left alone they would also be detected as a movement --
-				// drawn twice, and animated sliding against the world they are anchored to.
-				std::vector<uint16_t> pinned_this_frame;
-				for(const pinnedst &pin:state.pinned)
-					{
-					if(pin.start_time_ms!=frame_time_ms)continue;
-					if(pinned_this_frame.empty())
-						pinned_this_frame.assign(size_t(tile_count),0);
-					pinned_this_frame[size_t(pin.x)*size_t(input.dim_y)+size_t(pin.y)]|=
-						uint16_t(1U<<static_cast<size_t>(pin.layer));
-					}
 				std::vector<uint8_t> claimed_sources(tile_count);
 				const size_t existing_movement_count=state.movements.size();
 				// A chained movement's source may already have been rewritten this frame.
@@ -855,9 +744,6 @@ class visual_animation_managerst
 							const int32_t target=x*input.dim_y+y;
 							const int32_t texpos=current[target];
 							if(texpos==0)continue;
-							if(!pinned_this_frame.empty()&&
-								(pinned_this_frame[size_t(target)]&
-									uint16_t(1U<<layer))!=0)continue;
 							if(static_cast<viewport_visual_layer>(layer)==
 								viewport_visual_layer::item&&
 								previous_layers[static_cast<size_t>(
@@ -937,7 +823,6 @@ class visual_animation_managerst
 								y,
 								frame_time_ms
 								});
-							++stats.movements;
 							if(static_cast<viewport_visual_layer>(layer)==
 									viewport_visual_layer::center&&
 								state.facing.size()==
@@ -983,34 +868,8 @@ class visual_animation_managerst
 							!visual_layer_matches(movement.layer,current,movement.texpos);
 						}),
 				state.movements.end());
-			state.pinned.erase(
-				std::remove_if(
-					state.pinned.begin(),
-					state.pinned.end(),
-					[&](const pinnedst &pin)
-						{
-						const size_t layer=static_cast<size_t>(pin.layer);
-						const int32_t index=pin.x*input.dim_y+pin.y;
-						const int32_t current=input.current[layer][index];
-						return frame_time_ms-pin.start_time_ms>=movement_duration_ms||
-							current==0||
-							!visual_layer_matches(pin.layer,current,pin.texpos);
-						}),
-				state.pinned.end());
 			state.last_shift_x=translated?landed_shift[0]:0;
 			state.last_shift_y=translated?landed_shift[1]:0;
-			stats.last_shift_x=state.last_shift_x;
-			stats.last_shift_y=state.last_shift_y;
-			{
-			int32_t pending_sum_x=0,pending_sum_y=0;
-			for(const auto &shift:state.pending)
-				{
-				pending_sum_x+=shift[0];
-				pending_sum_y+=shift[1];
-				}
-			stats.last_pending_dx=pending_sum_x;
-			stats.last_pending_dy=pending_sum_y;
-			}
 			// has_mirrored is recomputed here rather than maintained at every write site.
 			if(state.facing.size()==size_t(input.dim_x)*size_t(input.dim_y))
 				{
@@ -1085,18 +944,6 @@ class visual_animation_managerst
 			return force_full_redraw;
 			}
 
-		// Scrolls queued but not yet observed in this viewport's buffers. Zero means the
-		// manager believes it owes nothing, which is the point the renderer's shift accounting
-		// must balance: anything unattributed at that moment moved on screen uncompensated.
-		size_t get_pending_count(const void *viewport) const
-			{
-			for(const viewport_animationst &state:viewports)
-				{
-				if(state.viewport==viewport)return state.pending.size();
-				}
-			return 0;
-			}
-
 		// The scroll that landed in this viewport's buffers this frame, {0,0} if none did.
 		std::array<int32_t,2> get_last_shift(const void *viewport) const
 			{
@@ -1106,17 +953,6 @@ class visual_animation_managerst
 					return {state.last_shift_x,state.last_shift_y};
 				}
 			return {0,0};
-			}
-
-		static inline const std::vector<pinnedst> empty_pinned{};
-
-		const std::vector<pinnedst> &get_pinned(const void *viewport) const
-			{
-			for(const viewport_animationst &state:viewports)
-				{
-				if(state.viewport==viewport)return state.pinned;
-				}
-			return empty_pinned;
 			}
 
 		visual_movement_renderst get_movement(
