@@ -35,7 +35,7 @@ smooth-movement camera on   # enable the free camera
 
 ## Compatibility
 
-Requires DFHack 53.16-r1 or newer and the SDL 2D renderer. Always download the plugin version that matches your DFHack version.
+Requires DFHack 53.16-r1.1 and the SDL 2D renderer. Always download the plugin version that matches your DFHack version.
 
 ## License
 
