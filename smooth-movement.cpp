@@ -8,6 +8,7 @@
 #include "modules/DFSDL.h"
 
 #include "df/enabler.h"
+#include "df/game_mode.h"
 #include "df/graphic.h"
 #include "df/graphic_viewportst.h"
 #include "df/renderer_2d_base.h"
@@ -34,6 +35,7 @@ DFHACK_PLUGIN("smooth-movement");
 DFHACK_PLUGIN_IS_ENABLED(is_enabled);
 
 REQUIRE_GLOBAL(enabler);
+REQUIRE_GLOBAL(gamemode);
 REQUIRE_GLOBAL(gps);
 REQUIRE_GLOBAL(window_x);
 REQUIRE_GLOBAL(window_y);
@@ -41,7 +43,7 @@ REQUIRE_GLOBAL(window_z);
 
 namespace {
 
-constexpr const char *plugin_version="0.3.0";
+constexpr const char *plugin_version="0.4.0-dev";
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -67,9 +69,8 @@ bool flip_enabled=false;
 
 // --- free camera -------------------------------------------------------------------------------
 // The camera is visually unbound from the tile grid. Two layered offsets:
-//   rest      -- a PERSISTENT sub-tile offset in tiles: the free camera. Set by pixel-perfect
-//                middle-mouse drag panning (the view rests wherever released, mid-tile or not)
-//                and by the `smooth-movement camera <fx> <fy>` console command. Survives zoom
+//   rest      -- a PERSISTENT sub-tile offset in tiles: the free camera. Set only by the
+//                `smooth-movement camera <fx> <fy>` console command. Survives zoom
 //                and z-level changes. Kept in [-0.5,0.5] by normalization: whole-tile parts are
 //                folded into window_x/window_y (a plain UI scroll write -- NEVER the viewport
 //                dims, which crash DF; the sub-tile strip this leaves at one screen edge has no
@@ -79,26 +80,51 @@ bool flip_enabled=false;
 bool camera_enabled=false;                    // OFF by default: plain `enable smooth-movement`
                                               // keeps upstream behavior (creature interpolation
                                               // only); `smooth-movement camera on` opts in.
-constexpr int32_t camera_max_glide_tiles=3;   // per-jump: farther than this snaps instantly
-constexpr double camera_tau_ms=35.0;          // transient catch-up (~95% done after 100ms)
+constexpr double camera_tau_ms=90.0;          // transient catch-up (~95% done after ~270ms) --
+                                              // double the prior 180 (halving tau doubles the
+                                              // catch-up rate for exponential decay)
+constexpr double camera_glide_knee_tiles=1.0; // debt past this decays proportionally faster --
+                                              // see glide_tau_ms. Applies ONLY during sustained
+                                              // scrolling (camera_glide_sustained): the knee
+                                              // exists to keep the equilibrium debt low while
+                                              // landings keep arriving, where the fast catch-up
+                                              // blends into the motion already on screen. An
+                                              // ISOLATED landing has no such cover -- the screen
+                                              // is otherwise still, so knee-rate decay reads as a
+                                              // snap -- and multi-tile isolated landings are the
+                                              // NORM while paused, where DF recomputes the
+                                              // buffers lazily and scrolls coalesce.
+constexpr double camera_tau_min_ms=20.0;      // floor on the shortened tau: below this the
+                                              // catch-up stops reading as motion and becomes a snap
+constexpr double camera_glide_clamp_tiles=8.0;    // runaway backstop ONLY, not an operating limit.
+                                              // A hard cap is a bad tool for bounding this: when it
+                                              // bites it discards a tile of compensation, so the
+                                              // content moves a tile with nothing cancelling it --
+                                              // it manufactures exactly the jump the glide exists
+                                              // to hide, once per landing, which at speed is every
+                                              // frame. A 1-tile cap was tried and did that
+                                              // (smoothing visibly gave up as soon as the view
+                                              // moved quickly). The knee above bounds the debt
+                                              // instead, by decaying it faster rather than
+                                              // throwing it away.
+constexpr uint32_t camera_sustained_gap_ms=150;  // landings closer together than this are one
+                                              // continuous scroll (a drag lands every frame or
+                                              // two); further apart they are isolated actions
 double transient_x=0.0;                       // decaying glide offset, pixels
 double transient_y=0.0;
+uint32_t camera_last_landing_ms=0;            // when the previous landing was attributed
+bool camera_glide_sustained=false;            // last landing followed another within the gap:
+                                              // the knee (fast catch-up) may engage
 double rest_x=0.0;                            // persistent free-camera offset, tiles
 double rest_y=0.0;                            // (positive = view sits WEST/NORTH of window)
-int32_t camera_pending_dx=0;                  // scroll delta announced but not yet in the buffers
-int32_t camera_pending_dy=0;
-int32_t camera_pending_frames=0;
 int32_t self_scroll_x=0;                      // window deltas WE wrote: visual no-ops when landing
 int32_t self_scroll_y=0;
-bool drag_active=false;
-double drag_anchor_vx=0.0;                    // visual camera at drag start, tiles
-double drag_anchor_vy=0.0;
-int32_t drag_anchor_mx=0;                     // precise mouse at drag start, pixels
-int32_t drag_anchor_my=0;
 bool camera_was_offset=false;                 // edge-detects offset->0 for one cleanup redraw
-int32_t camera_prev_wx=0;                     // window-scroll observation baseline
-int32_t camera_prev_wy=0;
-bool camera_has_prev=false;
+
+bool adventure_mode()
+{
+	return gamemode!=nullptr&&*gamemode==df::game_mode::ADVENTURE;
+}
 
 double tile_px(const df::renderer_2d_base *renderer)
 {
@@ -106,47 +132,17 @@ double tile_px(const df::renderer_2d_base *renderer)
 	return double(zoom==128?32:std::max(1,zoom*32/128));
 }
 
-// Match ratio of "buffers shifted by (dwx,dwy)" on the background layer: 0..1, or -1 when there
-// is nothing to compare (empty background).
-double background_match_ratio(const df::graphic_viewportst *vp,int32_t dwx,int32_t dwy)
-{
-	int32_t considered=0;
-	int32_t matches=0;
-	for(int32_t x=0;x<vp->dim_x;++x)
-		{
-		const int32_t sx=x+dwx;
-		if(sx<0||sx>=vp->dim_x)continue;
-		for(int32_t y=0;y<vp->dim_y;++y)
-			{
-			const int32_t sy=y+dwy;
-			if(sy<0||sy>=vp->dim_y)continue;
-			const int32_t cur=vp->screentexpos_background[x*vp->dim_y+y];
-			if(cur==0)continue;
-			++considered;
-			if(vp->screentexpos_background_old[sx*vp->dim_y+sy]==cur)++matches;
-			}
-		}
-	if(considered==0)return -1.0;
-	return double(matches)/double(considered);
-}
-
 // Cancel everything except the persistent rest offset (the camera keeps its sub-tile position
 // across zoom/z/resize; only the in-flight animation state is unfollowable).
-void clear_camera_pending()
-{
-	camera_pending_dx=0;
-	camera_pending_dy=0;
-	camera_pending_frames=0;
-	self_scroll_x=0;
-	self_scroll_y=0;
-}
-
 void cancel_camera_transients()
 {
 	transient_x=0.0;
 	transient_y=0.0;
-	clear_camera_pending();
-	drag_active=false;
+	self_scroll_x=0;
+	self_scroll_y=0;
+	// The scroll context is gone with the debt; without this a post-cancel landing could decay
+	// one frame at the knee tau off a stale flag before resampling it.
+	camera_glide_sustained=false;
 }
 
 void set_camera_enabled(bool enable)
@@ -156,7 +152,6 @@ void set_camera_enabled(bool enable)
 	cancel_camera_transients();
 	rest_x=0.0;
 	rest_y=0.0;
-	camera_has_prev=false;   // fresh observation baseline; no phantom scroll on re-enable
 	// camera_was_offset stays: the render path issues one cleanup redraw if we were mid-offset.
 }
 
@@ -178,9 +173,47 @@ void normalize_rest()
 		}
 }
 
+// Exponential lerp toward zero: shrinks `value` by a FIXED FRACTION of its remaining distance to
+// zero every tau_ms, independent of frame rate -- the standard framerate-independent damped
+// approach. This is what makes the glide catch-up provably overshoot-proof: every call multiplies
+// `value` by a factor in (0,1), so it can shrink and change magnitude but can never cross zero or
+// reverse sign in a single step -- there is no way for the result to land on the far side of the
+// target. (Contrast with clamping a value to a fixed cap right after an unrelated jump, which IS a
+// discontinuous snap -- that was the actual source of the visible "over-correction" under fast
+// dragging, not this decay.)
+double decay_toward_zero(double value,double tau_ms,uint32_t delta_ms)
+{
+	return value*std::exp(-double(delta_ms)/tau_ms);
+}
+
+// Tau for the debt currently outstanding. Up to the knee the glide eases out at the base rate --
+// the ordinary case, a single landing, is one tile and never exceeds it, so isolated scrolls
+// animate exactly as before. Past the knee tau shortens in proportion, so every extra tile of debt
+// buys a faster catch-up instead of being discarded.
+//
+// This is what lets the glide keep animating when the view moves fast. Compensate-then-decay under
+// SUSTAINED scrolling settles where new debt and decay balance; at a fixed tau that is
+// rate*tau/frame, about six tiles at a tile per frame -- far enough behind that the view visibly
+// trails and lurches. Shortening tau in proportion to the debt makes the balance point
+// sqrt(rate*knee*tau/frame) instead: ~1.6 tiles at half a tile per frame, ~2.3 at one, ~3.3 at two.
+// Sub-linear in scroll rate, so it stays bounded at any speed without ever dropping a tile of
+// compensation, which is the part a hard cap cannot do.
+double glide_tau_ms(double debt_px,double tile)
+{
+	if(tile<=0.0)return camera_tau_ms;
+	// The knee is an equilibrium tool, not a presentation upgrade: only sustained scrolling has
+	// an equilibrium to bound. For an isolated landing the shortened tau -- floored at 20ms,
+	// about one render frame -- discards more than half the debt per frame, which on an
+	// otherwise-still screen is a visible snap, not a glide. Isolated multi-tile landings are
+	// exactly the paused case (coalesced scrolls, recenters), so they ease out at the base tau.
+	if(!camera_glide_sustained)return camera_tau_ms;
+	const double tiles=std::abs(debt_px)/tile;
+	if(tiles<=camera_glide_knee_tiles)return camera_tau_ms;
+	return std::max(camera_tau_min_ms,camera_tau_ms*camera_glide_knee_tiles/tiles);
+}
+
 // A scroll of (ax,ay) tiles has landed in the buffers: our own normalization writes are visual
-// no-ops (they move into rest); the remainder is a real scroll and glides -- unless a drag is
-// driving the position directly, in which case it folds into rest wholesale.
+// no-ops (they move into rest); the remainder is a real scroll and adds to the glide debt.
 void attribute_landed(int32_t ax,int32_t ay,double tile)
 {
 	int32_t sx=0;
@@ -195,168 +228,100 @@ void attribute_landed(int32_t ax,int32_t ay,double tile)
 	rest_y+=sy;
 	const int32_t gx=ax-sx;
 	const int32_t gy=ay-sy;
-	if(drag_active)
-		{
-		rest_x+=gx;
-		rest_y+=gy;
-		}
-	else
-		{
-		transient_x+=gx*tile;
-		transient_y+=gy*tile;
-		const double cap=tile*(camera_max_glide_tiles+0.5);
-		transient_x=std::clamp(transient_x,-cap,cap);
-		transient_y=std::clamp(transient_y,-cap,cap);
-		}
+	transient_x+=gx*tile;
+	transient_y+=gy*tile;
+	// Safety backstop only -- see camera_glide_clamp_tiles. A well-behaved lerp does not need a
+	// magnitude clamp to avoid overshoot; this exists purely to bound a genuinely runaway state.
+	const double cap=tile*camera_glide_clamp_tiles;
+	transient_x=std::clamp(transient_x,-cap,cap);
+	transient_y=std::clamp(transient_y,-cap,cap);
 }
 
-// Per-frame camera bookkeeping: observe window scrolls, attribute them when the buffers apply
-// them (glide vs our own normalization writes), drive the drag, decay the transient.
+// Per-frame camera bookkeeping: compensate scrolls on the frame their content actually lands in
+// the render buffers, and decay that compensation away.
+//
+// ATTRIBUTION IS KEYED TO BUFFER LANDINGS, NEVER TO window_x/window_y DELTAS. The distinction is
+// the whole correctness argument here, and getting it wrong is what every previous version of this
+// function did:
+//
+//   The drawn image is the viewport BUFFER content (redraw_world_tile -> update_viewport_tile,
+//   which reads vp->screentexpos_*) painted at renderer->origin plus our glide offset. window_x
+//   is not a term in it. window_x changes at INPUT time; DF recomputes the buffers on some LATER
+//   frame -- "far less often than this hook runs, and while paused hardly at all" (upstream
+//   c116b2d, the same observation that fixed the sprite jiggle). So window_x is an announcement of
+//   intent, and the buffers are the thing on screen.
+//
+//   Compensating on the window delta therefore shifts the world by a tile while the screen is
+//   still showing pre-scroll content -- a visible jump AGAINST the direction of travel -- and then
+//   jumps again when the buffer finally lands. Unpaused this is invisible: the buffers recompute
+//   nearly every frame, so window delta and buffer shift coincide and the wrong model happens to
+//   give the right answer. Paused, they come apart, and that gap IS the "camera jitters while
+//   paused" bug. (It is also the original "camera jumps the opposite direction as motion starts"
+//   report, which was misdiagnosed as a since-removed 2-frame hold buffer. A fixed frame delay was
+//   never the fix either: the correct delay is "until the buffers advance", which is not a number.)
+//
+// animation_manager.get_last_shift(vp) is exactly that landing: the tile shift the manager
+// confirmed against buffer content THIS frame, zero on frames nothing landed. It is gated on the
+// buffer fingerprint actually changing, resolves fast scrolls piecewise (the buffers may apply
+// only +1 of a pending +3), handles view crossings, and ages by wall clock -- machinery this
+// function used to duplicate, worse, in a private background_match_ratio search with a fistful of
+// magic frame counts. synchronize_viewport runs earlier in the same frame, so the value is fresh.
 void update_camera(
 	df::renderer_2d_base *renderer,
-	const df::graphic_viewportst *vp,
-	uint32_t delta_ms)
+	uint32_t now_ms,
+	uint32_t delta_ms,
+	int32_t shift_x,
+	int32_t shift_y)
 {
-	if(!camera_enabled)return;
+	// Adventure mode is excluded: the view follows the player there, so EVERY step is a scroll
+	// and the whole-map glide repaint would run near-constantly -- too heavy to be worth it.
+	if(!camera_enabled||adventure_mode())return;
 	const double tile=tile_px(renderer);
-	const int32_t wx=window_x?*window_x:0;
-	const int32_t wy=window_y?*window_y:0;
-	if(camera_has_prev&&(wx!=camera_prev_wx||wy!=camera_prev_wy))
-		{
-		const int32_t dx=wx-camera_prev_wx;
-		const int32_t dy=wy-camera_prev_wy;
-		if((std::abs(dx)>camera_max_glide_tiles||std::abs(dy)>camera_max_glide_tiles)&&
-			!drag_active)
-			cancel_camera_transients();   // teleport-like jump (recenter/minimap): snap
-		else
-			{
-			camera_pending_dx+=dx;
-			camera_pending_dy+=dy;
-			camera_pending_frames=0;
-			}
-		}
-	camera_prev_wx=wx;
-	camera_prev_wy=wy;
-	camera_has_prev=true;
 
-	if(camera_pending_dx!=0||camera_pending_dy!=0)
-		{
-		if(std::abs(camera_pending_dx)>6||std::abs(camera_pending_dy)>6)
-			{
-			// Scrolling far outran detection: snap (keep rest, drop the animation debt).
-			transient_x=0.0;
-			transient_y=0.0;
-			clear_camera_pending();
-			}
-		else
-			{
-			// Fast scrolling applies the pending delta PIECEMEAL: the buffers may hold +1 of a
-			// pending +3 this frame. Testing only the total made landings miss, time out, and
-			// snap -- the fast-scroll jitter. Instead, find the LARGEST applied prefix of the
-			// pending scroll and attribute just that; the rest keeps pending. Ties between
-			// qualifying shifts only happen on uniform terrain, where mistiming is invisible.
-			const int32_t stepx=(camera_pending_dx>0)-(camera_pending_dx<0);
-			const int32_t stepy=(camera_pending_dy>0)-(camera_pending_dy<0);
-			int32_t best_ax=0,best_ay=0,best_mag=-1;
-			double best_score=-1.0;
-			bool no_data=false;
-			for(int32_t ix=0;ix<=std::abs(camera_pending_dx);++ix)
-				{
-				for(int32_t iy=0;iy<=std::abs(camera_pending_dy);++iy)
-					{
-					const double score=background_match_ratio(vp,ix*stepx,iy*stepy);
-					if(score<0.0){no_data=true;break;}
-					const int32_t mag=ix+iy;
-					if(score>=0.6&&(mag>best_mag||(mag==best_mag&&score>best_score)))
-						{
-						best_mag=mag;
-						best_score=score;
-						best_ax=ix*stepx;
-						best_ay=iy*stepy;
-						}
-					}
-				if(no_data)break;
-				}
-			if(no_data)
-				{
-				// Nothing to compare against (empty background): give up on attribution.
-				clear_camera_pending();
-				}
-			else if(best_mag>0)
-				{
-				attribute_landed(best_ax,best_ay,tile);
-				camera_pending_dx-=best_ax;
-				camera_pending_dy-=best_ay;
-				camera_pending_frames=0;
-				}
-			else if(best_mag==0)
-				{
-				// Content demonstrably hasn't moved yet: keep waiting, no timeout pressure.
-				camera_pending_frames=0;
-				}
-			else if(++camera_pending_frames>4)
-				{
-				// Neither static nor any prefix recognizable (heavy simultaneous change):
-				// drop the debt without touching the in-flight glide.
-				clear_camera_pending();
-				}
-			}
-		}
-
-	// --- pixel-perfect middle-mouse drag: the view follows the mouse 1:1 and rests where
-	// released. DF's own drag still moves window in tile steps; rest carries the remainder.
-	// Positions are tracked against the CONTENT window (window minus unlanded jumps) so the
-	// buffer lag never causes a visible stutter.
-	const bool mbut=enabler!=nullptr&&enabler->mouse_mbut;
-	const double content_wx=double(wx-camera_pending_dx);
-	const double content_wy=double(wy-camera_pending_dy);
-	if(mbut&&!drag_active&&gps!=nullptr)
-		{
-		drag_active=true;
-		drag_anchor_vx=content_wx-rest_x-transient_x/tile;
-		drag_anchor_vy=content_wy-rest_y-transient_y/tile;
-		drag_anchor_mx=gps->precise_mouse_x;
-		drag_anchor_my=gps->precise_mouse_y;
-		transient_x=0.0;
-		transient_y=0.0;
-		}
-	if(drag_active)
-		{
-		if(!mbut)
-			{
-			drag_active=false;
-			normalize_rest();
-			}
-		else if(gps!=nullptr)
-			{
-			double vx=drag_anchor_vx-double(gps->precise_mouse_x-drag_anchor_mx)/tile;
-			double vy=drag_anchor_vy-double(gps->precise_mouse_y-drag_anchor_my)/tile;
-			rest_x=content_wx-vx;
-			rest_y=content_wy-vy;
-			// If DF's own drag disagrees by more than a tile and a half, rebase on its view.
-			const double lim=1.5;
-			if(rest_x<-lim||rest_x>lim||rest_y<-lim||rest_y>lim)
-				{
-				rest_x=std::clamp(rest_x,-lim,lim);
-				rest_y=std::clamp(rest_y,-lim,lim);
-				drag_anchor_vx=content_wx-rest_x+
-					double(gps->precise_mouse_x-drag_anchor_mx)/tile;
-				drag_anchor_vy=content_wy-rest_y+
-					double(gps->precise_mouse_y-drag_anchor_my)/tile;
-				}
-			}
-		}
-
+	// Decay BEFORE attributing, so the landing frame renders its compensation IN FULL. The
+	// landing frame is the one frame the glide exists for: the content just jumped -shift on
+	// screen and the offset must cancel exactly that. Decaying after attributing leaked
+	// (1-exp(-dt/tau)) of the landing before it was ever drawn once -- ~18% of a tile at the
+	// base tau, and at the knee-shortened tau MOST of it (a five-tile landing rendered barely a
+	// third of its compensation; the missing two-thirds was the paused-scroll jump). The sprite
+	// interpolation path already renders full compensation on its landing frame (a smoothstep
+	// at t=0 is the whole offset); this makes the camera match it.
 	if(transient_x!=0.0||transient_y!=0.0)
 		{
-		const double k=std::exp(-double(delta_ms)/camera_tau_ms);
-		transient_x*=k;
-		transient_y*=k;
+		transient_x=decay_toward_zero(
+			transient_x,glide_tau_ms(transient_x,tile),delta_ms);
+		transient_y=decay_toward_zero(
+			transient_y,glide_tau_ms(transient_y,tile),delta_ms);
 		if(std::abs(transient_x)<0.5&&std::abs(transient_y)<0.5)
 			{
 			transient_x=0.0;
 			transient_y=0.0;
 			}
+		}
+
+	// EVERY landing is animated. There is no size above which the glide stands down: a landing
+	// is content that has already moved on screen, so declining to compensate it is not "taking
+	// the step cleanly", it is choosing to show the jump. The old threshold could only ever
+	// convert a smooth catch-up into a visible one, and judging when that trade was worth making
+	// from the landing size alone proved unreliable in play -- it fired on ordinary fast
+	// scrolling, which is exactly when the smoothing matters most.
+	//
+	// Nothing needs the threshold any more. A genuinely huge landing (recenter, minimap warp) is
+	// bounded by camera_glide_clamp_tiles and eased out at the base tau (isolated landings never
+	// engage the knee), a fast quarter-second slide rather than a chase across the map.
+	//
+	// Our own normalization writes are filtered out inside attribute_landed -- they move into
+	// rest, not into the glide.
+	if(shift_x!=0||shift_y!=0)
+		{
+		attribute_landed(shift_x,shift_y,tile);
+		// Landings arriving back-to-back are one continuous scroll: the knee may engage to keep
+		// the trailing debt bounded (see glide_tau_ms). The flag is sampled here, on landings
+		// only, so the decay of an isolated landing stays at the base tau for its whole tail --
+		// it cannot speed up mid-glide.
+		camera_glide_sustained=
+			now_ms-camera_last_landing_ms<=camera_sustained_gap_ms;
+		camera_last_landing_ms=now_ms;
 		}
 }
 
@@ -484,7 +449,11 @@ viewport_visual_animation_inputst animation_input(df::graphic_viewportst *vp)
 		visual_layers(const_viewport),
 		visual_layers(const_viewport,true),
 		window_x?*window_x:0,
-		window_y?*window_y:0
+		window_y?*window_y:0,
+		// Scroll-landing oracle: terrain is world-anchored, so landings attribute even when
+		// the sprite layers are sparse or scrolled in lockstep with the view.
+		vp->screentexpos_background,
+		vp->screentexpos_background_old
 		};
 }
 
@@ -1237,11 +1206,19 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 
 	if(!viewport_readable(vp)||renderer->sdl_renderer==nullptr)
 		return;
-	update_camera(renderer,vp,animation_manager.get_frame_delta_ms());
+	// The MAIN viewport's landing, read once: lower z-level viewports are synchronized too, and
+	// everything below is about what the player is looking at.
+	const std::array<int32_t,2> landed=animation_manager.get_last_shift(vp);
+	update_camera(renderer,now_ms,animation_manager.get_frame_delta_ms(),landed[0],landed[1]);
 	const double cam_tile=tile_px(renderer);
-	const int32_t glide_x=int32_t(std::lround(transient_x+rest_x*cam_tile));
-	const int32_t glide_y=int32_t(std::lround(transient_y+rest_y*cam_tile));
+	const bool camera_active=camera_enabled&&!adventure_mode();
+
+	const int32_t glide_x=camera_active?
+		int32_t(std::lround(transient_x+rest_x*cam_tile)):0;
+	const int32_t glide_y=camera_active?
+		int32_t(std::lround(transient_y+rest_y*cam_tile)):0;
 	const bool glide=glide_x!=0||glide_y!=0;
+
 	if(!glide&&camera_was_offset)
 		{
 		// The camera just re-joined the grid: one engine redraw replaces the last shifted frame.
@@ -1393,8 +1370,9 @@ void reset_state()
 	rest_x=0.0;
 	rest_y=0.0;
 	camera_enabled=false;
-	camera_has_prev=false;
 	camera_was_offset=false;
+	camera_last_landing_ms=0;
+	camera_glide_sustained=false;
 	flip_enabled=false;
 }
 
@@ -1408,7 +1386,8 @@ command_result status_command(
 			"smooth-movement {}: {}\n",
 			plugin_version,
 			is_enabled?"enabled":"disabled");
-		out.print("free camera: {}, offset {:.3f} {:.3f} (tiles east/south of the grid)\n",
+		out.print("free camera (fortress mode): {}, offset {:.3f} {:.3f}"
+			" (tiles east/south of the grid)\n",
 			camera_enabled?"on":"off",-rest_x,-rest_y);
 		out.print("sprite flipping: {}\n",
 			flip_enabled?"on":"off");
@@ -1425,6 +1404,8 @@ command_result status_command(
 		if(parameters.size()==2&&parameters[1]=="on")
 			{
 			set_camera_enabled(true);
+			if(adventure_mode())
+				out.print("note: the free camera applies in fortress mode only.\n");
 			return CR_OK;
 			}
 		if(parameters.size()==2&&parameters[1]=="off")

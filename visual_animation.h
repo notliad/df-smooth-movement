@@ -135,6 +135,14 @@ struct viewport_visual_animation_inputst
 	// Only a hint: it changes at input time, the buffers shift on a later render frame.
 	int32_t pan_x=0;
 	int32_t pan_y=0;
+	// Optional scroll-landing oracle: the background layer (current and last frame). The
+	// visual layers alone cannot confirm a landing when they are sparse or empty -- a scroll
+	// over creature-free terrain has no sprites to match. Background content is world-anchored
+	// and always populated, so it identifies the frame (and, under fast scrolling, the partial
+	// prefix) a pending scroll actually lands. May be left null: the manager then falls back
+	// to the layer majority test with suppression.
+	const int32_t *background=nullptr;
+	const int32_t *background_old=nullptr;
 
 	bool valid() const
 		{
@@ -232,6 +240,12 @@ class visual_animation_managerst
 		bool has_context=false;
 		bool seen=false;
 		std::vector<movementst> movements;
+		// The scroll that landed in THIS viewport's buffers on the current synchronize call.
+		// Per-viewport rather than global: lower z-level viewports are synchronized too, and
+		// the renderer's glide compensation must read the main viewport's landing specifically,
+		// not whichever viewport happened to be synchronized last.
+		int32_t last_shift_x=0;
+		int32_t last_shift_y=0;
 		// One facing per tile, not per unit: the viewport exposes one creature texpos per tile.
 		std::vector<int8_t> facing;
 		// Stationary mirrored creatures are repainted every frame; this is the cheap pre-check.
@@ -313,6 +327,20 @@ class visual_animation_managerst
 				hash=(hash^uint64_t(uint32_t(input.previous[layer][i])))*fnv_prime;
 				}
 			}
+		// The background oracle, when supplied, is world-anchored, and it is what the landing
+		// test actually reads. Sprite layers alone can be byte-identical across a real scroll --
+		// a creature-free view has nothing on them at all. Fingerprinting the sprites only would
+		// report "buffers unchanged" for precisely the frames a landing needs to be attributed
+		// on. Terrain lives in the same viewport recompute, so this does not make the detector
+		// fire any more often than DF actually redraws.
+		if(input.background!=nullptr&&input.background_old!=nullptr)
+			{
+			for(int32_t i=0;i<tile_count;++i)
+				{
+				hash=(hash^uint64_t(uint32_t(input.background[i])))*fnv_prime;
+				hash=(hash^uint64_t(uint32_t(input.background_old[i])))*fnv_prime;
+				}
+			}
 		return hash;
 		}
 
@@ -347,6 +375,36 @@ class visual_animation_managerst
 					++considered;
 					if(visual_layer_matches(id,texpos,previous[sx*input.dim_y+sy]))++matches;
 					}
+				}
+			}
+		if(considered==0)return -1.0;
+		return double(matches)/double(considered);
+		}
+
+	// Match ratio for a hypothesized shift: prefers the background-layer oracle when supplied
+	// (world-anchored and always populated, so it can attribute a landing even when the sprite
+	// layers are sparse or empty), falling back to the sprite majority test otherwise.
+	static double landing_match_ratio(
+		const viewport_visual_animation_inputst &input,
+		int32_t dwx,
+		int32_t dwy)
+		{
+		if(input.background==nullptr||input.background_old==nullptr)
+			return shift_match_ratio(input,dwx,dwy);
+		int32_t considered=0;
+		int32_t matches=0;
+		for(int32_t x=0;x<input.dim_x;++x)
+			{
+			const int32_t sx=x+dwx;
+			if(sx<0||sx>=input.dim_x)continue;
+			for(int32_t y=0;y<input.dim_y;++y)
+				{
+				const int32_t sy=y+dwy;
+				if(sy<0||sy>=input.dim_y)continue;
+				const int32_t cur=input.background[x*input.dim_y+y];
+				if(cur==0)continue;
+				++considered;
+				if(input.background_old[sx*input.dim_y+sy]==cur)++matches;
 				}
 			}
 		if(considered==0)return -1.0;
@@ -433,6 +491,11 @@ class visual_animation_managerst
 			if(input.viewport==nullptr)return;
 			viewport_animationst &state=get_viewport(input);
 			state.seen=true;
+			// Cleared up front rather than only on the paths that reach the landing test below:
+			// the renderer keys its glide compensation off this, and an early return that left
+			// the PREVIOUS frame's landing standing would compensate the same scroll twice.
+			state.last_shift_x=0;
+			state.last_shift_y=0;
 
 			if(!input.valid())
 				{
@@ -455,9 +518,19 @@ class visual_animation_managerst
 				{
 				if(state.pending.size()>=max_pending_shifts)
 					{
-					// Same give-up as the other two sites: the owed shifts are unknowable now.
-					abandon_pending(state);
-					reset_facing(state);
+					// The queue is bounded, but its TOTAL is a debt: every tile queued here
+					// eventually moves the world on screen, and a consumer that compensates
+					// scrolls (the fortress free camera) needs it attributed or that motion
+					// happens with nothing cancelling it -- a visible jump. Discarding the
+					// queue here was measured doing exactly that: every unaccounted shift in
+					// a drag capture came from this site, during stretches where the window
+					// kept stepping while the buffers had not recomputed for eight frames.
+					// Coalesce the two oldest instead. Granularity is what the bound has to
+					// cost; the debt is not. The pair can no longer land separately, only
+					// together, which at worst delays one attribution.
+					state.pending[1][0]+=state.pending[0][0];
+					state.pending[1][1]+=state.pending[0][1];
+					state.pending.erase(state.pending.begin());
 					}
 				state.pending.push_back(
 					{input.pan_x-state.pan_x,input.pan_y-state.pan_y});
@@ -522,7 +595,7 @@ class visual_animation_managerst
 					// A prefix netting to zero is indistinguishable from "nothing landed yet".
 					// Accepting it would retire shifts the buffers have still to apply.
 					if(shift[0]==0&&shift[1]==0)continue;
-					const double ratio=shift_match_ratio(input,shift[0],shift[1]);
+					const double ratio=landing_match_ratio(input,shift[0],shift[1]);
 					// Emptiness is per-prefix: a long one can push every sprite out of range
 					// while a shorter one still has something to say.
 					if(ratio<0.0)continue;
@@ -589,7 +662,7 @@ class visual_animation_managerst
 					landed_shift=landed;
 					translated=true;
 					}
-				else if(shift_match_ratio(input,0,0)>=0.5&&
+				else if(landing_match_ratio(input,0,0)>=0.5&&
 					++state.pending_age<=max_pending_age_frames)
 					{
 					// The buffers have not moved yet, so the scroll is still in flight.
@@ -795,6 +868,8 @@ class visual_animation_managerst
 							!visual_layer_matches(movement.layer,current,movement.texpos);
 						}),
 				state.movements.end());
+			state.last_shift_x=translated?landed_shift[0]:0;
+			state.last_shift_y=translated?landed_shift[1]:0;
 			// has_mirrored is recomputed here rather than maintained at every write site.
 			if(state.facing.size()==size_t(input.dim_x)*size_t(input.dim_y))
 				{
@@ -867,6 +942,17 @@ class visual_animation_managerst
 		bool requires_full_redraw() const
 			{
 			return force_full_redraw;
+			}
+
+		// The scroll that landed in this viewport's buffers this frame, {0,0} if none did.
+		std::array<int32_t,2> get_last_shift(const void *viewport) const
+			{
+			for(const viewport_animationst &state:viewports)
+				{
+				if(state.viewport==viewport)
+					return {state.last_shift_x,state.last_shift_y};
+				}
+			return {0,0};
 			}
 
 		visual_movement_renderst get_movement(
