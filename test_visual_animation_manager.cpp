@@ -607,6 +607,35 @@ int main()
 	run_frame(reset_on_zoom,pan_input,8020);
 	assert(!reset_on_zoom.get_movement(viewport,viewport_visual_layer::center,1,1).active);
 
+	// Releasing a drag abandons a pan that never landed instead of waiting 120 redraws.
+	// The first changed buffer stays guarded in case it is the late pan; the next move resumes.
+	visual_animation_managerst released_drag;
+	pan_current.fill(0);
+	pan_previous.fill(0);
+	pan_input.pan_x=0;
+	pan_input.pan_finished=false;
+	pan_input.context_revision=1;
+	pan_current[1*3+1]=42;
+	pan_previous=pan_current;
+	run_frame(released_drag,pan_input,8100);
+	pan_input.pan_x=1;
+	run_frame(released_drag,pan_input,8110);
+	pan_input.pan_finished=true;
+	run_frame(released_drag,pan_input,8120);
+	pan_input.pan_finished=false;
+	pan_previous=pan_current;
+	pan_current[2*3+1]=42;
+	pan_current[1*3+1]=0;
+	run_frame(released_drag,pan_input,8130);
+	assert(!released_drag.get_movement(
+		viewport,viewport_visual_layer::center,2,1).active);
+	pan_previous=pan_current;
+	pan_current[1*3+1]=42;
+	pan_current[2*3+1]=0;
+	run_frame(released_drag,pan_input,8140);
+	assert(released_drag.get_movement(
+		viewport,viewport_visual_layer::center,1,1).active);
+
 	// Status fragments inherit nearby center motion even while their texture flashes.
 	std::array<int32_t,9> status_current{};
 	std::array<int32_t,9> status_previous{};

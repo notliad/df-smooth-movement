@@ -135,6 +135,7 @@ struct viewport_visual_animation_inputst
 	// Only a hint: it changes at input time, the buffers shift on a later render frame.
 	int32_t pan_x=0;
 	int32_t pan_y=0;
+	bool pan_finished=false;
 
 	bool valid() const
 		{
@@ -604,6 +605,13 @@ class visual_animation_managerst
 					// It may yet land, so do not resume detection on the very next redraw.
 					state.suppress_frames=2;
 					}
+				}
+			if(input.pan_finished&&!state.pending.empty())
+				{
+				// A released drag cannot provide more evidence for an unlanded pan.
+				abandon_pending(state);
+				reset_facing(state);
+				state.suppress_frames=1;
 				}
 
 			const bool suppress=!buffers_advanced||crossed_views||
