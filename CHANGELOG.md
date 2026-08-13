@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Remove the experimental free camera and its `smooth-movement camera` commands.
 - Mirror creature sprites horizontally so they face their direction of travel.
   Dwarf Fortress creature art natively faces west, so only creatures moving
   east are mirrored. Facing is sticky: only horizontal movement changes it,
