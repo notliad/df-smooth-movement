@@ -6,11 +6,21 @@
 #include "VTableInterpose.h"
 
 #include "modules/DFSDL.h"
+#include "modules/Materials.h"
+#include "modules/Units.h"
 
 #include "df/graphic.h"
 #include "df/graphic_viewportst.h"
+#include "df/item.h"
+#include "df/item_toolst.h"
+#include "df/item_type.h"
+#include "df/material.h"
 #include "df/renderer_2d_base.h"
 #include "df/texture_fullid.h"
+#include "df/unit.h"
+#include "df/unit_inventory_item.h"
+#include "df/vehicle.h"
+#include "df/world.h"
 
 #include "visual_animation.h"
 
@@ -36,10 +46,11 @@ REQUIRE_GLOBAL(gps);
 REQUIRE_GLOBAL(window_x);
 REQUIRE_GLOBAL(window_y);
 REQUIRE_GLOBAL(window_z);
+REQUIRE_GLOBAL(world);
 
 namespace {
 
-constexpr const char *plugin_version="0.3.0";
+constexpr const char *plugin_version="0.4.0-carry-debug.8";
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -61,6 +72,25 @@ int32_t previous_pan_x=0;
 int32_t previous_pan_y=0;
 bool has_pan_context=false;
 bool flip_enabled=false;
+
+struct carried_item_debugst
+{
+	int32_t visible_units=0;
+	int32_t hauled_items=0;
+	int32_t resolved_texpos=0;
+	int32_t drawable_items=0;
+	int32_t item_type=-1;
+	int32_t material_index=-1;
+	int32_t item_layer_texpos=0;
+	int32_t boulder_texpos1=0;
+	int32_t boulder_texpos2=0;
+	int32_t bar_texpos=0;
+	int32_t wood_texpos=0;
+	int32_t boulder_table_texpos=0;
+	size_t boulder_table_size=0;
+};
+
+carried_item_debugst carried_item_debug;
 
 constexpr uint32_t fire_bits=0x70000000U;
 
@@ -262,6 +292,28 @@ struct render_proxyst
 	SDL_Texture *texture;
 	bool mirrored=false;
 	int32_t mirror_shift=0;
+	std::set<std::pair<int32_t,int32_t>> coverage;
+};
+
+struct carried_item_proxyst
+{
+	float source_x;
+	float source_y;
+	int32_t target_x;
+	int32_t target_y;
+	float progress;
+	SDL_Texture *texture;
+	std::set<std::pair<int32_t,int32_t>> coverage;
+};
+
+struct contained_item_proxyst
+{
+	float source_x;
+	float source_y;
+	int32_t target_x;
+	int32_t target_y;
+	float progress;
+	SDL_Texture *texture;
 	std::set<std::pair<int32_t,int32_t>> coverage;
 };
 
@@ -514,9 +566,12 @@ SDL_Texture *cached_texture(
 		df::texture_fullid_flag::mask_transparent_background:
 		0;
 	const auto texture=renderer->tile_cache.tile_cache.find(texture_id);
-	return texture==renderer->tile_cache.tile_cache.end()?
-		nullptr:
-		static_cast<SDL_Texture *>(texture->second);
+	if(texture!=renderer->tile_cache.tile_cache.end())
+		return static_cast<SDL_Texture *>(texture->second);
+	for(const auto &[cached_id,cached_texture]:renderer->tile_cache.tile_cache)
+		if(cached_id.texpos==texpos)
+			return static_cast<SDL_Texture *>(cached_texture);
+	return nullptr;
 }
 
 // The render_copy_ex_f null check is defensive only, not a graceful-degradation path.
@@ -558,6 +613,209 @@ void draw_proxy(df::renderer_2d_base *renderer,const render_proxyst &proxy)
 		proxy.texture,
 		destination,
 		proxy.mirrored);
+}
+
+void draw_carried_item_proxy(
+	df::renderer_2d_base *renderer,
+	const carried_item_proxyst &proxy)
+{
+	const int32_t zoom=renderer->viewport_zoom_factor;
+	const float tile_size=float(zoom==128?32:std::max(1,zoom*32/128));
+	const float target_x=tile_pixel(proxy.target_x,renderer->origin_x,zoom);
+	const float target_y=tile_pixel(proxy.target_y,renderer->origin_y,zoom);
+	const float source_x=target_x+(proxy.source_x-proxy.target_x)*tile_size;
+	const float source_y=target_y+(proxy.source_y-proxy.target_y)*tile_size;
+	const float x=source_x+(target_x-source_x)*proxy.progress;
+	const float y=source_y+(target_y-source_y)*proxy.progress;
+	const auto icon=carried_item_icon_rect(x,y,tile_size);
+	const SDL_FRect destination={icon.x,icon.y,icon.width,icon.height};
+	render_copy_f(
+		static_cast<SDL_Renderer *>(renderer->sdl_renderer),
+		proxy.texture,nullptr,&destination);
+}
+
+void draw_contained_item_proxy(
+	df::renderer_2d_base *renderer,
+	const contained_item_proxyst &proxy)
+{
+	const int32_t zoom=renderer->viewport_zoom_factor;
+	const float tile_size=float(zoom==128?32:std::max(1,zoom*32/128));
+	const float target_x=tile_pixel(proxy.target_x,renderer->origin_x,zoom);
+	const float target_y=tile_pixel(proxy.target_y,renderer->origin_y,zoom);
+	const float source_x=target_x+(proxy.source_x-proxy.target_x)*tile_size;
+	const float source_y=target_y+(proxy.source_y-proxy.target_y)*tile_size;
+	const float x=source_x+(target_x-source_x)*proxy.progress;
+	const float y=source_y+(target_y-source_y)*proxy.progress;
+	const auto icon=contained_item_icon_rect(x,y,tile_size);
+	const SDL_FRect destination={icon.x,icon.y,icon.width,icon.height};
+	render_copy_f(
+		static_cast<SDL_Renderer *>(renderer->sdl_renderer),
+		proxy.texture,nullptr,&destination);
+}
+
+df::item *hauled_item(const df::unit *unit)
+{
+	if(unit==nullptr)return nullptr;
+	for(const df::unit_inventory_item *inventory_item:unit->inventory)
+		{
+		if(inventory_item!=nullptr&&inventory_item->item!=nullptr&&
+			inventory_item->mode==df::inv_item_role_type::Hauled)
+			return inventory_item->item;
+		}
+	return nullptr;
+}
+
+SDL_Texture *cached_viewport_texture(
+	df::renderer_2d_base *renderer,
+	df::graphic_viewportst *vp,
+	int32_t index,
+	int32_t texpos)
+{
+	SDL_Texture *texture=cached_texture(renderer,texpos);
+	if(texture!=nullptr||vp->screentexpos_background_two==nullptr)return texture;
+	// Hauled items are not normally drawn, so make the renderer cache this tile.
+	// The caller redraws the tile from its restored buffers before this frame reaches the screen.
+	scoped_value_restorest<int32_t> staged(vp->screentexpos_background_two[index]);
+	vp->screentexpos_background_two[index]=texpos;
+	renderer->update_viewport_tile(vp,index/vp->dim_y,index%vp->dim_y);
+	return cached_texture(renderer,texpos);
+}
+
+int32_t item_texpos(
+	df::item *item)
+{
+	const MaterialInfo material(item);
+	if(!material.isValid())return 0;
+	switch(item->getType())
+		{
+		case df::item_type::BOULDER:
+			return material.material->boulder_texpos1!=0?
+				material.material->boulder_texpos1:
+				material.material->boulder_texpos2;
+		case df::item_type::BAR:
+			return material.material->bar_texpos;
+		case df::item_type::WOOD:
+			return material.material->wood_texpos;
+		default:
+			return 0;
+		}
+}
+
+std::vector<carried_item_proxyst> collect_carried_item_proxies(
+	df::renderer_2d_base *renderer,
+	df::graphic_viewportst *vp)
+{
+	std::vector<carried_item_proxyst> proxies;
+	carried_item_debug={};
+	if(world==nullptr||window_x==nullptr||window_y==nullptr||window_z==nullptr)
+		return proxies;
+
+	std::vector<df::unit *> units;
+	Units::getUnitsInBox(
+		units,
+		*window_x,*window_y,*window_z,
+		*window_x+vp->dim_x-1,*window_y+vp->dim_y-1,*window_z);
+	for(const df::unit *unit:units)
+		{
+		const int32_t x=unit->pos.x-*window_x;
+		const int32_t y=unit->pos.y-*window_y;
+		if(!inside_clip(vp,x,y))continue;
+		const int32_t index=x*vp->dim_y+y;
+		if(vp->screentexpos[index]==0)continue;
+		++carried_item_debug.visible_units;
+		df::item *item=hauled_item(unit);
+		if(item==nullptr)continue;
+		++carried_item_debug.hauled_items;
+		carried_item_debug.item_type=int32_t(item->getType());
+		carried_item_debug.material_index=item->getActualMaterialIndex();
+		carried_item_debug.item_layer_texpos=vp->screentexpos_item[index];
+		carried_item_debug.boulder_table_size=gps->texpos_boulder.size();
+		if(carried_item_debug.material_index>=0&&
+			static_cast<size_t>(carried_item_debug.material_index)<
+			gps->texpos_boulder.size())
+			carried_item_debug.boulder_table_texpos=
+				gps->texpos_boulder[carried_item_debug.material_index];
+		const MaterialInfo material(item);
+		if(material.isValid())
+			{
+			carried_item_debug.boulder_texpos1=material.material->boulder_texpos1;
+			carried_item_debug.boulder_texpos2=material.material->boulder_texpos2;
+			carried_item_debug.bar_texpos=material.material->bar_texpos;
+			carried_item_debug.wood_texpos=material.material->wood_texpos;
+			}
+		const int32_t texpos=item_texpos(item);
+		if(texpos==0)continue;
+		++carried_item_debug.resolved_texpos;
+		SDL_Texture *texture=cached_viewport_texture(
+			renderer,vp,index,texpos);
+		if(texture==nullptr)continue;
+		++carried_item_debug.drawable_items;
+		const auto movement=animation_manager.get_movement(
+			vp,viewport_visual_layer::center,x,y);
+		const float source_x=movement.active?movement.source_x:float(x);
+		const float source_y=movement.active?movement.source_y:float(y);
+		const float progress=movement.active?movement.progress:1.0f;
+		carried_item_proxyst proxy={
+			source_x,source_y,x,y,progress,texture,{}};
+		for(int32_t coverage_x=int32_t(std::floor(std::min(source_x,float(x))));
+			coverage_x<=int32_t(std::ceil(std::max(source_x,float(x))));++coverage_x)
+			{
+			if(inside_clip(vp,coverage_x,y))proxy.coverage.emplace(coverage_x,y);
+			}
+		proxies.push_back(std::move(proxy));
+		}
+	return proxies;
+}
+
+void append_contained_item_proxy(
+	std::vector<contained_item_proxyst> &proxies,
+	df::renderer_2d_base *renderer,
+	df::graphic_viewportst *vp,
+	df::item *container,
+	viewport_visual_layer layer)
+{
+	if(container==nullptr)return;
+	const int32_t x=container->pos.x-*window_x;
+	const int32_t y=container->pos.y-*window_y;
+	if(!inside_clip(vp,x,y))return;
+	const int32_t index=x*vp->dim_y+y;
+	const int32_t *layer_texpos=layer==viewport_visual_layer::vehicle?
+		vp->screentexpos_vehicle:
+		vp->screentexpos_item;
+	if(layer_texpos==nullptr||layer_texpos[index]==0)return;
+	std::vector<df::item *> contents;
+	Items::getContainedItems(container,&contents);
+	if(contents.empty())return;
+	const int32_t texpos=item_texpos(contents.front());
+	if(texpos==0)return;
+	SDL_Texture *texture=cached_viewport_texture(renderer,vp,index,texpos);
+	if(texture==nullptr)return;
+	const auto movement=animation_manager.get_movement(vp,layer,x,y);
+	const float source_x=movement.active?movement.source_x:float(x);
+	const float source_y=movement.active?movement.source_y:float(y);
+	const float progress=movement.active?movement.progress:1.0f;
+	contained_item_proxyst proxy={source_x,source_y,x,y,progress,texture,{}};
+	for(int32_t coverage_x=int32_t(std::floor(std::min(source_x,float(x))));
+		coverage_x<=int32_t(std::ceil(std::max(source_x,float(x))));++coverage_x)
+		if(inside_clip(vp,coverage_x,y))proxy.coverage.emplace(coverage_x,y);
+	proxies.push_back(std::move(proxy));
+}
+
+std::vector<contained_item_proxyst> collect_contained_item_proxies(
+	df::renderer_2d_base *renderer,
+	df::graphic_viewportst *vp)
+{
+	std::vector<contained_item_proxyst> proxies;
+	if(world==nullptr||window_x==nullptr||window_y==nullptr)return proxies;
+	for(df::vehicle *vehicle:world->vehicles.active)
+		append_contained_item_proxy(
+			proxies,renderer,vp,Items::findItemByID(vehicle->item_id),
+			viewport_visual_layer::vehicle);
+	for(df::item *item:world->items.other.TOOL)
+		if(item!=nullptr&&item->isWheelbarrow())
+			append_contained_item_proxy(
+				proxies,renderer,vp,item,viewport_visual_layer::item);
+	return proxies;
 }
 
 std::vector<render_proxyst> collect_proxies(
@@ -896,7 +1154,9 @@ void redraw_viewport_tiles(
 void draw_viewport_interpolation_stages(
 	df::renderer_2d_base *renderer,
 	const std::vector<viewport_renderst> &viewports,
-	const tile_coveragest &coverage)
+	const tile_coveragest &coverage,
+	const std::vector<carried_item_proxyst> &carried_items,
+	const std::vector<contained_item_proxyst> &contained_items)
 {
 	for(size_t index=0;index<viewports.size();++index)
 		{
@@ -906,6 +1166,13 @@ void draw_viewport_interpolation_stages(
 		const viewport_renderst &viewport=viewports[index];
 		draw_interpolation_stages(
 			renderer,viewport.viewport,viewport.proxies,viewport.coverage);
+		if(index+1==viewports.size())
+			{
+			for(const carried_item_proxyst &proxy:carried_items)
+				draw_carried_item_proxy(renderer,proxy);
+			for(const contained_item_proxyst &proxy:contained_items)
+				draw_contained_item_proxy(renderer,proxy);
+			}
 		// A viewport shades everything drawn beneath it, so this covers every staged tile.
 		// Restricting it to the tiles this viewport has sprites on would not deepen with distance.
 		for(const auto &[x,y]:coverage)
@@ -938,13 +1205,22 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 
 	if(!viewport_readable(vp)||renderer->sdl_renderer==nullptr)
 		return;
+	std::vector<carried_item_proxyst> carried_items=
+		collect_carried_item_proxies(renderer,vp);
+	std::vector<contained_item_proxyst> contained_items=
+		collect_contained_item_proxies(renderer,vp);
 	if(!animation_manager.requires_full_redraw()&&
-		(!flip_enabled||!has_mirrored_viewport_facing(viewports)))
+		(!flip_enabled||!has_mirrored_viewport_facing(viewports))&&
+		carried_items.empty()&&contained_items.empty()&&previous_coverage.empty())
 		return;
 
 	std::vector<viewport_renderst> viewport_renders=
 		collect_viewport_renders(renderer,viewports);
 	tile_coveragest coverage=collect_viewport_coverage(viewport_renders);
+	for(const carried_item_proxyst &proxy:carried_items)
+		coverage.insert(proxy.coverage.begin(),proxy.coverage.end());
+	for(const contained_item_proxyst &proxy:contained_items)
+		coverage.insert(proxy.coverage.begin(),proxy.coverage.end());
 
 	SDL_Renderer *sdl_renderer=static_cast<SDL_Renderer *>(renderer->sdl_renderer);
 	const int32_t zoom=renderer->viewport_zoom_factor;
@@ -974,7 +1250,8 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		if(inside_clip(vp,x,y))
 			redraw_world_tile(renderer,viewport_renders,coverage,x,y);
 		}
-	draw_viewport_interpolation_stages(renderer,viewport_renders,coverage);
+	draw_viewport_interpolation_stages(
+		renderer,viewport_renders,coverage,carried_items,contained_items);
 
 	previous_coverage=std::move(coverage);
 }
@@ -1035,6 +1312,7 @@ void reset_state()
 	previous_pan_y=0;
 	has_pan_context=false;
 	flip_enabled=false;
+	carried_item_debug={};
 }
 
 command_result status_command(
@@ -1079,6 +1357,28 @@ command_result status_command(
 			}
 		return CR_WRONG_USAGE;
 		}
+	if(parameters[0]=="carry-debug"&&parameters.size()==1)
+		{
+		out.print(
+			"carried items: visible units {}, hauled {}, texpos {}, drawable {}\n",
+			carried_item_debug.visible_units,
+			carried_item_debug.hauled_items,
+			carried_item_debug.resolved_texpos,
+			carried_item_debug.drawable_items);
+		out.print(
+			"item: type {}, material {}, layer {}, boulder {}|{}, bar {}, wood {}, table[{}]={} (size {})\n",
+			carried_item_debug.item_type,
+			carried_item_debug.material_index,
+			carried_item_debug.item_layer_texpos,
+			carried_item_debug.boulder_texpos1,
+			carried_item_debug.boulder_texpos2,
+			carried_item_debug.bar_texpos,
+			carried_item_debug.wood_texpos,
+			carried_item_debug.material_index,
+			carried_item_debug.boulder_table_texpos,
+			carried_item_debug.boulder_table_size);
+		return CR_OK;
+		}
 	return CR_WRONG_USAGE;
 }
 
@@ -1089,7 +1389,7 @@ plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 {
 	commands.emplace_back(
 		"smooth-movement",
-		"Smooth movement status; sprite flipping: flip on|off.",
+		"Smooth movement status; flip on|off; carry-debug.",
 		status_command);
 	return CR_OK;
 }

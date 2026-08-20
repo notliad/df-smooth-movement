@@ -8,6 +8,7 @@ A visual plugin for Dwarf Fortress that makes movement smoother.
 - **Synced icons:** status icons follow their creature while it moves.
 - **Animated carts:** wheelbarrows and minecarts move smoothly too.
 - **Sprites flip** creatures can optionally face the direction they are walking.
+- **Carried items:** a small item icon floats above a hauler.
 
 ## Installation
 
@@ -29,6 +30,7 @@ enable smooth-movement
 smooth-movement             # show plugin status
 disable smooth-movement     # disable the plugin
 smooth-movement flip on     # enable sprites flip
+smooth-movement carry-debug # inspect the carried-item render path
 ```
 
 ## Compatibility

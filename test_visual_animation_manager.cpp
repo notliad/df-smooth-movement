@@ -90,6 +90,14 @@ int main()
 	// Reflection is self-inverse.
 	assert(mirrored_tile_x(mirrored_tile_x(6,5),5)==6);
 	assert(mirrored_tile_x(mirrored_tile_x(8,5),5)==8);
+	const auto carried_icon=carried_item_icon_rect(100.0f,200.0f,20.0f);
+	assert(carried_icon.width>0.0f&&carried_icon.height>0.0f);
+	assert(carried_icon.x>=100.0f&&carried_icon.y>=200.0f);
+	assert(carried_icon.x+carried_icon.width<=120.0f);
+	assert(carried_icon.y+carried_icon.height<=220.0f);
+	const auto contained_icon=contained_item_icon_rect(100.0f,200.0f,20.0f);
+	assert(contained_icon.x==106.0f&&contained_icon.y==206.0f);
+	assert(contained_icon.width==8.0f&&contained_icon.height==8.0f);
 
 	{
 	constexpr int32_t dim=4;

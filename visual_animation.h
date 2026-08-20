@@ -156,6 +156,40 @@ struct visual_movement_renderst
 	bool inherited=false;
 };
 
+struct visual_icon_rectst
+{
+	float x;
+	float y;
+	float width;
+	float height;
+};
+
+constexpr visual_icon_rectst carried_item_icon_rect(
+	float tile_x,
+	float tile_y,
+	float tile_size)
+{
+	return {
+		tile_x+tile_size*0.05f,
+		tile_y+tile_size*0.2f,
+		tile_size*0.7f,
+		tile_size*0.7f
+		};
+}
+
+constexpr visual_icon_rectst contained_item_icon_rect(
+	float tile_x,
+	float tile_y,
+	float tile_size)
+{
+	return {
+		tile_x+tile_size*0.3f,
+		tile_y+tile_size*0.3f,
+		tile_size*0.4f,
+		tile_size*0.4f
+		};
+}
+
 inline float animation_progress(
 	uint32_t now_ms,
 	uint32_t start_time_ms,
