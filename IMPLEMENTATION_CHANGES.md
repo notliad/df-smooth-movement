@@ -245,8 +245,39 @@ Camera commands, sprite-flip commands, and status snapshots use the same
 ownership boundary.
 
 The plugin command is registered as core-unlocked because it can synchronously
-wait for render-thread work. Holding DFHack's core suspension during that wait
-could deadlock the simulation and render threads.
+wait for render-thread work, and parsing and output need no core access.
+
+Two rules govern when a transaction may wait for the render thread, and both
+follow from one fact: `runOnRenderThread` merely appends to a queue that DFHack
+drains from `dfhooks_sdl_loop`, on DF's main/render thread, once per frame just
+before the screen buffer is drawn -- and only after DF's simulation thread has
+finished producing that frame, because the render thread spends the simulation
+phase parked in `enablerst::async_wait()`. The render thread can service a
+callback only while the simulation thread is free to run.
+
+First, a transaction must not wait while holding DFHack's core suspension. DF's
+simulation thread owns the core for the whole of `Core::Update`, so waiting there
+deadlocks unconditionally. Every `enable smooth-movement` arrives at
+`plugin_enable` with the core suspended, and the core-unlocked command flag only
+prevents DFHack adding a further suspension -- a command invoked from lua still
+runs on the simulation thread, which already holds one. So transactions check
+`Core::isSuspended()` and run inline on the calling thread when it is set. The
+frame ordering that causes the deadlock is what makes that safe: while the core
+is suspended the render thread is blocked before its render phase, so
+`update_all` is neither running nor able to start, and the state has no other
+reader.
+
+Second, a transaction must not hold the transaction mutex while waiting. A waiter
+that holds it can be joined by an inline transaction on the simulation thread,
+which then blocks on the mutex; a blocked simulation thread never lets the render
+thread reach the drain the waiter is waiting for. The queued task therefore takes
+the mutex itself, on the render thread, which keeps it mutually exclusive with
+inline transactions without ever placing it on a blocking path.
+
+Because the render thread identifies itself by running a transaction, a plugin
+enabled entirely through the inline path reaches its first frame with no owner
+recorded, so `update_all` claims ownership there. The lock is taken once, on
+that first frame.
 
 ### Renderer-state validation and checked arithmetic
 

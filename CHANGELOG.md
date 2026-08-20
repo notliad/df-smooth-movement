@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Fix two deadlocks in the render-thread transaction path, either of which froze
+  Dwarf Fortress with no output. A transaction no longer waits for the render
+  thread while holding DFHack's core suspension, and no longer holds the
+  transaction mutex while waiting; the render thread can only drain its callback
+  queue once DF's simulation thread is free, so both cases stranded the very
+  drain they were waiting for. Enabling the plugin from `onMapLoad.init` froze
+  the game on the way into a fort, and a `smooth-movement camera on` issued from
+  lua froze it the same way.
 - Keep a followed unit (including the Adventure player) screen-locked while the
   camera glides by sharing scroll detection with unit interpolation and deriving
   the camera offset from the compensating visual movement.

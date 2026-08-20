@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -62,25 +63,86 @@ decltype(&SDL_SetRenderDrawColor) set_render_draw_color=nullptr;
 // elsewhere, so they rendezvous with that thread before reading or changing it. This mutex only
 // serializes those rare transactions; the per-frame hook never takes it.
 std::mutex render_transaction_mutex;
+// Published as a pair: render_thread_id is written before the flag is set, and read after the flag
+// is seen, so the id is visible to any thread that observes the flag. Read outside the mutex --
+// render_thread_transaction has to know which thread it is on before deciding whether to take it.
 std::thread::id render_thread_id;
-bool has_render_thread_id=false;
+std::atomic<bool> has_render_thread_id{false};
+// Set while a transaction that could not rendezvous owns the state on its own thread; see
+// render_thread_transaction. Written under render_transaction_mutex, and only ever set while the
+// render hook cannot run.
+std::atomic<bool> render_state_owned_inline{false};
 
+struct inline_ownershipst
+{
+	inline_ownershipst() { render_state_owned_inline.store(true,std::memory_order_release); }
+	~inline_ownershipst() { render_state_owned_inline.store(false,std::memory_order_release); }
+	inline_ownershipst(const inline_ownershipst &)=delete;
+	inline_ownershipst &operator=(const inline_ownershipst &)=delete;
+};
+
+bool on_render_thread()
+{
+	return has_render_thread_id.load(std::memory_order_acquire)&&
+		render_thread_id==std::this_thread::get_id();
+}
+
+// Two rules govern how a transaction reaches the render state, and both come from one fact:
+// runOnRenderThread merely APPENDS to a queue. DFHack drains that queue from dfhooks_sdl_loop, on
+// DF's main/render thread, once per frame -- and only after DF's simulation thread has finished
+// producing the frame, because the render thread spends the simulation phase parked in
+// enablerst::async_wait(). So the render thread can service a callback only while the simulation
+// thread is free to run.
+//
+// Rule 1: do not wait for the render thread while holding DFHack's core suspension.
+//
+// DF's simulation thread owns the core for the whole of Core::Update, so waiting there is an
+// unconditional deadlock: the render thread cannot drain the queue until we return, and we do not
+// return until it drains the queue. This is not a corner case. Every `enable smooth-movement`
+// reaches plugin_enable with the core suspended, so the plugin froze DF outright whenever it was
+// enabled from anywhere but the console -- Core::Update -> handleLoadAndUnloadScripts -> the
+// script -> Commands::enable -> plugin_enable -> block forever. Enabling from onMapLoad.init hung
+// the game on the way into a fort. Registering the command core-unlocked does not help either: it
+// stops DFHack adding a suspension of its own, but a command invoked from lua still runs on the
+// simulation thread, which already holds one, so `smooth-movement camera on` from a script hung it
+// the same way.
+//
+// The frame ordering that causes the deadlock is what makes the alternative safe: while the core is
+// suspended the render thread is blocked BEFORE its render phase, so update_all is neither running
+// nor able to start. The state has no other reader and can be touched directly.
+//
+// Rule 2: do not hold render_transaction_mutex while waiting for the render thread.
+//
+// A waiter that holds it can be joined by an inline transaction on the simulation thread, which
+// then blocks on the mutex -- and a blocked simulation thread never lets the render thread reach
+// the drain the waiter is waiting for. Three threads, one cycle, same freeze. The queued task takes
+// the mutex itself, on the render thread, which keeps it mutually exclusive with inline
+// transactions without ever putting it on a blocking path.
 template<typename Callback>
 auto render_thread_transaction(Callback callback)
 {
 	using result_type=std::invoke_result_t<Callback>;
-	std::unique_lock<std::mutex> transaction(render_transaction_mutex);
-	if(has_render_thread_id&&render_thread_id==std::this_thread::get_id())
+	if(on_render_thread())
+		{
+		std::lock_guard<std::mutex> transaction(render_transaction_mutex);
 		return callback();
+		}
+	if(Core::getInstance().isSuspended())
+		{
+		std::lock_guard<std::mutex> transaction(render_transaction_mutex);
+		inline_ownershipst ownership;
+		return callback();
+		}
 
 	auto task=std::make_shared<std::packaged_task<result_type()>>(
 		[callback=std::move(callback)]() mutable -> result_type
 			{
+			std::lock_guard<std::mutex> transaction(render_transaction_mutex);
 			const std::thread::id current=std::this_thread::get_id();
-			if(!has_render_thread_id)
+			if(!has_render_thread_id.load(std::memory_order_relaxed))
 				{
 				render_thread_id=current;
-				has_render_thread_id=true;
+				has_render_thread_id.store(true,std::memory_order_release);
 				}
 			else if(render_thread_id!=current)
 				throw std::runtime_error("DFHack render thread changed");
@@ -91,9 +153,22 @@ auto render_thread_transaction(Callback callback)
 	return result.get();
 }
 
+// The render thread identifies itself by running a transaction, so a plugin enabled entirely
+// through the inline path above reaches its first frame with no owner recorded. Claim it there
+// instead. The lock is taken once, on that first frame; every later frame is a single atomic read.
+void adopt_render_thread()
+{
+	if(has_render_thread_id.load(std::memory_order_acquire))return;
+	std::lock_guard<std::mutex> transaction(render_transaction_mutex);
+	if(has_render_thread_id.load(std::memory_order_relaxed))return;
+	render_thread_id=std::this_thread::get_id();
+	has_render_thread_id.store(true,std::memory_order_release);
+}
+
 void assert_render_thread()
 {
-	assert(has_render_thread_id);
+	if(render_state_owned_inline.load(std::memory_order_acquire))return;
+	assert(has_render_thread_id.load(std::memory_order_acquire));
 	assert(render_thread_id==std::this_thread::get_id());
 }
 
@@ -1477,6 +1552,7 @@ IMPLEMENT_VMETHOD_INTERPOSE(renderer_hook,update_all);
 
 void renderer_hook::interpose_fn_update_all()
 {
+	adopt_render_thread();
 	assert_render_thread();
 	// update_all is the existing UI stage, so world correction must run first.
 	render_interpolated_world(this);
@@ -1772,8 +1848,10 @@ plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 		"sprite flipping: flip on|off.",
 		status_command,
 		false,
-		// The command synchronously waits for render-thread work. Holding CoreSuspender while
-		// waiting can deadlock the simulation and render threads, and parsing/output need no core.
+		// The command can synchronously wait for render-thread work, and parsing/output need no
+		// core. Note this only avoids DFHack adding a suspension: a command invoked from lua still
+		// runs on the simulation thread with the core already suspended, which is why
+		// render_thread_transaction, not this flag, is what keeps the wait from deadlocking.
 		true);
 	return CR_OK;
 }
