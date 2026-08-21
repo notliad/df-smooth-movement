@@ -1,4 +1,4 @@
-# DF Smooth Movement
+# XPredux
 
 A visual plugin for Dwarf Fortress that makes movement smoother.
 
@@ -15,22 +15,22 @@ A visual plugin for Dwarf Fortress that makes movement smoother.
 1. Download the release archive for your operating system and DFHack version.
 2. Extract it into the Dwarf Fortress/DFHack folder.
 3. Check that the plugin is in one of these locations:
-   - Linux: `hack/plugins/smooth-movement.plug.so`
-   - Windows: `hack/plugins/smooth-movement.plug.dll`
+   - Linux: `hack/plugins/xpredux.plug.so`
+   - Windows: `hack/plugins/xpredux.plug.dll`
 4. Start Dwarf Fortress through DFHack and run this in the console:
 
 ```text
-load smooth-movement
-enable smooth-movement
+load xpredux
+enable xpredux
 ```
 
 ## Useful commands
 
 ```text
-smooth-movement             # show plugin status
-disable smooth-movement     # disable the plugin
-smooth-movement flip on     # enable sprites flip
-smooth-movement camera on   # enable the free camera
+xpredux             # show plugin status
+disable xpredux     # disable the plugin
+xpredux flip on     # enable sprites flip
+xpredux camera on   # enable the free camera
 ```
 
 ## Compatibility

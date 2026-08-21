@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Rename the plugin, command, and release artifacts to `xpredux`.
+- Split DFHack integration, movement rendering, free camera, and sprite flipping
+  into separate modules with frame context passed explicitly between them.
 - Mirror creature sprites horizontally so they face their direction of travel.
   Dwarf Fortress creature art natively faces west, so only creatures moving
   east are mirrored. Facing is sticky: only horizontal movement changes it,
@@ -10,7 +13,7 @@
   composites them into a single tile sprite. Multi-tile creatures mirror as
   one composite, reflected about their anchor tile. Items, vehicles, and
   designations are never mirrored. Off by default; turn it on with
-  `smooth-movement flip on`.
+  `xpredux flip on`.
 
 ## 0.3.0 - 2026-08-03
 
@@ -24,7 +27,7 @@
   minecart sprite changes no longer interrupt interpolation, and consecutive
   steps retarget from the current fractional position instead of snapping back
   to the previous tile center.
-- Optional free camera (`smooth-movement camera on`, off by default): map scrolls
+- Optional free camera (`xpredux camera on`, off by default): map scrolls
   glide with an exponential catch-up, middle-mouse drag pans pixel-perfectly and
   can rest between tiles, and `camera <fx> <fy>` sets a persistent sub-tile
   offset. Render-only; the game's tile camera is untouched.
