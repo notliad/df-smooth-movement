@@ -1,29 +1,29 @@
-set(XPREDUX_SOURCES
-	xpredux.cpp
+set(STRATUM_SOURCES
+	stratum.cpp
 	movement_feature.cpp
 	camera_feature.cpp
 	sprite_flip_feature.cpp)
 
-dfhack_plugin(xpredux ${XPREDUX_SOURCES} LINK_LIBRARIES lua)
-target_include_directories(xpredux PRIVATE ${SDL2_INCLUDE_DIRS})
-target_compile_features(xpredux PRIVATE cxx_std_17)
+dfhack_plugin(stratum ${STRATUM_SOURCES} LINK_LIBRARIES lua)
+target_include_directories(stratum PRIVATE ${SDL2_INCLUDE_DIRS})
+target_compile_features(stratum PRIVATE cxx_std_17)
 
 add_executable(
-	xpredux-animation-test
+	stratum-animation-test
 	EXCLUDE_FROM_ALL
 	test_visual_animation_manager.cpp)
-target_compile_features(xpredux-animation-test PRIVATE cxx_std_17)
+target_compile_features(stratum-animation-test PRIVATE cxx_std_17)
 
 add_executable(
-	xpredux-camera-test
+	stratum-camera-test
 	EXCLUDE_FROM_ALL
 	test_camera_feature.cpp
 	camera_feature.cpp)
-target_compile_features(xpredux-camera-test PRIVATE cxx_std_17)
+target_compile_features(stratum-camera-test PRIVATE cxx_std_17)
 
 add_executable(
-	xpredux-sprite-flip-test
+	stratum-sprite-flip-test
 	EXCLUDE_FROM_ALL
 	test_sprite_flip_feature.cpp
 	sprite_flip_feature.cpp)
-target_compile_features(xpredux-sprite-flip-test PRIVATE cxx_std_17)
+target_compile_features(stratum-sprite-flip-test PRIVATE cxx_std_17)

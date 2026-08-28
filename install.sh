@@ -57,9 +57,9 @@ git -C "$dfhack_src" submodule update --init --recursive
 external_cmake="$dfhack_src/plugins/external/CMakeLists.txt"
 mkdir -p "$(dirname -- "$external_cmake")"
 [[ -f "$external_cmake" ]] || touch "$external_cmake"
-plugin_subdir="add_subdirectory(\"$plugin_src\" xpredux-external)"
+plugin_subdir="add_subdirectory(\"$plugin_src\" stratum-external)"
 if ! grep -Fxq "$plugin_subdir" "$external_cmake"; then
-	sed -i '\|add_subdirectory(df-smooth-movement)|d; \|add_subdirectory(".*/df-smooth-movement" df-smooth-movement)|d; \|add_subdirectory(".*/df-smooth-movement" smooth-movement-external)|d; \|add_subdirectory(".*/df-smooth-movement" xpredux-external)|d' "$external_cmake"
+	sed -i '\|add_subdirectory(df-smooth-movement)|d; \|add_subdirectory(".*/df-smooth-movement" df-smooth-movement)|d; \|add_subdirectory(".*/df-smooth-movement" smooth-movement-external)|d; \|add_subdirectory(".*/df-smooth-movement" xpredux-external)|d; \|add_subdirectory(".*/df-smooth-movement" stratum-external)|d' "$external_cmake"
 	printf '\n%s\n' "$plugin_subdir" >> "$external_cmake"
 fi
 
@@ -71,19 +71,19 @@ if [[ ! -f "$dfhack_build/build.ninja" ]]; then
 		-DCMAKE_INSTALL_PREFIX="$df_dir"
 fi
 if [[ "${SKIP_TESTS:-0}" == 1 ]]; then
-	cmake --build "$dfhack_build" --target xpredux -j2
+	cmake --build "$dfhack_build" --target stratum -j2
 else
-	cmake --build "$dfhack_build" --target xpredux xpredux-animation-test xpredux-camera-test xpredux-sprite-flip-test -j2
-	"$dfhack_build/plugins/external/xpredux-external/xpredux-animation-test"
-	"$dfhack_build/plugins/external/xpredux-external/xpredux-camera-test"
-	"$dfhack_build/plugins/external/xpredux-external/xpredux-sprite-flip-test"
+	cmake --build "$dfhack_build" --target stratum stratum-animation-test stratum-camera-test stratum-sprite-flip-test -j2
+	"$dfhack_build/plugins/external/stratum-external/stratum-animation-test"
+	"$dfhack_build/plugins/external/stratum-external/stratum-camera-test"
+	"$dfhack_build/plugins/external/stratum-external/stratum-sprite-flip-test"
 fi
 
-plugin_file="$dfhack_build/plugins/external/xpredux-external/xpredux.plug.so"
+plugin_file="$dfhack_build/plugins/external/stratum-external/stratum.plug.so"
 if [[ ! -f "$plugin_file" ]]; then
 	echo "Built plugin not found under $dfhack_build." >&2
 	exit 1
 fi
 
-install -m755 "$plugin_file" "$df_dir/hack/plugins/xpredux.plug.so"
-echo "Installed: $df_dir/hack/plugins/xpredux.plug.so"
+install -m755 "$plugin_file" "$df_dir/hack/plugins/stratum.plug.so"
+echo "Installed: $df_dir/hack/plugins/stratum.plug.so"

@@ -19,7 +19,7 @@
 
 using namespace DFHack;
 
-DFHACK_PLUGIN("xpredux");
+DFHACK_PLUGIN("stratum");
 DFHACK_PLUGIN_IS_ENABLED(is_enabled);
 
 REQUIRE_GLOBAL(enabler);
@@ -81,7 +81,7 @@ camera_frame_inputst make_camera_input(
 	return input;
 }
 
-void render_xpredux(df::renderer_2d_base *renderer)
+void render_stratum(df::renderer_2d_base *renderer)
 {
 	movement_frame_contextst frame=make_frame_context(renderer);
 	const movement_prepare_resultst prepared=movement_feature::prepare(frame);
@@ -105,7 +105,7 @@ IMPLEMENT_VMETHOD_INTERPOSE(renderer_hook,update_all);
 
 void renderer_hook::interpose_fn_update_all()
 {
-	render_xpredux(this);
+	render_stratum(this);
 	INTERPOSE_NEXT(update_all)();
 }
 
@@ -121,7 +121,7 @@ bool load_sdl(color_ostream &out)
 	#define bind(name,target) \
 		target=reinterpret_cast<decltype(target)>(LookupPlugin(sdl_handle,#name)); \
 		if(target==nullptr) { \
-			out.printerr("xpredux: SDL2 function unavailable: " #name "\n"); \
+			out.printerr("stratum: SDL2 function unavailable: " #name "\n"); \
 			clear_sdl_bindings(); \
 			return false; \
 		}
@@ -148,7 +148,7 @@ command_result status_command(
 {
 	if(parameters.empty())
 		{
-		out.print("xpredux {}: {}\n",plugin_version,is_enabled?"enabled":"disabled");
+		out.print("stratum {}: {}\n",plugin_version,is_enabled?"enabled":"disabled");
 		out.print(
 			"free camera: {}, offset {:.3f} {:.3f} (tiles east/south of the grid)\n",
 			camera_feature.enabled()?"on":"off",
@@ -218,7 +218,7 @@ command_result status_command(
 			sprite_flip_feature.set_enabled(enable);
 			if(gps!=nullptr)++gps->force_full_display_count;
 			out.print(
-				"xpredux: sprite flipping {}\n",
+				"stratum: sprite flipping {}\n",
 				enable?"enabled":"disabled");
 			return CR_OK;
 			}
@@ -233,7 +233,7 @@ DFhackCExport command_result
 plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 {
 	commands.emplace_back(
-		"xpredux",
+		"stratum",
 		"Smooth movement status; free camera: camera on|off|reset|<fx> <fy>; "
 		"sprite flipping: flip on|off.",
 		status_command);
@@ -249,7 +249,7 @@ DFhackCExport command_result plugin_enable(color_ostream &out,bool enable)
 		if(!load_sdl(out))return CR_FAILURE;
 		if(!INTERPOSE_HOOK(renderer_hook,update_all).apply())
 			{
-			out.printerr("xpredux: could not hook the 2D renderer\n");
+			out.printerr("stratum: could not hook the 2D renderer\n");
 			clear_sdl_bindings();
 			return CR_FAILURE;
 			}
@@ -262,7 +262,7 @@ DFhackCExport command_result plugin_enable(color_ostream &out,bool enable)
 		if(gps!=nullptr)++gps->force_full_display_count;
 		}
 	is_enabled=enable;
-	out.print("xpredux: {}\n",enable?"enabled":"disabled");
+	out.print("stratum: {}\n",enable?"enabled":"disabled");
 	return CR_OK;
 }
 

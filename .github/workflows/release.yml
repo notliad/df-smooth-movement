@@ -32,13 +32,13 @@ jobs:
 
       - name: Add the plugin to DFHack
         run: |
-          mkdir -p dfhack/plugins/external/xpredux
-          cp CMakeLists.txt *.cpp *.h dfhack/plugins/external/xpredux/
+          mkdir -p dfhack/plugins/external/stratum
+          cp CMakeLists.txt *.cpp *.h dfhack/plugins/external/stratum/
 
       - name: Build Linux plugin
         run: |
           cmake -S dfhack -B dfhack/build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_DOCS=OFF
-          cmake --build dfhack/build/linux --target xpredux
+          cmake --build dfhack/build/linux --target stratum
 
       - name: Build Windows plugin
         run: (cd dfhack/build && ./build-win64-from-linux.sh)
@@ -49,10 +49,10 @@ jobs:
         run: |
           release_tag="$GITHUB_REF_NAME-dfhack-$DFHACK_TAG"
           mkdir -p release/linux/hack/plugins release/windows/hack/plugins
-          install -m755 dfhack/build/linux/plugins/external/xpredux/xpredux.plug.so release/linux/hack/plugins/
-          install -m755 dfhack/build/win64-cross/output/hack/plugins/xpredux.plug.dll release/windows/hack/plugins/
-          (cd release/linux && zip -q -r "../xpredux-$release_tag-linux-x86_64.zip" hack)
-          (cd release/windows && zip -q -r "../xpredux-$release_tag-windows-x86_64.zip" hack)
+          install -m755 dfhack/build/linux/plugins/external/stratum/stratum.plug.so release/linux/hack/plugins/
+          install -m755 dfhack/build/win64-cross/output/hack/plugins/stratum.plug.dll release/windows/hack/plugins/
+          (cd release/linux && zip -q -r "../stratum-$release_tag-linux-x86_64.zip" hack)
+          (cd release/windows && zip -q -r "../stratum-$release_tag-windows-x86_64.zip" hack)
           for archive in release/*.zip; do unzip -t "$archive"; done
 
       - name: Upload release assets

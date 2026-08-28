@@ -1,4 +1,4 @@
-# XPredux
+# Stratum
 
 A visual plugin for Dwarf Fortress that makes movement smoother.
 
@@ -15,22 +15,22 @@ A visual plugin for Dwarf Fortress that makes movement smoother.
 1. Download the release archive for your operating system and DFHack version.
 2. Extract it into the Dwarf Fortress/DFHack folder.
 3. Check that the plugin is in one of these locations:
-   - Linux: `hack/plugins/xpredux.plug.so`
-   - Windows: `hack/plugins/xpredux.plug.dll`
+   - Linux: `hack/plugins/stratum.plug.so`
+   - Windows: `hack/plugins/stratum.plug.dll`
 4. Start Dwarf Fortress through DFHack and run this in the console:
 
 ```text
-load xpredux
-enable xpredux
+load stratum
+enable stratum
 ```
 
 ## Useful commands
 
 ```text
-xpredux             # show plugin status
-disable xpredux     # disable the plugin
-xpredux flip on     # enable sprites flip
-xpredux camera on   # enable the free camera
+stratum             # show plugin status
+disable stratum     # disable the plugin
+stratum flip on     # enable sprites flip
+stratum camera on   # enable the free camera
 ```
 
 ## Compatibility

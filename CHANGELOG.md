@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Rename the plugin, command, and release artifacts to `xpredux`.
+- Rename the plugin, command, and release artifacts to `stratum`.
 - Split DFHack integration, movement rendering, free camera, and sprite flipping
   into separate modules with frame context passed explicitly between them.
 - Mirror creature sprites horizontally so they face their direction of travel.
@@ -13,7 +13,7 @@
   composites them into a single tile sprite. Multi-tile creatures mirror as
   one composite, reflected about their anchor tile. Items, vehicles, and
   designations are never mirrored. Off by default; turn it on with
-  `xpredux flip on`.
+  `stratum flip on`.
 
 ## 0.3.0 - 2026-08-03
 
