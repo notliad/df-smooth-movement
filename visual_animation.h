@@ -156,13 +156,24 @@ struct visual_movement_renderst
 	bool inherited=false;
 };
 
+// smoothstep: zero velocity at both ends of every tile-to-tile hop -- the default, matching
+// upstream behavior. linear: constant velocity across the hop, removing the dead-stop for units
+// moving every tick (corners still have a sharp direction change either way).
+enum class easing_modest : int8_t
+{
+	smoothstep=0,
+	linear=1
+};
+
 inline float animation_progress(
 	uint32_t now_ms,
 	uint32_t start_time_ms,
-	uint32_t duration_ms)
+	uint32_t duration_ms,
+	easing_modest mode=easing_modest::smoothstep)
 {
 	const float linear=std::min(
 		1.0f,float(now_ms-start_time_ms)/duration_ms);
+	if(mode==easing_modest::linear)return linear;
 	return linear*linear*(3.0f-2.0f*linear);
 }
 
@@ -262,6 +273,10 @@ class visual_animation_managerst
 	std::vector<viewport_animationst> viewports;
 
 	static constexpr uint32_t movement_duration_ms=100;
+	// Session setting, not persisted across an enable/disable cycle -- same convention as
+	// smooth-movement.cpp's flip_enabled/camera_enabled globals. Defaults to smoothstep so
+	// reconstructing the manager (plugin re-enable) restores upstream behavior.
+	easing_modest easing_mode=easing_modest::smoothstep;
 	// Scrolling faster than detection keeps up: give up rather than test ever more prefixes.
 	static constexpr size_t max_pending_shifts=8;
 	// Bounds the wait on a scroll that never lands, so suppression cannot stick forever.
@@ -408,11 +423,21 @@ class visual_animation_managerst
 	float movement_progress(uint32_t start_time_ms) const
 		{
 		return animation_progress(
-			frame_time_ms,start_time_ms,movement_duration_ms);
+			frame_time_ms,start_time_ms,movement_duration_ms,easing_mode);
 		}
 
 	public:
 		visual_animation_managerst()=default;
+
+		void set_easing_mode(easing_modest mode)
+			{
+			easing_mode=mode;
+			}
+
+		easing_modest get_easing_mode() const
+			{
+			return easing_mode;
+			}
 
 		void begin_frame(uint32_t now_ms)
 			{

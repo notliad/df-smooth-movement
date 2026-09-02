@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add an optional linear movement easing mode (`smooth-movement easing linear`),
+  alongside the existing smoothstep curve which stays the default. Smoothstep
+  has zero velocity at both ends of every tile-to-tile hop, so a unit moving
+  every tick visibly stops and restarts at each tile; linear holds constant
+  velocity across the hop instead. Corners still turn sharply either way --
+  this only removes the per-tile dead-stop. Switch back with
+  `smooth-movement easing smoothstep`.
 - Mirror creature sprites horizontally so they face their direction of travel.
   Dwarf Fortress creature art natively faces west, so only creatures moving
   east are mirrored. Facing is sticky: only horizontal movement changes it,

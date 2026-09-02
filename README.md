@@ -31,7 +31,21 @@ smooth-movement             # show plugin status
 disable smooth-movement     # disable the plugin
 smooth-movement flip on     # enable sprites flip
 smooth-movement camera on   # enable the free camera
+smooth-movement easing linear   # constant-velocity movement (see below)
 ```
+
+### Movement easing
+
+Each tile-to-tile move is tweened over a fixed duration. By default it uses a
+smoothstep curve, which eases in and out -- zero velocity at both the start
+and end of every hop. For a unit moving every tick this reads as a rhythmic
+stutter: accelerate, arrive, stop, repeat.
+
+`smooth-movement easing linear` switches to constant velocity across each
+hop instead, so continuously moving units glide rather than stutter. It does
+not smooth out the sharp turn at corners (that would need velocity carried
+across hops, which this plugin doesn't do), only the dead-stop at each tile.
+Switch back with `smooth-movement easing smoothstep`, the default.
 
 ## Compatibility
 

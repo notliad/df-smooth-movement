@@ -414,6 +414,10 @@ int main()
 	}
 
 	assert(animation_progress(100,0,100)==1.0f);
+	// Default mode is smoothstep: eases in, so it lags plain linear progress early in the hop.
+	assert(animation_progress(25,0,100)==animation_progress(25,0,100,easing_modest::smoothstep));
+	assert(animation_progress(25,0,100)<0.25f);
+	assert(animation_progress(25,0,100,easing_modest::linear)==0.25f);
 	assert(inherited_visual_source_tile(0,0,1)==-1);
 	assert(inherited_visual_source_tile(2,0,1)==1);
 	assert(visual_layer_descriptor(viewport_visual_layer::right).center_x==-1);
@@ -721,4 +725,24 @@ int main()
 		viewport,viewport_visual_layer::vehicle,2,1);
 	assert(chained.active&&chained.source_x>0.0f&&chained.source_x<1.0f&&
 		chained.progress==0.0f);
+
+	// A manager defaults to smoothstep; switching to linear changes reported progress mid-hop.
+	current.fill(0);
+	previous.fill(0);
+	input.current.fill(empty.data());
+	input.previous.fill(empty.data());
+	set_layer(input,viewport_visual_layer::center,current.data(),previous.data());
+	visual_animation_managerst eased;
+	assert(eased.get_easing_mode()==easing_modest::smoothstep);
+	eased.set_easing_mode(easing_modest::linear);
+	assert(eased.get_easing_mode()==easing_modest::linear);
+	run_frame(eased,input,990);
+	previous[0*3+1]=77;
+	current[1*3+1]=77;
+	run_frame(eased,input,1000);
+	previous=current;
+	run_frame(eased,input,1025);
+	const auto eased_move=eased.get_movement(
+		viewport,viewport_visual_layer::center,1,1);
+	assert(eased_move.active&&eased_move.progress==0.25f);
 }

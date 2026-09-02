@@ -1412,6 +1412,9 @@ command_result status_command(
 			camera_enabled?"on":"off",-rest_x,-rest_y);
 		out.print("sprite flipping: {}\n",
 			flip_enabled?"on":"off");
+		out.print("movement easing: {}\n",
+			animation_manager.get_easing_mode()==easing_modest::linear?
+				"linear":"smoothstep");
 		return CR_OK;
 		}
 	if(parameters[0]=="camera")
@@ -1491,6 +1494,32 @@ command_result status_command(
 			}
 		return CR_WRONG_USAGE;
 		}
+	if(parameters[0]=="easing")
+		{
+		if(parameters.size()==1)
+			{
+			out.print("movement easing: {}\n",
+				animation_manager.get_easing_mode()==easing_modest::linear?
+					"linear":"smoothstep");
+			return CR_OK;
+			}
+		// Smoothstep decelerates to a dead stop at every tile before the next hop starts;
+		// linear holds constant velocity across the hop instead. Corners still turn sharply
+		// either way -- only the per-tile stop-start is what this switches.
+		if(parameters.size()==2&&parameters[1]=="smoothstep")
+			{
+			animation_manager.set_easing_mode(easing_modest::smoothstep);
+			out.print("smooth-movement: movement easing set to smoothstep\n");
+			return CR_OK;
+			}
+		if(parameters.size()==2&&parameters[1]=="linear")
+			{
+			animation_manager.set_easing_mode(easing_modest::linear);
+			out.print("smooth-movement: movement easing set to linear\n");
+			return CR_OK;
+			}
+		return CR_WRONG_USAGE;
+		}
 	return CR_WRONG_USAGE;
 }
 
@@ -1502,7 +1531,7 @@ plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 	commands.emplace_back(
 		"smooth-movement",
 		"Smooth movement status; free camera: camera on|off|reset|<fx> <fy>; "
-		"sprite flipping: flip on|off.",
+		"sprite flipping: flip on|off; movement easing: easing smoothstep|linear.",
 		status_command);
 	return CR_OK;
 }
