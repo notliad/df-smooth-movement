@@ -156,14 +156,36 @@ struct visual_movement_renderst
 	bool inherited=false;
 };
 
+struct visual_icon_rectst
+{
+	float x;
+	float y;
+	float width;
+	float height;
+};
+
+constexpr visual_icon_rectst carried_item_icon_rect(
+	float tile_x,
+	float tile_y,
+	float tile_size)
+{
+	return {
+		tile_x+tile_size*0.05f,
+		tile_y+tile_size*0.2f,
+		tile_size*0.7f,
+		tile_size*0.7f
+		};
+}
+
 inline float animation_progress(
 	uint32_t now_ms,
 	uint32_t start_time_ms,
-	uint32_t duration_ms)
+	uint32_t duration_ms,
+	bool linear=false)
 {
-	const float linear=std::min(
+	const float progress=std::min(
 		1.0f,float(now_ms-start_time_ms)/duration_ms);
-	return linear*linear*(3.0f-2.0f*linear);
+	return linear?progress:progress*progress*(3.0f-2.0f*progress);
 }
 
 inline bool visual_moved_between_tiles(
@@ -221,6 +243,8 @@ class visual_animation_managerst
 		int32_t target_x;
 		int32_t target_y;
 		uint32_t start_time_ms;
+		uint32_t duration_ms;
+		bool historical=false;
 	};
 
 	struct viewport_animationst
@@ -259,9 +283,10 @@ class visual_animation_managerst
 	uint32_t frame_delta_ms=0;
 	bool has_frame=false;
 	bool force_full_redraw=false;
+	bool linear=false;
 	std::vector<viewport_animationst> viewports;
 
-	static constexpr uint32_t movement_duration_ms=100;
+	static constexpr uint32_t movement_duration_ms=150;
 	// Scrolling faster than detection keeps up: give up rather than test ever more prefixes.
 	static constexpr size_t max_pending_shifts=8;
 	// Bounds the wait on a scroll that never lands, so suppression cannot stick forever.
@@ -405,14 +430,32 @@ class visual_animation_managerst
 		return viewports.back();
 		}
 
-	float movement_progress(uint32_t start_time_ms) const
+	float movement_progress(const movementst &movement) const
 		{
 		return animation_progress(
-			frame_time_ms,start_time_ms,movement_duration_ms);
+			frame_time_ms,movement.start_time_ms,
+			linear?movement.duration_ms:movement_duration_ms,linear);
+		}
+
+	bool movement_active(const movementst &movement) const
+		{
+		return !movement.historical&&
+			frame_time_ms-movement.start_time_ms<
+			(linear?movement.duration_ms:movement_duration_ms);
 		}
 
 	public:
 		visual_animation_managerst()=default;
+
+		void set_linear(bool enabled)
+			{
+			linear=enabled;
+			}
+
+		bool is_linear() const
+			{
+			return linear;
+			}
 
 		void begin_frame(uint32_t now_ms)
 			{
@@ -424,7 +467,13 @@ class visual_animation_managerst
 			for(viewport_animationst &state:viewports)
 				{
 				state.seen=false;
-				if(!state.movements.empty())force_full_redraw=true;
+				for(movementst &movement:state.movements)
+					{
+					if(movement.historical)continue;
+					force_full_redraw=true;
+					if(linear&&frame_time_ms-movement.start_time_ms>=movement.duration_ms)
+						movement.historical=true;
+					}
 				}
 			}
 
@@ -725,20 +774,34 @@ class visual_animation_managerst
 							claimed_sources[source]=1;
 							float visual_source_x=float(source/input.dim_y);
 							float visual_source_y=float(source%input.dim_y);
+							const movementst *predecessor=nullptr;
 							for(size_t i=0;i<existing_movement_count;++i)
 								{
 								const movementst &movement=state.movements[i];
 								if(movement.layer!=
-										static_cast<viewport_visual_layer>(layer)||
+									static_cast<viewport_visual_layer>(layer)||
 									movement.target_x!=visual_source_x||
-									movement.target_y!=visual_source_y)continue;
-								const float progress=
-									movement_progress(movement.start_time_ms);
-								visual_source_x=movement.source_x+
-									(movement.target_x-movement.source_x)*progress;
-								visual_source_y=movement.source_y+
-									(movement.target_y-movement.source_y)*progress;
-								break;
+									movement.target_y!=visual_source_y||
+									(linear&&frame_time_ms-movement.start_time_ms>500))continue;
+								if(predecessor==nullptr||
+									frame_time_ms-movement.start_time_ms<
+									frame_time_ms-predecessor->start_time_ms)
+									predecessor=&movement;
+								}
+							uint32_t duration_ms=movement_duration_ms;
+							if(predecessor!=nullptr)
+								{
+								if(movement_active(*predecessor))
+									{
+									const float progress=movement_progress(*predecessor);
+									visual_source_x=predecessor->source_x+
+										(predecessor->target_x-predecessor->source_x)*progress;
+									visual_source_y=predecessor->source_y+
+										(predecessor->target_y-predecessor->source_y)*progress;
+									}
+								if(linear)duration_ms=std::clamp(
+									frame_time_ms-predecessor->start_time_ms,
+									movement_duration_ms,500U);
 								}
 							state.movements.push_back(
 								{
@@ -748,7 +811,8 @@ class visual_animation_managerst
 								visual_source_y,
 								x,
 								y,
-								frame_time_ms
+								frame_time_ms,
+								duration_ms
 								});
 							if(static_cast<viewport_visual_layer>(layer)==
 									viewport_visual_layer::center&&
@@ -785,14 +849,20 @@ class visual_animation_managerst
 				std::remove_if(
 					state.movements.begin(),
 					state.movements.end(),
-					[&](const movementst &movement)
+					[&](movementst &movement)
 						{
 						const size_t layer=static_cast<size_t>(movement.layer);
 						const int32_t target=movement.target_x*input.dim_y+movement.target_y;
 						const int32_t current=input.current[layer][target];
-						return frame_time_ms-movement.start_time_ms>=movement_duration_ms||
-							current==0||
+						const bool invalid=current==0||
 							!visual_layer_matches(movement.layer,current,movement.texpos);
+						if(linear)
+							{
+							if(invalid||frame_time_ms-movement.start_time_ms>=movement.duration_ms)
+								movement.historical=true;
+							return frame_time_ms-movement.start_time_ms>500;
+							}
+						return frame_time_ms-movement.start_time_ms>=movement_duration_ms||invalid;
 						}),
 				state.movements.end());
 			// has_mirrored is recomputed here rather than maintained at every write site.
@@ -811,7 +881,8 @@ class visual_animation_managerst
 					}
 				state.has_mirrored=any_mirrored;
 				}
-			if(!state.movements.empty())force_full_redraw=true;
+			for(const movementst &movement:state.movements)
+				if(movement_active(movement))force_full_redraw=true;
 			}
 
 		void end_frame()
@@ -824,7 +895,8 @@ class visual_animation_managerst
 				viewports.end());
 			for(const viewport_animationst &state:viewports)
 				{
-				if(!state.movements.empty())force_full_redraw=true;
+				for(const movementst &movement:state.movements)
+					if(movement_active(movement))force_full_redraw=true;
 				}
 			}
 
@@ -882,6 +954,7 @@ class visual_animation_managerst
 				bool ambiguous=false;
 				for(const movementst &movement:state.movements)
 					{
+					if(!movement_active(movement))continue;
 					if(movement.layer==layer&&movement.target_x==target_x&&
 						movement.target_y==target_y)
 						{
@@ -889,7 +962,7 @@ class visual_animation_managerst
 							true,
 							movement.source_x,
 							movement.source_y,
-							movement_progress(movement.start_time_ms)
+							movement_progress(movement)
 							};
 						}
 					if(layer==viewport_visual_layer::vehicle||
@@ -902,7 +975,8 @@ class visual_animation_managerst
 							movement.source_x-movement.target_x||
 						companion->source_y-companion->target_y!=
 							movement.source_y-movement.target_y||
-						companion->start_time_ms!=movement.start_time_ms))
+						companion->start_time_ms!=movement.start_time_ms||
+						companion->duration_ms!=movement.duration_ms))
 						ambiguous=true;
 					else if(companion==nullptr)
 						companion=&movement;
@@ -913,7 +987,7 @@ class visual_animation_managerst
 						true,
 						target_x+companion->source_x-companion->target_x,
 						target_y+companion->source_y-companion->target_y,
-						movement_progress(companion->start_time_ms),
+						movement_progress(*companion),
 						true
 						};
 				break;

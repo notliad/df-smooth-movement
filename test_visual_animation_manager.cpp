@@ -413,7 +413,14 @@ int main()
 	assert(manager.get_facing(gap_viewport,2,3)==native_sprite_facing);
 	}
 
-	assert(animation_progress(100,0,100)==1.0f);
+	assert(animation_progress(150,0,150)==1.0f);
+	assert(animation_progress(75,0,150)==0.5f);
+	assert(animation_progress(75,0,150,true)==0.5f);
+	assert(animation_progress(25,0,150,true)==float(1)/6);
+	assert(animation_progress(25,0,150)<float(1)/6);
+	const auto carried_icon=carried_item_icon_rect(100.0f,200.0f,20.0f);
+	assert(carried_icon.x==101.0f&&carried_icon.y==204.0f);
+	assert(carried_icon.width==14.0f&&carried_icon.height==14.0f);
 	assert(inherited_visual_source_tile(0,0,1)==-1);
 	assert(inherited_visual_source_tile(2,0,1)==1);
 	assert(visual_layer_descriptor(viewport_visual_layer::right).center_x==-1);
@@ -447,20 +454,122 @@ int main()
 
 	previous=current;
 	set_layer(input,viewport_visual_layer::center,current.data(),previous.data());
-	run_frame(movement,input,2050);
+	run_frame(movement,input,2075);
 	render=movement.get_movement(viewport,viewport_visual_layer::center,1,1);
 	assert(render.active);
 	assert(render.progress==0.5f);
 
-	run_frame(movement,input,2100);
+	run_frame(movement,input,2150);
 	assert(!movement.get_movement(
 		viewport,viewport_visual_layer::center,1,1).active);
 	assert(movement.requires_full_redraw());
 
-	run_frame(movement,input,2120);
+	run_frame(movement,input,2170);
 	assert(!movement.requires_full_redraw());
 
+	visual_animation_managerst linear_movement;
+	linear_movement.set_linear(true);
+	current.fill(0);
+	previous.fill(0);
+	set_layer(input,viewport_visual_layer::center,current.data(),previous.data());
+	run_frame(linear_movement,input,2190);
+	previous[0*3+1]=42;
+	current[1*3+1]=42;
+	run_frame(linear_movement,input,2200);
+	previous=current;
+	run_frame(linear_movement,input,2225);
+	assert(linear_movement.get_movement(
+		viewport,viewport_visual_layer::center,1,1).progress==float(1)/6);
+
+	// Linear cadence follows the latest step, while completed movement stays silent history.
+	{
+	std::array<int32_t,9> at_zero{};
+	std::array<int32_t,9> at_one{};
+	std::array<int32_t,9> at_two{};
+	at_zero[0*3+1]=42;
+	at_one[1*3+1]=42;
+	at_two[2*3+1]=42;
+
+	visual_animation_managerst adaptive;
+	adaptive.set_linear(true);
+	set_layer(input,viewport_visual_layer::center,at_zero.data(),empty.data());
+	run_frame(adaptive,input,1000);
+	set_layer(input,viewport_visual_layer::center,at_one.data(),at_zero.data());
+	run_frame(adaptive,input,1010);
+	run_frame(adaptive,input,1085);
+	assert(adaptive.get_movement(
+		viewport,viewport_visual_layer::center,1,1).progress==0.5f); // first: 150 ms
+	run_frame(adaptive,input,1160);
+	assert(!adaptive.get_movement(
+		viewport,viewport_visual_layer::center,1,1).active);
+	run_frame(adaptive,input,1161);
+	assert(!adaptive.requires_full_redraw());
+	set_layer(input,viewport_visual_layer::center,at_two.data(),at_one.data());
+	run_frame(adaptive,input,1310);
+	run_frame(adaptive,input,1460);
+	assert(adaptive.get_movement(
+		viewport,viewport_visual_layer::center,2,1).progress==0.5f); // cadence: 300 ms
+
+	visual_animation_managerst minimum;
+	minimum.set_linear(true);
+	set_layer(input,viewport_visual_layer::center,at_zero.data(),empty.data());
+	run_frame(minimum,input,2000);
+	set_layer(input,viewport_visual_layer::center,at_one.data(),at_zero.data());
+	run_frame(minimum,input,2010);
+	set_layer(input,viewport_visual_layer::center,at_two.data(),at_one.data());
+	run_frame(minimum,input,2110);
+	run_frame(minimum,input,2185);
+	assert(minimum.get_movement(
+		viewport,viewport_visual_layer::center,2,1).progress==0.5f); // clamped to 150 ms
+
+	visual_animation_managerst maximum;
+	maximum.set_linear(true);
+	set_layer(input,viewport_visual_layer::center,at_zero.data(),empty.data());
+	run_frame(maximum,input,3000);
+	set_layer(input,viewport_visual_layer::center,at_one.data(),at_zero.data());
+	run_frame(maximum,input,3010);
+	set_layer(input,viewport_visual_layer::center,at_two.data(),at_one.data());
+	run_frame(maximum,input,3510);
+	run_frame(maximum,input,3760);
+	assert(maximum.get_movement(
+		viewport,viewport_visual_layer::center,2,1).progress==0.5f); // clamped to 500 ms
+	set_layer(input,viewport_visual_layer::center,at_one.data(),at_two.data());
+	run_frame(maximum,input,4111);
+	run_frame(maximum,input,4186);
+	assert(maximum.get_movement(
+		viewport,viewport_visual_layer::center,1,1).progress==0.5f); // history expired: 150 ms
+
+	// Reversal leaves two predecessors at B; the newer B->A step must win for A->B.
+	visual_animation_managerst reversal;
+	reversal.set_linear(true);
+	set_layer(input,viewport_visual_layer::center,at_zero.data(),empty.data());
+	run_frame(reversal,input,4000);
+	set_layer(input,viewport_visual_layer::center,at_one.data(),at_zero.data());
+	run_frame(reversal,input,4010);
+	set_layer(input,viewport_visual_layer::center,at_zero.data(),at_one.data());
+	run_frame(reversal,input,4310);
+	set_layer(input,viewport_visual_layer::center,at_one.data(),at_zero.data());
+	run_frame(reversal,input,4510);
+	run_frame(reversal,input,4610);
+	assert(reversal.get_movement(
+		viewport,viewport_visual_layer::center,1,1).progress==0.5f); // latest cadence: 200 ms
+
+	visual_animation_managerst smoothstep;
+	set_layer(input,viewport_visual_layer::center,at_zero.data(),empty.data());
+	run_frame(smoothstep,input,5000);
+	set_layer(input,viewport_visual_layer::center,at_one.data(),at_zero.data());
+	run_frame(smoothstep,input,5010);
+	set_layer(input,viewport_visual_layer::center,at_two.data(),at_one.data());
+	run_frame(smoothstep,input,5110);
+	run_frame(smoothstep,input,5185);
+	assert(smoothstep.get_movement(
+		viewport,viewport_visual_layer::center,2,1).progress==0.5f); // fixed 150 ms
+	}
+
 	visual_animation_managerst ambiguous;
+	assert(!ambiguous.is_linear());
+	ambiguous.set_linear(true);
+	assert(ambiguous.is_linear());
 	run_frame(ambiguous,input,2990);
 	previous.fill(0);
 	previous[0*3+1]=42;
@@ -652,7 +761,7 @@ int main()
 	assert(carried_item.active&&carried_item.inherited);
 	previous=current;
 	status_current[1*3+0]=92;
-	run_frame(companion,input,9050);
+	run_frame(companion,input,9075);
 	status=companion.get_movement(viewport,viewport_visual_layer::designation,1,0);
 	assert(status.active&&status.progress==0.5f);
 
@@ -709,7 +818,7 @@ int main()
 		viewport,viewport_visual_layer::vehicle,1,1).active);
 	previous=current;
 	current[1*3+1]=79;
-	run_frame(vehicle,input,12050);
+	run_frame(vehicle,input,12075);
 	const auto cart=vehicle.get_movement(
 		viewport,viewport_visual_layer::vehicle,1,1);
 	assert(cart.active&&cart.progress==0.5f);

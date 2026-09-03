@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Set smoothstep movement tweens to 150 ms. Add optional linear easing with
+  adaptive 150–500 ms durations based on the cadence between consecutive steps
+  (`smooth-movement linear on`) and icons for boulders, bars, and wood hauled by units
+  (`smooth-movement hauled on`). Both flags are off by default.
 - Mirror creature sprites horizontally so they face their direction of travel.
   Dwarf Fortress creature art natively faces west, so only creatures moving
   east are mirrored. Facing is sticky: only horizontal movement changes it,

@@ -4,7 +4,7 @@ A visual plugin for Dwarf Fortress that makes movement smoother.
 
 ## Features
 
-- **Smooth movement:** creatures, hauled items, and vehicles glide between tiles.
+- **Smooth movement:** creatures, hauled raw materials, and vehicles glide between tiles.
 - **Synced icons:** status icons follow their creature while it moves.
 - **Animated carts:** wheelbarrows and minecarts move smoothly too.
 - **Sprites flip** creatures can optionally face the direction they are walking.
@@ -29,8 +29,12 @@ enable smooth-movement
 ```text
 smooth-movement             # show plugin status
 disable smooth-movement     # disable the plugin
+smooth-movement all on      # enable every flag except the WIP free camera
+smooth-movement all off     # disable every flag except the WIP free camera
 smooth-movement flip on     # enable sprites flip
 smooth-movement camera on   # enable the free camera
+smooth-movement linear on   # use linear easing with adaptive 150–500 ms movement tweens
+smooth-movement hauled on   # show icons for carried boulders, bars, and wood
 ```
 
 ## Compatibility
