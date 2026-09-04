@@ -38,6 +38,32 @@ void set_layer(
 	input.previous[index]=previous;
 }
 
+template<size_t N>
+void fill_background(std::array<int32_t,N> &background,int32_t seed)
+{
+	for(size_t i=0;i<N;++i)background[i]=seed+int32_t(i);
+}
+
+template<size_t N>
+void shift_background(
+	std::array<int32_t,N> &current,
+	const std::array<int32_t,N> &previous,
+	int32_t dimension,
+	int32_t dx,
+	int32_t dy,
+	int32_t exposed_seed)
+{
+	for(int32_t x=0;x<dimension;++x)
+		for(int32_t y=0;y<dimension;++y)
+			{
+			const int32_t sx=x+dx;
+			const int32_t sy=y+dy;
+			const size_t index=size_t(x*dimension+y);
+			current[index]=sx>=0&&sx<dimension&&sy>=0&&sy<dimension?
+				previous[size_t(sx*dimension+sy)]:exposed_seed+int32_t(index);
+			}
+}
+
 void run_frame(
 	visual_animation_managerst &manager,
 	const viewport_visual_animation_inputst &input,
@@ -84,6 +110,12 @@ int main()
 	assert(mirrored_tile_x(4,5)==6);   // left spill -> right
 	// The formula is a general reflection, so it holds for offsets no layer can express.
 	assert(mirrored_tile_x(8,5)==2);
+	assert(!camera_glide_enabled(false,false));
+	assert(camera_glide_enabled(false,true));
+	assert(camera_glide_enabled(true,false));
+	assert(native_follow_changed(-1,42));
+	assert(!native_follow_changed(42,42));
+	assert(native_follow_changed(42,-1));
 	// center_x is only ever -1, 0 or +1, so the real mirror shift is only ever -2, 0 or +2.
 	for(const auto &descriptor:visual_layer_descriptors)
 		assert(descriptor.center_x>=-1&&descriptor.center_x<=1);
@@ -125,6 +157,12 @@ int main()
 	assert(manager.get_facing(viewport,1,2)==visual_facingst::west);
 	set_layer(input,viewport_visual_layer::center,before,west_after);
 	run_frame(manager,input,1032);
+	assert(manager.get_facing(viewport,2,2)==visual_facingst::east);
+	assert(manager.get_movement(
+		viewport,viewport_visual_layer::center,2,2).active);
+	manager.cancel_transitions();
+	assert(!manager.get_movement(
+		viewport,viewport_visual_layer::center,2,2).active);
 	assert(manager.get_facing(viewport,2,2)==visual_facingst::east);
 	}
 
@@ -570,6 +608,7 @@ int main()
 	assert(!ambiguous.is_linear());
 	ambiguous.set_linear(true);
 	assert(ambiguous.is_linear());
+	set_layer(input,viewport_visual_layer::center,current.data(),previous.data());
 	run_frame(ambiguous,input,2990);
 	previous.fill(0);
 	previous[0*3+1]=42;
@@ -830,4 +869,107 @@ int main()
 		viewport,viewport_visual_layer::vehicle,2,1);
 	assert(chained.active&&chained.source_x>0.0f&&chained.source_x<1.0f&&
 		chained.progress==0.0f);
+
+	// Every cardinal and diagonal follow step gets a stable inverse visual anchor.
+	for(int32_t dx=-1;dx<=1;++dx)
+		for(int32_t dy=-1;dy<=1;++dy)
+			{
+			if(dx==0&&dy==0)continue;
+			constexpr int32_t dim=7;
+			constexpr size_t tiles=size_t(dim)*size_t(dim);
+			const int token=dx*3+dy;
+			std::array<int32_t,tiles> empty{};
+			std::array<int32_t,tiles> creature{};
+			std::array<int32_t,tiles> creature_old{};
+			std::array<int32_t,tiles> background{};
+			std::array<int32_t,tiles> background_old{};
+			fill_background(background_old,2000);
+			background=background_old;
+			const int32_t center=dim/2;
+			creature[size_t(center*dim+center)]=42;
+			creature_old=creature;
+			auto follow_input=make_input(&token,dim,empty.data());
+			set_layer(follow_input,viewport_visual_layer::center,
+				creature.data(),creature_old.data());
+			follow_input.current_background=background.data();
+			follow_input.previous_background=background_old.data();
+			visual_animation_managerst follow_manager;
+			run_frame(follow_manager,follow_input,20000);
+			follow_input.pan_x=dx;
+			follow_input.pan_y=dy;
+			run_frame(follow_manager,follow_input,20010);
+			shift_background(background,background_old,dim,dx,dy,3000);
+			run_frame(follow_manager,follow_input,20020);
+			const auto scroll=follow_manager.get_scroll(&token);
+			assert(scroll.landed&&scroll.landed_x==dx&&scroll.landed_y==dy&&
+				!scroll.pending&&scroll.follow_candidate!=no_visual_movement);
+			const auto movement=follow_manager.get_movement(
+				&token,viewport_visual_layer::center,center,center);
+			const auto follow=follow_manager.get_follow(&token,scroll.follow_candidate);
+			assert(movement.active&&follow.active&&
+				movement.movement_id==scroll.follow_candidate);
+			assert(std::abs((movement.source_x-center)*(1.0f-movement.progress)+
+				follow.offset_x)<0.000001f);
+			assert(std::abs((movement.source_y-center)*(1.0f-movement.progress)+
+				follow.offset_y)<0.000001f);
+			run_frame(follow_manager,follow_input,20095);
+			const auto fractional=follow_manager.get_follow(&token,scroll.follow_candidate);
+			assert(fractional.active&&std::abs(fractional.offset_x)<1.0f&&
+				std::abs(fractional.offset_y)<1.0f);
+			}
+
+	// A multi-tile announcement may land partially, then retire the remaining debt.
+	{
+	constexpr int32_t dim=6;
+	constexpr size_t tiles=size_t(dim)*size_t(dim);
+	const int token=0;
+	std::array<int32_t,tiles> empty{};
+	std::array<int32_t,tiles> background{};
+	std::array<int32_t,tiles> background_old{};
+	fill_background(background_old,4000);
+	background=background_old;
+	auto input=make_input(&token,dim,empty.data());
+	input.current_background=background.data();
+	input.previous_background=background_old.data();
+	visual_animation_managerst partial;
+	run_frame(partial,input,21000);
+	input.pan_x=3;
+	run_frame(partial,input,21010);
+	shift_background(background,background_old,dim,1,0,5000);
+	run_frame(partial,input,21020);
+	auto scroll=partial.get_scroll(&token);
+	assert(scroll.landed&&scroll.landed_x==1&&scroll.pending&&scroll.pending_x==2);
+	background_old=background;
+	shift_background(background,background_old,dim,2,0,6000);
+	run_frame(partial,input,21030);
+	scroll=partial.get_scroll(&token);
+	assert(scroll.landed&&scroll.landed_x==2&&!scroll.pending);
+	}
+
+	// Uniform terrain is visually safe to retire; absent data abandons without an offset.
+	{
+	constexpr int32_t dim=4;
+	constexpr size_t tiles=size_t(dim)*size_t(dim);
+	const int uniform_token=0,empty_token=1;
+	std::array<int32_t,tiles> empty{};
+	std::array<int32_t,tiles> uniform{};
+	uniform.fill(77);
+	auto input=make_input(&uniform_token,dim,empty.data());
+	input.current_background=uniform.data();
+	input.previous_background=uniform.data();
+	visual_animation_managerst manager;
+	run_frame(manager,input,22000);
+	input.pan_x=1;
+	run_frame(manager,input,22010);
+	assert(manager.get_scroll(&uniform_token).landed);
+	auto empty_input=make_input(&empty_token,dim,empty.data());
+	empty_input.current_background=empty.data();
+	empty_input.previous_background=empty.data();
+	visual_animation_managerst empty_manager;
+	run_frame(empty_manager,empty_input,22100);
+	empty_input.pan_x=1;
+	run_frame(empty_manager,empty_input,22110);
+	const auto abandoned=empty_manager.get_scroll(&empty_token);
+	assert(abandoned.abandoned&&!abandoned.pending);
+	}
 }

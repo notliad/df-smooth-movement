@@ -15,6 +15,7 @@
 #include "df/item.h"
 #include "df/item_type.h"
 #include "df/material.h"
+#include "df/plotinfost.h"
 #include "df/renderer_2d_base.h"
 #include "df/texture_fullid.h"
 #include "df/unit.h"
@@ -43,6 +44,8 @@ DFHACK_PLUGIN_IS_ENABLED(is_enabled);
 
 REQUIRE_GLOBAL(enabler);
 REQUIRE_GLOBAL(gps);
+REQUIRE_GLOBAL(pause_state);
+REQUIRE_GLOBAL(plotinfo);
 REQUIRE_GLOBAL(window_x);
 REQUIRE_GLOBAL(window_y);
 REQUIRE_GLOBAL(window_z);
@@ -94,11 +97,13 @@ double transient_x=0.0;                       // decaying glide offset, pixels
 double transient_y=0.0;
 double rest_x=0.0;                            // persistent free-camera offset, tiles
 double rest_y=0.0;                            // (positive = view sits WEST/NORTH of window)
-int32_t camera_pending_dx=0;                  // scroll delta announced but not yet in the buffers
-int32_t camera_pending_dy=0;
-int32_t camera_pending_frames=0;
 int32_t self_scroll_x=0;                      // window deltas WE wrote: visual no-ops when landing
 int32_t self_scroll_y=0;
+visual_movement_idst camera_follow_id=no_visual_movement;
+const void *camera_follow_viewport=nullptr;
+double camera_follow_x=0.0;
+double camera_follow_y=0.0;
+bool camera_ignore_pending=false;
 bool drag_active=false;
 double drag_anchor_vx=0.0;                    // visual camera at drag start, tiles
 double drag_anchor_vy=0.0;
@@ -108,6 +113,7 @@ bool camera_was_offset=false;                 // edge-detects offset->0 for one 
 int32_t camera_prev_wx=0;                     // window-scroll observation baseline
 int32_t camera_prev_wy=0;
 bool camera_has_prev=false;
+int32_t native_follow_id=-1;
 
 double tile_px(const df::renderer_2d_base *renderer)
 {
@@ -117,44 +123,24 @@ double tile_px(const df::renderer_2d_base *renderer)
 
 // Match ratio of "buffers shifted by (dwx,dwy)" on the background layer: 0..1, or -1 when there
 // is nothing to compare (empty background).
-double background_match_ratio(const df::graphic_viewportst *vp,int32_t dwx,int32_t dwy)
-{
-	int32_t considered=0;
-	int32_t matches=0;
-	for(int32_t x=0;x<vp->dim_x;++x)
-		{
-		const int32_t sx=x+dwx;
-		if(sx<0||sx>=vp->dim_x)continue;
-		for(int32_t y=0;y<vp->dim_y;++y)
-			{
-			const int32_t sy=y+dwy;
-			if(sy<0||sy>=vp->dim_y)continue;
-			const int32_t cur=vp->screentexpos_background[x*vp->dim_y+y];
-			if(cur==0)continue;
-			++considered;
-			if(vp->screentexpos_background_old[sx*vp->dim_y+sy]==cur)++matches;
-			}
-		}
-	if(considered==0)return -1.0;
-	return double(matches)/double(considered);
-}
-
 // Cancel everything except the persistent rest offset (the camera keeps its sub-tile position
 // across zoom/z/resize; only the in-flight animation state is unfollowable).
-void clear_camera_pending()
+void clear_camera_tracking()
 {
-	camera_pending_dx=0;
-	camera_pending_dy=0;
-	camera_pending_frames=0;
 	self_scroll_x=0;
 	self_scroll_y=0;
+	camera_follow_id=no_visual_movement;
+	camera_follow_viewport=nullptr;
+	camera_follow_x=0.0;
+	camera_follow_y=0.0;
+	camera_ignore_pending=false;
 }
 
 void cancel_camera_transients()
 {
 	transient_x=0.0;
 	transient_y=0.0;
-	clear_camera_pending();
+	clear_camera_tracking();
 	drag_active=false;
 }
 
@@ -187,47 +173,19 @@ void normalize_rest()
 		}
 }
 
-// A scroll of (ax,ay) tiles has landed in the buffers: our own normalization writes are visual
-// no-ops (they move into rest); the remainder is a real scroll and glides -- unless a drag is
-// driving the position directly, in which case it folds into rest wholesale.
-void attribute_landed(int32_t ax,int32_t ay,double tile)
-{
-	int32_t sx=0;
-	if(self_scroll_x!=0&&(self_scroll_x>0)==(ax>0)&&ax!=0)
-		sx=(std::abs(self_scroll_x)<=std::abs(ax))?self_scroll_x:ax;
-	int32_t sy=0;
-	if(self_scroll_y!=0&&(self_scroll_y>0)==(ay>0)&&ay!=0)
-		sy=(std::abs(self_scroll_y)<=std::abs(ay))?self_scroll_y:ay;
-	self_scroll_x-=sx;
-	self_scroll_y-=sy;
-	rest_x+=sx;
-	rest_y+=sy;
-	const int32_t gx=ax-sx;
-	const int32_t gy=ay-sy;
-	if(drag_active)
-		{
-		rest_x+=gx;
-		rest_y+=gy;
-		}
-	else
-		{
-		transient_x+=gx*tile;
-		transient_y+=gy*tile;
-		const double cap=tile*(camera_max_glide_tiles+0.5);
-		transient_x=std::clamp(transient_x,-cap,cap);
-		transient_y=std::clamp(transient_y,-cap,cap);
-		}
-}
-
 // Per-frame camera bookkeeping: observe window scrolls, attribute them when the buffers apply
 // them (glide vs our own normalization writes), drive the drag, decay the transient.
 void update_camera(
 	df::renderer_2d_base *renderer,
 	const df::graphic_viewportst *vp,
-	uint32_t delta_ms)
+	uint32_t delta_ms,
+	bool native_follow_active)
 {
-	if(!camera_enabled)return;
+	if(!camera_glide_enabled(camera_enabled,native_follow_active))return;
 	const double tile=tile_px(renderer);
+	const double k=std::exp(-double(delta_ms)/camera_tau_ms);
+	transient_x*=k;
+	transient_y*=k;
 	const int32_t wx=window_x?*window_x:0;
 	const int32_t wy=window_y?*window_y:0;
 	if(camera_has_prev&&(wx!=camera_prev_wx||wy!=camera_prev_wy))
@@ -236,79 +194,83 @@ void update_camera(
 		const int32_t dy=wy-camera_prev_wy;
 		if((std::abs(dx)>camera_max_glide_tiles||std::abs(dy)>camera_max_glide_tiles)&&
 			!drag_active)
-			cancel_camera_transients();   // teleport-like jump (recenter/minimap): snap
-		else
 			{
-			camera_pending_dx+=dx;
-			camera_pending_dy+=dy;
-			camera_pending_frames=0;
+			transient_x=0.0;
+			transient_y=0.0;
+			camera_follow_id=no_visual_movement;
+			camera_follow_x=0.0;
+			camera_follow_y=0.0;
+			camera_ignore_pending=true;
 			}
 		}
 	camera_prev_wx=wx;
 	camera_prev_wy=wy;
 	camera_has_prev=true;
 
-	if(camera_pending_dx!=0||camera_pending_dy!=0)
+	const visual_scroll_renderst scroll=animation_manager.get_scroll(vp);
+	if(scroll.abandoned)
 		{
-		if(std::abs(camera_pending_dx)>6||std::abs(camera_pending_dy)>6)
+		clear_camera_tracking();
+		}
+	if(scroll.landed)
+		{
+		int32_t sx=0;
+		if(self_scroll_x!=0&&scroll.landed_x!=0&&
+			(self_scroll_x>0)==(scroll.landed_x>0))
+			sx=std::abs(self_scroll_x)<=std::abs(scroll.landed_x)?
+				self_scroll_x:scroll.landed_x;
+		int32_t sy=0;
+		if(self_scroll_y!=0&&scroll.landed_y!=0&&
+			(self_scroll_y>0)==(scroll.landed_y>0))
+			sy=std::abs(self_scroll_y)<=std::abs(scroll.landed_y)?
+				self_scroll_y:scroll.landed_y;
+		self_scroll_x-=sx;
+		self_scroll_y-=sy;
+		rest_x+=sx;
+		rest_y+=sy;
+		const int32_t gx=scroll.landed_x-sx;
+		const int32_t gy=scroll.landed_y-sy;
+		const bool ignore=camera_ignore_pending;
+		if(!scroll.pending)camera_ignore_pending=false;
+		if(drag_active)
 			{
-			// Scrolling far outran detection: snap (keep rest, drop the animation debt).
+			rest_x+=gx;
+			rest_y+=gy;
+			}
+		else if((gx!=0||gy!=0)&&!ignore&&native_follow_active&&sx==0&&sy==0&&
+			scroll.follow_candidate!=no_visual_movement)
+			{
+			camera_follow_id=scroll.follow_candidate;
+			camera_follow_viewport=vp;
 			transient_x=0.0;
 			transient_y=0.0;
-			clear_camera_pending();
+			}
+		else if((gx!=0||gy!=0)&&!ignore)
+			{
+			camera_follow_id=no_visual_movement;
+			camera_follow_viewport=nullptr;
+			camera_follow_x=0.0;
+			camera_follow_y=0.0;
+			const double cap=tile*(camera_max_glide_tiles+0.5);
+			transient_x=std::clamp(transient_x+gx*tile,-cap,cap);
+			transient_y=std::clamp(transient_y+gy*tile,-cap,cap);
+			}
+		}
+	if(camera_follow_id!=no_visual_movement)
+		{
+		const auto follow=animation_manager.get_follow(
+			camera_follow_viewport,camera_follow_id);
+		if(follow.active)
+			{
+			camera_follow_x=follow.offset_x*tile;
+			camera_follow_y=follow.offset_y*tile;
 			}
 		else
 			{
-			// Fast scrolling applies the pending delta PIECEMEAL: the buffers may hold +1 of a
-			// pending +3 this frame. Testing only the total made landings miss, time out, and
-			// snap -- the fast-scroll jitter. Instead, find the LARGEST applied prefix of the
-			// pending scroll and attribute just that; the rest keeps pending. Ties between
-			// qualifying shifts only happen on uniform terrain, where mistiming is invisible.
-			const int32_t stepx=(camera_pending_dx>0)-(camera_pending_dx<0);
-			const int32_t stepy=(camera_pending_dy>0)-(camera_pending_dy<0);
-			int32_t best_ax=0,best_ay=0,best_mag=-1;
-			double best_score=-1.0;
-			bool no_data=false;
-			for(int32_t ix=0;ix<=std::abs(camera_pending_dx);++ix)
-				{
-				for(int32_t iy=0;iy<=std::abs(camera_pending_dy);++iy)
-					{
-					const double score=background_match_ratio(vp,ix*stepx,iy*stepy);
-					if(score<0.0){no_data=true;break;}
-					const int32_t mag=ix+iy;
-					if(score>=0.6&&(mag>best_mag||(mag==best_mag&&score>best_score)))
-						{
-						best_mag=mag;
-						best_score=score;
-						best_ax=ix*stepx;
-						best_ay=iy*stepy;
-						}
-					}
-				if(no_data)break;
-				}
-			if(no_data)
-				{
-				// Nothing to compare against (empty background): give up on attribution.
-				clear_camera_pending();
-				}
-			else if(best_mag>0)
-				{
-				attribute_landed(best_ax,best_ay,tile);
-				camera_pending_dx-=best_ax;
-				camera_pending_dy-=best_ay;
-				camera_pending_frames=0;
-				}
-			else if(best_mag==0)
-				{
-				// Content demonstrably hasn't moved yet: keep waiting, no timeout pressure.
-				camera_pending_frames=0;
-				}
-			else if(++camera_pending_frames>4)
-				{
-				// Neither static nor any prefix recognizable (heavy simultaneous change):
-				// drop the debt without touching the in-flight glide.
-				clear_camera_pending();
-				}
+			camera_follow_id=no_visual_movement;
+			camera_follow_viewport=nullptr;
+			camera_follow_x=0.0;
+			camera_follow_y=0.0;
 			}
 		}
 
@@ -316,18 +278,22 @@ void update_camera(
 	// released. DF's own drag still moves window in tile steps; rest carries the remainder.
 	// Positions are tracked against the CONTENT window (window minus unlanded jumps) so the
 	// buffer lag never causes a visible stutter.
-	const bool mbut=enabler!=nullptr&&enabler->mouse_mbut;
-	const double content_wx=double(wx-camera_pending_dx);
-	const double content_wy=double(wy-camera_pending_dy);
+	const bool mbut=camera_enabled&&enabler!=nullptr&&enabler->mouse_mbut;
+	const double content_wx=double(wx-scroll.pending_x);
+	const double content_wy=double(wy-scroll.pending_y);
 	if(mbut&&!drag_active&&gps!=nullptr)
 		{
 		drag_active=true;
-		drag_anchor_vx=content_wx-rest_x-transient_x/tile;
-		drag_anchor_vy=content_wy-rest_y-transient_y/tile;
+		drag_anchor_vx=content_wx-rest_x-(transient_x+camera_follow_x)/tile;
+		drag_anchor_vy=content_wy-rest_y-(transient_y+camera_follow_y)/tile;
 		drag_anchor_mx=gps->precise_mouse_x;
 		drag_anchor_my=gps->precise_mouse_y;
 		transient_x=0.0;
 		transient_y=0.0;
+		camera_follow_id=no_visual_movement;
+		camera_follow_viewport=nullptr;
+		camera_follow_x=0.0;
+		camera_follow_y=0.0;
 		}
 	if(drag_active)
 		{
@@ -356,16 +322,10 @@ void update_camera(
 			}
 		}
 
-	if(transient_x!=0.0||transient_y!=0.0)
+	if(std::abs(transient_x)<0.5&&std::abs(transient_y)<0.5)
 		{
-		const double k=std::exp(-double(delta_ms)/camera_tau_ms);
-		transient_x*=k;
-		transient_y*=k;
-		if(std::abs(transient_x)<0.5&&std::abs(transient_y)<0.5)
-			{
-			transient_x=0.0;
-			transient_y=0.0;
-			}
+		transient_x=0.0;
+		transient_y=0.0;
 		}
 }
 
@@ -490,6 +450,8 @@ viewport_visual_animation_inputst animation_input(df::graphic_viewportst *vp)
 		visual_context_revision,
 		visual_layers(const_viewport),
 		visual_layers(const_viewport,true),
+		vp->screentexpos_background,
+		vp->screentexpos_background_old,
 		window_x?*window_x:0,
 		window_y?*window_y:0
 		};
@@ -1366,6 +1328,15 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	const std::vector<df::graphic_viewportst *> viewports=active_viewports();
 
 	if(vp!=nullptr)update_visual_context(renderer,vp);
+	const int32_t follow_id=plotinfo?plotinfo->follow_unit:-1;
+	if(native_follow_changed(native_follow_id,follow_id))
+		{
+		native_follow_id=follow_id;
+		++visual_context_revision;
+		previous_coverage.clear();
+		cancel_camera_transients();
+		camera_has_prev=false;
+		}
 	const uint32_t now_ms=Core::getInstance().p->getTickCount();
 	animation_manager.begin_frame(now_ms);
 	for(df::graphic_viewportst *viewport:viewports)
@@ -1374,10 +1345,23 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 
 	if(!viewport_readable(vp)||renderer->sdl_renderer==nullptr)
 		return;
-	update_camera(renderer,vp,animation_manager.get_frame_delta_ms());
+	const bool paused=pause_state&&*pause_state;
+	if(paused)
+		{
+		animation_manager.cancel_transitions();
+		cancel_camera_transients();
+		rest_x=0.0;
+		rest_y=0.0;
+		camera_has_prev=false;
+		}
+	const bool native_follow_active=follow_id>=0;
+	if(!paused)
+		update_camera(renderer,vp,animation_manager.get_frame_delta_ms(),native_follow_active);
 	const double cam_tile=tile_px(renderer);
-	const int32_t glide_x=int32_t(std::lround(transient_x+rest_x*cam_tile));
-	const int32_t glide_y=int32_t(std::lround(transient_y+rest_y*cam_tile));
+	const int32_t glide_x=int32_t(std::lround(
+		transient_x+camera_follow_x+rest_x*cam_tile));
+	const int32_t glide_y=int32_t(std::lround(
+		transient_y+camera_follow_y+rest_y*cam_tile));
 	const bool glide=glide_x!=0||glide_y!=0;
 	if(!glide&&camera_was_offset)
 		{
@@ -1540,6 +1524,7 @@ void reset_state()
 	camera_enabled=false;
 	camera_has_prev=false;
 	camera_was_offset=false;
+	native_follow_id=-1;
 	flip_enabled=false;
 	hauled_enabled=false;
 }
