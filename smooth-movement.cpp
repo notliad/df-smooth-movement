@@ -1348,7 +1348,6 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	const bool paused=pause_state&&*pause_state;
 	if(paused)
 		{
-		animation_manager.cancel_transitions();
 		cancel_camera_transients();
 		camera_has_prev=false;
 		}
