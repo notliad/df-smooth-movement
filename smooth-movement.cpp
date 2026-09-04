@@ -1350,8 +1350,6 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		{
 		animation_manager.cancel_transitions();
 		cancel_camera_transients();
-		rest_x=0.0;
-		rest_y=0.0;
 		camera_has_prev=false;
 		}
 	const bool native_follow_active=follow_id>=0;
