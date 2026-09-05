@@ -5,6 +5,11 @@
 - Add `smooth-movement stats [on|off|reset]`: counts frames, frames that reached the draw
   stage and engine tile repaints, and (while on) times the render hook split into movement
   detection and drawing. Off by default; the counters cost a few increments per frame.
+- Cheaper idle frames. The per-frame buffer signature now hashes in eight independent
+  FNV-1a lanes instead of one serial chain, and the detection pass reuses its working
+  vectors across frames instead of allocating them per viewport. An idle viewport's sync
+  drops from about 84 to 15 microseconds in the manager benchmark; detection results are
+  unchanged.
 - Set smoothstep movement tweens to 150 ms. Add optional linear easing with
   adaptive 150–500 ms durations based on the cadence between consecutive steps
   (`smooth-movement linear on`) and icons for boulders, bars, and wood hauled by units

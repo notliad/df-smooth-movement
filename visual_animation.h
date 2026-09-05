@@ -328,6 +328,12 @@ class visual_animation_managerst
 	bool linear=false;
 	visual_movement_idst next_movement_id=1;
 	std::vector<viewport_animationst> viewports;
+	// Per-frame working storage, kept across frames so a busy frame allocates nothing.
+	std::vector<std::vector<int32_t>> scratch_rebased_previous;
+	std::vector<uint8_t> scratch_claimed_sources;
+	std::vector<int8_t> scratch_facing_at_frame_start;
+	std::vector<uint8_t> scratch_facing_target_written;
+	std::vector<int32_t> scratch_pending_facing_source_clears;
 
 	static constexpr uint32_t movement_duration_ms=150;
 	// Scrolling faster than detection keeps up: give up rather than test ever more prefixes.
@@ -384,30 +390,50 @@ class visual_animation_managerst
 		state.suppress_frames=0;
 		}
 
+	// The signature hashes every tracked buffer each frame, so its speed sets the floor of an
+	// idle frame. One FNV-1a chain is a serial multiply per value; eight independent chains,
+	// each over every eighth value, let the CPU overlap them and finish several times sooner.
+	static constexpr size_t signature_lanes=8;
+
+	static void hash_signature_lanes(
+		uint64_t (&lanes)[signature_lanes],
+		const int32_t *values,
+		int32_t count)
+		{
+		constexpr uint64_t fnv_prime=0x100000001b3ULL;
+		int32_t i=0;
+		for(;i+int32_t(signature_lanes)<=count;i+=int32_t(signature_lanes))
+			for(size_t lane=0;lane<signature_lanes;++lane)
+				lanes[lane]=(lanes[lane]^uint64_t(uint32_t(values[i+int32_t(lane)])))*fnv_prime;
+		for(;i<count;++i)
+			lanes[0]=(lanes[0]^uint64_t(uint32_t(values[i])))*fnv_prime;
+		}
+
 	// Identifies the buffer contents this frame, to tell a redrawn viewport from a repeated one.
 	static uint64_t compute_buffer_signature(const viewport_visual_animation_inputst &input)
 		{
-		// FNV-1a. Only ever compared against the previous frame's value, never stored.
+		// FNV-1a in lanes. Only ever compared against the previous frame's value, never stored.
 		constexpr uint64_t fnv_offset_basis=0xcbf29ce484222325ULL;
 		constexpr uint64_t fnv_prime=0x100000001b3ULL;
-		uint64_t hash=fnv_offset_basis;
+		uint64_t lanes[signature_lanes];
+		for(size_t lane=0;lane<signature_lanes;++lane)
+			lanes[lane]=fnv_offset_basis^uint64_t(lane);
 		const int32_t tile_count=input.dim_x*input.dim_y;
 		if(input.current_background!=nullptr&&input.previous_background!=nullptr)
-			for(int32_t i=0;i<tile_count;++i)
-				{
-				hash=(hash^uint64_t(uint32_t(input.current_background[i])))*fnv_prime;
-				hash=(hash^uint64_t(uint32_t(input.previous_background[i])))*fnv_prime;
-				}
+			{
+			hash_signature_lanes(lanes,input.current_background,tile_count);
+			hash_signature_lanes(lanes,input.previous_background,tile_count);
+			}
 		for(size_t layer=0;layer<input.current.size();++layer)
 			{
 			if(!visual_layer_tracks_own_movement(
 				static_cast<viewport_visual_layer>(layer)))continue;
-			for(int32_t i=0;i<tile_count;++i)
-				{
-				hash=(hash^uint64_t(uint32_t(input.current[layer][i])))*fnv_prime;
-				hash=(hash^uint64_t(uint32_t(input.previous[layer][i])))*fnv_prime;
-				}
+			hash_signature_lanes(lanes,input.current[layer],tile_count);
+			hash_signature_lanes(lanes,input.previous[layer],tile_count);
 			}
+		uint64_t hash=lanes[0];
+		for(size_t lane=1;lane<signature_lanes;++lane)
+			hash=(hash*fnv_prime)^lanes[lane];
 		return hash;
 		}
 
@@ -829,7 +855,7 @@ class visual_animation_managerst
 			// On the landing frame `previous` is still framed on the pre-scroll view.
 			// Rebasing it by the landed delta keeps a creature that walked during the scroll.
 			auto previous_layers=input.previous;
-			std::vector<std::vector<int32_t>> rebased_previous;
+			std::vector<std::vector<int32_t>> &rebased_previous=scratch_rebased_previous;
 			if(translated&&!suppress)
 				{
 				rebased_previous.resize(input.previous.size());
@@ -857,14 +883,19 @@ class visual_animation_managerst
 			if(!suppress)
 				{
 				const int32_t tile_count=input.dim_x*input.dim_y;
-				std::vector<uint8_t> claimed_sources(tile_count);
+				std::vector<uint8_t> &claimed_sources=scratch_claimed_sources;
+				claimed_sources.resize(size_t(tile_count));
 				const size_t existing_movement_count=state.movements.size();
 				// A chained movement's source may already have been rewritten this frame.
-				const std::vector<int8_t> facing_at_frame_start=state.facing;
+				const std::vector<int8_t> &facing_at_frame_start=scratch_facing_at_frame_start;
+				scratch_facing_at_frame_start=state.facing;
 				// Source clears are deferred until every movement this frame is registered.
 				// A source can be another movement's target in the same frame -- a chain.
-				std::vector<uint8_t> facing_target_written;
-				std::vector<int32_t> pending_facing_source_clears;
+				std::vector<uint8_t> &facing_target_written=scratch_facing_target_written;
+				std::vector<int32_t> &pending_facing_source_clears=
+					scratch_pending_facing_source_clears;
+				facing_target_written.clear();
+				pending_facing_source_clears.clear();
 				long double best_follow_distance=std::numeric_limits<long double>::max();
 				if(state.facing.size()==size_t(input.dim_x)*size_t(input.dim_y))
 					facing_target_written.assign(state.facing.size(),0);
