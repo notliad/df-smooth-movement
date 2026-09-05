@@ -196,20 +196,12 @@ class tile_coveragest
 };
 
 // The frame's working sets, kept across frames so their grids are allocated once.
-tile_coveragest previous_coverage;
 tile_coveragest coverage_scratch;
-tile_coveragest redraw_coverage_scratch;
 std::vector<SDL_Rect> tile_rects_scratch;
 uint64_t visual_context_revision=0;
 const void *previous_viewport=nullptr;
 std::array<int32_t,12> previous_view_signature{};
 bool has_view_signature=false;
-// Map scroll (window_x/window_y) is tracked separately from the reset signature: a pure pan is
-// followed (movements are translated) instead of triggering a full reset, so it must NOT bump the
-// context revision. It only invalidates the viewport-space blackout coverage from the prior frame.
-int32_t previous_pan_x=0;
-int32_t previous_pan_y=0;
-bool has_pan_context=false;
 bool flip_enabled=false;
 bool hauled_enabled=false;
 
@@ -491,22 +483,11 @@ void update_visual_context(
 	if(changed)
 		{
 		++visual_context_revision;
-		previous_coverage.clear();
 		cancel_camera_transients();
 		}
 	previous_viewport=vp;
 	previous_view_signature=signature;
 	has_view_signature=true;
-
-	// On a pure pan the reset signature is unchanged, but last frame's blackout coverage is in the
-	// old viewport frame, so discard it (the engine repaints the whole scrolled viewport anyway).
-	const int32_t pan_x=window_x?*window_x:0;
-	const int32_t pan_y=window_y?*window_y:0;
-	if(!has_pan_context||previous_pan_x!=pan_x||previous_pan_y!=pan_y)
-		previous_coverage.clear();
-	previous_pan_x=pan_x;
-	previous_pan_y=pan_y;
-	has_pan_context=true;
 }
 
 using viewport_layer_memberst=int32_t *df::graphic_viewportst::*;
@@ -1494,7 +1475,6 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		{
 		native_follow_id=follow_id;
 		++visual_context_revision;
-		previous_coverage.clear();
 		cancel_camera_transients();
 		camera_has_prev=false;
 		}
@@ -1534,7 +1514,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		std::vector<carried_item_proxyst>{};
 	if(!glide&&!animation_manager.requires_full_redraw()&&
 		(!flip_enabled||!has_mirrored_viewport_facing(viewports))&&
-		carried_items.empty()&&previous_coverage.empty())
+		carried_items.empty())
 		return;
 	++frame_stats.painted;
 
@@ -1591,20 +1571,15 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		renderer->origin_x=saved_origin_x;
 		renderer->origin_y=saved_origin_y;
 		render_set_clip_rect(sdl_renderer,nullptr);
-
-		// Everything was repainted; per-tile coverage bookkeeping restarts after the glide.
-		previous_coverage.clear();
 		return;
 		}
 
-	tile_coveragest &redraw_coverage=redraw_coverage_scratch;
-	redraw_coverage.clear();
-	redraw_coverage.insert(coverage.tiles().begin(),coverage.tiles().end());
-	redraw_coverage.insert(previous_coverage.tiles().begin(),previous_coverage.tiles().end());
+	// The engine repaints every viewport tile each frame before this hook runs, so a tile a
+	// sprite covered last frame is clean again by now: only this frame's coverage is blanked.
 	// Every tile blanks to the same colour, so they go to the renderer as one call.
 	std::vector<SDL_Rect> &tile_rects=tile_rects_scratch;
 	tile_rects.clear();
-	for(const auto &[x,y]:redraw_coverage.tiles())
+	for(const auto &[x,y]:coverage.tiles())
 		{
 		if(!inside_clip(vp,x,y))continue;
 		tile_rects.push_back(
@@ -1624,15 +1599,13 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		set_render_draw_color(sdl_renderer,old_r,old_g,old_b,old_a);
 		}
 
-	for(const auto &[x,y]:redraw_coverage.tiles())
+	for(const auto &[x,y]:coverage.tiles())
 		{
 		if(inside_clip(vp,x,y))
 			redraw_world_tile(renderer,viewport_renders,coverage,x,y);
 		}
 	draw_viewport_interpolation_stages(
 		renderer,viewport_renders,coverage,carried_items);
-
-	std::swap(previous_coverage,coverage);
 }
 
 struct renderer_hook : df::renderer_2d_base
@@ -1686,14 +1659,10 @@ bool load_sdl(color_ostream &out)
 void reset_state()
 {
 	animation_manager=visual_animation_managerst();
-	previous_coverage.clear();
 	visual_context_revision=0;
 	previous_viewport=nullptr;
 	previous_view_signature={};
 	has_view_signature=false;
-	previous_pan_x=0;
-	previous_pan_y=0;
-	has_pan_context=false;
 	cancel_camera_transients();
 	rest_x=0.0;
 	rest_y=0.0;

@@ -15,6 +15,10 @@
   per-tile selected-layer mask is a vector indexed like the buffers, and the tiles blanked
   before repainting go to SDL in a single `SDL_RenderFillRects` call. Same repaints and
   draws in the same order; less time between them.
+- Stop re-blanking and repainting the tiles a sprite covered the frame before. The engine
+  repaints every viewport tile each frame before the render hook runs, so those tiles are
+  already clean; only the tiles this frame's sprites touch are blanked. Drops the
+  previous-coverage set and the pan tracking that only existed to discard it.
 - Set smoothstep movement tweens to 150 ms. Add optional linear easing with
   adaptive 150–500 ms durations based on the cadence between consecutive steps
   (`smooth-movement linear on`) and icons for boulders, bars, and wood hauled by units
