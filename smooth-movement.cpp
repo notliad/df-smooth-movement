@@ -1385,12 +1385,15 @@ bool has_mirrored_viewport_facing(
 void render_interpolated_world(df::renderer_2d_base *renderer)
 {
 	++frame_stats.frames;
-	const uint64_t frame_start_us=frame_stats.enabled?frame_statsst::now_us():0;
+	// Read once: the console can flip the flag mid-frame, and a frame timed from its start
+	// only is a frame timed from a zero.
+	const bool timing_enabled=frame_stats.enabled;
+	const uint64_t frame_start_us=timing_enabled?frame_statsst::now_us():0;
 	uint64_t sync_end_us=frame_start_us;
 	// Runs on every exit, including the early return for frames with nothing to draw.
 	const scope_guardst timing([&]
 		{
-		if(!frame_stats.enabled)return;
+		if(!timing_enabled)return;
 		const uint64_t end_us=frame_statsst::now_us();
 		frame_stats.add_sync(sync_end_us-frame_start_us);
 		frame_stats.add_render(end_us-sync_end_us);
@@ -1413,7 +1416,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	for(df::graphic_viewportst *viewport:viewports)
 		animation_manager.synchronize_viewport(animation_input(viewport));
 	animation_manager.end_frame();
-	if(frame_stats.enabled)sync_end_us=frame_statsst::now_us();
+	if(timing_enabled)sync_end_us=frame_statsst::now_us();
 
 	if(!viewport_readable(vp)||renderer->sdl_renderer==nullptr)
 		return;
