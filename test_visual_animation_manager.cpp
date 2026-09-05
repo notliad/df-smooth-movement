@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+#include <algorithm>
 #include <array>
 #ifdef NDEBUG
 #undef NDEBUG
@@ -7,6 +8,7 @@
 #include <cassert>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 #include "visual_animation.h"
 
@@ -206,6 +208,90 @@ int main()
 	set_layer(input,viewport_visual_layer::center,up,west_after);
 	run_frame(manager,input,1032);
 	assert(manager.get_facing(viewport,1,1)==visual_facingst::west);
+	}
+
+	// The manager lists the tiles a movement can be looked up on: the target plus the 3x3
+	// around a center target, where fragments in other layers borrow its movement.
+	{
+	visual_animation_managerst manager;
+	auto input=make_input(viewport,dim,empty);
+	set_layer(input,viewport_visual_layer::center,before,empty);
+	run_frame(manager,input,1000);
+	std::vector<int32_t> tiles;
+	manager.active_movement_tiles(viewport,tiles);
+	assert(tiles.empty());
+	set_layer(input,viewport_visual_layer::center,west_after,before);
+	run_frame(manager,input,1016);
+	manager.active_movement_tiles(viewport,tiles);
+	std::sort(tiles.begin(),tiles.end());
+	assert(tiles.size()==9);
+	for(int32_t x=0;x<=2;++x)
+		for(int32_t y=1;y<=3;++y)
+			assert(std::binary_search(tiles.begin(),tiles.end(),x*dim+y));
+	// A right-hand fragment next to the target inherits the movement through the index.
+	const auto fragment=manager.get_movement(viewport,viewport_visual_layer::right,2,2);
+	assert(fragment.active&&fragment.inherited);
+	assert(fragment.source_x==3.0f&&fragment.source_y==2.0f);
+	// Vehicles and the center layer itself never borrow a neighbour's movement.
+	assert(!manager.get_movement(viewport,viewport_visual_layer::vehicle,2,2).active);
+	assert(!manager.get_movement(viewport,viewport_visual_layer::center,2,2).active);
+	// Off-grid lookups fall through to the scan and find nothing.
+	assert(!manager.get_movement(viewport,viewport_visual_layer::right,-1,2).active);
+	assert(!manager.get_movement(viewport,viewport_visual_layer::right,dim,2).active);
+	tiles.clear();
+	manager.active_movement_tiles(nullptr,tiles);
+	assert(tiles.empty());
+	// An expired movement leaves the index as it left the scan.
+	run_frame(manager,input,1016+1000);
+	tiles.clear();
+	manager.active_movement_tiles(viewport,tiles);
+	assert(tiles.empty());
+	assert(!manager.get_movement(viewport,viewport_visual_layer::right,2,2).active);
+	}
+
+	// Two center movements with different deltas next to one tile make it ambiguous; a tile
+	// with only one of them in reach still inherits.
+	{
+	int32_t pair_before[dim*dim]={};
+	int32_t pair_after[dim*dim]={};
+	pair_before[0*dim+0]=77;
+	pair_before[3*dim+3]=78;
+	pair_after[1*dim+1]=77;   // south-east
+	pair_after[2*dim+2]=78;   // north-west
+	visual_animation_managerst manager;
+	auto input=make_input(viewport,dim,empty);
+	set_layer(input,viewport_visual_layer::center,pair_before,empty);
+	run_frame(manager,input,1000);
+	set_layer(input,viewport_visual_layer::center,pair_after,pair_before);
+	run_frame(manager,input,1016);
+	assert(manager.get_movement(viewport,viewport_visual_layer::center,1,1).active);
+	assert(manager.get_movement(viewport,viewport_visual_layer::center,2,2).active);
+	assert(!manager.get_movement(viewport,viewport_visual_layer::right,2,1).active);
+	assert(!manager.get_movement(viewport,viewport_visual_layer::up,1,2).active);
+	const auto only_first=manager.get_movement(viewport,viewport_visual_layer::right,0,1);
+	assert(only_first.active&&only_first.source_x==-1.0f&&only_first.source_y==0.0f);
+	const auto only_second=manager.get_movement(viewport,viewport_visual_layer::left,3,2);
+	assert(only_second.active&&only_second.source_x==4.0f&&only_second.source_y==3.0f);
+	}
+
+	// The mirrored tile list mirrors has_mirrored: filled by an eastward step, emptied when the
+	// tile clears, and in index order.
+	{
+	visual_animation_managerst manager;
+	auto input=make_input(viewport,dim,empty);
+	set_layer(input,viewport_visual_layer::center,before,empty);
+	run_frame(manager,input,1000);
+	set_layer(input,viewport_visual_layer::center,west_after,before);
+	run_frame(manager,input,1016);
+	assert(manager.mirrored_tiles(viewport).empty());
+	set_layer(input,viewport_visual_layer::center,before,west_after);
+	run_frame(manager,input,1032);
+	assert(manager.mirrored_tiles(viewport).size()==1);
+	assert(manager.mirrored_tiles(viewport)[0]==2*dim+2);
+	assert(manager.mirrored_tiles(nullptr).empty());
+	set_layer(input,viewport_visual_layer::center,empty,before);
+	run_frame(manager,input,1048);
+	assert(manager.mirrored_tiles(viewport).empty());
 	}
 
 	// Out-of-range and unknown viewports fall back to the native facing.

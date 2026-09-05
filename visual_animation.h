@@ -319,6 +319,16 @@ class visual_animation_managerst
 		bool abandoned_this_frame=false;
 		std::array<int32_t,2> landed_shift{};
 		visual_movement_idst follow_candidate=no_visual_movement;
+		// Active movements by (layer, target tile), so get_movement is a lookup rather than a
+		// scan. Slots hold an index into `movements`, -1 when empty; `indexed_slots` lists the
+		// filled ones so a rebuild clears only those instead of the whole grid.
+		std::vector<int32_t> movement_index;
+		std::vector<int32_t> indexed_slots;
+		// Two active center movements on one target tile: the companion rule needs both, so
+		// get_movement scans `movements` instead of reading the index.
+		bool movement_index_ambiguous=false;
+		// Tiles whose facing is mirrored, in tile-index order. Maintained with has_mirrored.
+		std::vector<int32_t> mirrored_tiles;
 	};
 
 	uint32_t frame_time_ms=0;
@@ -376,6 +386,7 @@ class visual_animation_managerst
 			state.facing.end(),
 			int8_t(native_sprite_facing));
 		state.has_mirrored=false;
+		state.mirrored_tiles.clear();
 		}
 
 	static void reset_tracking(viewport_animationst &state)
@@ -550,6 +561,151 @@ class visual_animation_managerst
 			(linear?movement.duration_ms:movement_duration_ms);
 		}
 
+	static size_t movement_slot(
+		const viewport_animationst &state,
+		viewport_visual_layer layer,
+		int32_t x,
+		int32_t y)
+		{
+		return (static_cast<size_t>(layer)*size_t(state.dim_x)+size_t(x))*
+			size_t(state.dim_y)+size_t(y);
+		}
+
+	static bool inside_viewport(const viewport_animationst &state,int32_t x,int32_t y)
+		{
+		return x>=0&&x<state.dim_x&&y>=0&&y<state.dim_y;
+		}
+
+	// Rebuilt after every synchronize_viewport, so the index always describes the frame's
+	// active set. The first movement in vector order wins a slot, as the scan it replaces.
+	void index_movements(viewport_animationst &state)
+		{
+		const size_t slots=state.dim_x>0&&state.dim_y>0?
+			static_cast<size_t>(viewport_visual_layer::count)*size_t(state.dim_x)*size_t(state.dim_y):0;
+		if(state.movement_index.size()!=slots)
+			{
+			state.movement_index.assign(slots,-1);
+			state.indexed_slots.clear();
+			}
+		for(int32_t slot:state.indexed_slots)state.movement_index[size_t(slot)]=-1;
+		state.indexed_slots.clear();
+		state.movement_index_ambiguous=false;
+		for(size_t i=0;i<state.movements.size();++i)
+			{
+			const movementst &movement=state.movements[i];
+			if(!movement_active(movement)||
+				!inside_viewport(state,movement.target_x,movement.target_y))continue;
+			const size_t slot=movement_slot(
+				state,movement.layer,movement.target_x,movement.target_y);
+			if(state.movement_index[slot]>=0)
+				{
+				if(movement.layer==viewport_visual_layer::center)
+					state.movement_index_ambiguous=true;
+				continue;
+				}
+			state.movement_index[slot]=int32_t(i);
+			state.indexed_slots.push_back(int32_t(slot));
+			}
+		}
+
+	static visual_movement_renderst direct_movement(const movementst &movement,float progress)
+		{
+		return {true,movement.source_x,movement.source_y,progress,false,movement.id};
+		}
+
+	static visual_movement_renderst companion_movement(
+		const movementst &companion,
+		int32_t target_x,
+		int32_t target_y,
+		float progress)
+		{
+		return {
+			true,
+			target_x+companion.source_x-companion.target_x,
+			target_y+companion.source_y-companion.target_y,
+			progress,
+			true,
+			companion.id
+			};
+		}
+
+	static bool same_companion(const movementst &a,const movementst &b)
+		{
+		return a.source_x-a.target_x==b.source_x-b.target_x&&
+			a.source_y-a.target_y==b.source_y-b.target_y&&
+			a.start_time_ms==b.start_time_ms&&
+			a.duration_ms==b.duration_ms;
+		}
+
+	// The original lookup: kept for the ambiguous case and as the reference the index must match.
+	visual_movement_renderst scan_movement(
+		const viewport_animationst &state,
+		viewport_visual_layer layer,
+		int32_t target_x,
+		int32_t target_y) const
+		{
+		const movementst *companion=nullptr;
+		bool ambiguous=false;
+		for(const movementst &movement:state.movements)
+			{
+			if(!movement_active(movement))continue;
+			if(movement.layer==layer&&movement.target_x==target_x&&
+				movement.target_y==target_y)
+				return direct_movement(movement,movement_progress(movement));
+			if(layer==viewport_visual_layer::vehicle||
+				layer==viewport_visual_layer::center||
+				movement.layer!=viewport_visual_layer::center||
+				std::abs(movement.target_x-target_x)>1||
+				std::abs(movement.target_y-target_y)>1)continue;
+			if(companion!=nullptr&&!same_companion(*companion,movement))
+				ambiguous=true;
+			else if(companion==nullptr)
+				companion=&movement;
+			}
+		if(ambiguous)return {};
+		if(companion!=nullptr)
+			return companion_movement(
+				*companion,target_x,target_y,movement_progress(*companion));
+		return {};
+		}
+
+	visual_movement_renderst indexed_movement(
+		const viewport_animationst &state,
+		viewport_visual_layer layer,
+		int32_t target_x,
+		int32_t target_y) const
+		{
+		const int32_t direct=state.movement_index[
+			movement_slot(state,layer,target_x,target_y)];
+		if(direct>=0)
+			{
+			const movementst &movement=state.movements[size_t(direct)];
+			return direct_movement(movement,movement_progress(movement));
+			}
+		if(layer==viewport_visual_layer::vehicle||layer==viewport_visual_layer::center)
+			return {};
+		// Any two companions that disagree make the tile ambiguous, so the order of the
+		// nine slots does not matter.
+		const movementst *companion=nullptr;
+		for(int32_t dx=-1;dx<=1;++dx)
+			for(int32_t dy=-1;dy<=1;++dy)
+				{
+				const int32_t x=target_x+dx;
+				const int32_t y=target_y+dy;
+				if(!inside_viewport(state,x,y))continue;
+				const int32_t slot=state.movement_index[
+					movement_slot(state,viewport_visual_layer::center,x,y)];
+				if(slot<0)continue;
+				const movementst &movement=state.movements[size_t(slot)];
+				if(companion==nullptr)companion=&movement;
+				else if(!same_companion(*companion,movement))return {};
+				}
+		if(companion!=nullptr)
+			return companion_movement(
+				*companion,target_x,target_y,movement_progress(*companion));
+		return {};
+		}
+
 	visual_movement_idst allocate_movement_id()
 		{
 		const visual_movement_idst id=next_movement_id++;
@@ -599,12 +755,22 @@ class visual_animation_managerst
 			if(input.viewport==nullptr)return;
 			viewport_animationst &state=get_viewport(input);
 			state.seen=true;
+			synchronize(state,input);
+			index_movements(state);
+			}
+
+	private:
+		void synchronize(
+			viewport_animationst &state,
+			const viewport_visual_animation_inputst &input)
+			{
 
 			if(!input.valid())
 				{
 				reset_tracking(state);
 				state.has_context=false;
 				state.has_mirrored=false;
+				state.mirrored_tiles.clear();
 				return;
 				}
 
@@ -653,6 +819,7 @@ class visual_animation_managerst
 					size_t(input.dim_x)*size_t(input.dim_y),
 					int8_t(native_sprite_facing));
 				state.has_mirrored=false;
+				state.mirrored_tiles.clear();
 				}
 			// This hook runs per frame; the viewport is recomputed only when it changes, and while
 			// paused hardly at all. Re-reading a landed scroll steps every sprite by a tile.
@@ -666,6 +833,7 @@ class visual_animation_managerst
 				{
 				// Skips the recompute sweep, so clear has_mirrored here or a stale true survives.
 				state.has_mirrored=false;
+				state.mirrored_tiles.clear();
 				reset_tracking(state);
 				// window_z, zoom and resize change at input time; the buffers cross later.
 				// This reset covers only the input frame, not the crossing itself.
@@ -1058,18 +1226,24 @@ class visual_animation_managerst
 					input.current[static_cast<size_t>(
 						viewport_visual_layer::center)];
 				bool any_mirrored=false;
+				state.mirrored_tiles.clear();
 				for(size_t i=0;i<state.facing.size();++i)
 					{
 					if(center_current[i]==0)
 						state.facing[i]=int8_t(native_sprite_facing);
 					else if(state.facing[i]!=int8_t(native_sprite_facing))
+						{
 						any_mirrored=true;
+						state.mirrored_tiles.push_back(int32_t(i));
+						}
 					}
 				state.has_mirrored=any_mirrored;
 				}
 			for(const movementst &movement:state.movements)
 				if(movement_active(movement))force_full_redraw=true;
 			}
+
+	public:
 
 		void end_frame()
 			{
@@ -1089,7 +1263,11 @@ class visual_animation_managerst
 		// Pausing keeps persistent facing, but drops every in-flight visual transition.
 		void cancel_transitions()
 			{
-			for(viewport_animationst &state:viewports)reset_tracking(state);
+			for(viewport_animationst &state:viewports)
+				{
+				reset_tracking(state);
+				index_movements(state);
+				}
 			force_full_redraw=false;
 			}
 
@@ -1177,52 +1355,50 @@ class visual_animation_managerst
 			for(const viewport_animationst &state:viewports)
 				{
 				if(state.viewport!=viewport)continue;
-				const movementst *companion=nullptr;
-				bool ambiguous=false;
+				if(state.movement_index_ambiguous||state.movement_index.empty()||
+					!inside_viewport(state,target_x,target_y))
+					return scan_movement(state,layer,target_x,target_y);
+				return indexed_movement(state,layer,target_x,target_y);
+				}
+			return {};
+			}
+
+		// Appends every tile where get_movement can be active this frame: the target of each
+		// active movement, plus the 3x3 around each active center target for the companion
+		// rule. Unordered; a tile can appear more than once.
+		void active_movement_tiles(const void *viewport,std::vector<int32_t> &tiles) const
+			{
+			for(const viewport_animationst &state:viewports)
+				{
+				if(state.viewport!=viewport)continue;
 				for(const movementst &movement:state.movements)
 					{
 					if(!movement_active(movement))continue;
-					if(movement.layer==layer&&movement.target_x==target_x&&
-						movement.target_y==target_y)
+					if(movement.layer!=viewport_visual_layer::center)
 						{
-						return {
-							true,
-							movement.source_x,
-							movement.source_y,
-							movement_progress(movement),
-							false,
-							movement.id
-							};
+						if(inside_viewport(state,movement.target_x,movement.target_y))
+							tiles.push_back(movement.target_x*state.dim_y+movement.target_y);
+						continue;
 						}
-					if(layer==viewport_visual_layer::vehicle||
-						layer==viewport_visual_layer::center||
-						movement.layer!=viewport_visual_layer::center||
-						std::abs(movement.target_x-target_x)>1||
-						std::abs(movement.target_y-target_y)>1)continue;
-					if(companion!=nullptr&&
-						(companion->source_x-companion->target_x!=
-							movement.source_x-movement.target_x||
-						companion->source_y-companion->target_y!=
-							movement.source_y-movement.target_y||
-						companion->start_time_ms!=movement.start_time_ms||
-						companion->duration_ms!=movement.duration_ms))
-						ambiguous=true;
-					else if(companion==nullptr)
-						companion=&movement;
+					for(int32_t dx=-1;dx<=1;++dx)
+						for(int32_t dy=-1;dy<=1;++dy)
+							{
+							const int32_t x=movement.target_x+dx;
+							const int32_t y=movement.target_y+dy;
+							if(inside_viewport(state,x,y))tiles.push_back(x*state.dim_y+y);
+							}
 					}
-				if(ambiguous)return {};
-				if(companion!=nullptr)
-					return {
-						true,
-						target_x+companion->source_x-companion->target_x,
-						target_y+companion->source_y-companion->target_y,
-						movement_progress(*companion),
-						true,
-						companion->id
-						};
 				break;
 				}
-			return {};
+			}
+
+		// Tiles whose facing is mirrored, as tile indices in ascending order.
+		const std::vector<int32_t> &mirrored_tiles(const void *viewport) const
+			{
+			static const std::vector<int32_t> none;
+			for(const viewport_animationst &state:viewports)
+				if(state.viewport==viewport)return state.mirrored_tiles;
+			return none;
 			}
 };
 
