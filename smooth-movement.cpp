@@ -621,6 +621,15 @@ struct viewport_renderst
 	df::graphic_viewportst *viewport;
 	std::vector<render_proxyst> proxies;
 	render_coveragest coverage;
+	// Per tile, indexed like the buffers, whether the shading (the interface layer) rode on a
+	// repaint this frame, so the interface-only pass can leave the tile alone.
+	std::vector<uint8_t> shaded;
+	// Per tile, whether something is drawn over it after its last repaint: a designation
+	// sprite or a carried item. Its shading then waits for the interface-only pass.
+	std::vector<uint8_t> drawn_over;
+	// Per tile, the sprite group whose repaint above it can carry the shading, or no_group.
+	std::vector<uint8_t> shading_group;
+	static constexpr uint8_t no_group=0xff;
 };
 
 constexpr uint16_t visual_layer_bit(viewport_visual_layer layer)
@@ -755,9 +764,16 @@ void staged_repaint(df::renderer_2d_base *renderer,df::graphic_viewportst *vp,in
 	engine_repaint(renderer,vp,x,y);
 }
 
+// The interface-only pass paints the top shadow again as well, over everything drawn on the
+// tile. A tile with a top shadow keeps that pass, so its shading never rides on a repaint.
+bool shadow_keeps_interface_pass(const df::graphic_viewportst *vp,int32_t index)
+{
+	return vp->screentexpos_top_shadow!=nullptr&&vp->screentexpos_top_shadow[index]!=0;
+}
+
 void redraw_viewport_tile(
 	df::renderer_2d_base *renderer,
-	const viewport_renderst &viewport,
+	viewport_renderst &viewport,
 	int32_t x,
 	int32_t y,
 	bool defer_interface)
@@ -773,6 +789,14 @@ void redraw_viewport_tile(
 		};
 	// The interface layer is the shading for levels below the camera.
 	// A staged tile has a sprite drawn over it afterwards, so draw_interface_only places it instead.
+	// Unless nothing gets drawn over the tile: then this repaint is its last, and the engine
+	// paints the interface layer last within a repaint, so the shading can ride along.
+	if(defer_interface&&!viewport.coverage.all.count({x,y})&&
+		!viewport.drawn_over[size_t(index)]&&!shadow_keeps_interface_pass(vp,index))
+		{
+		defer_interface=false;
+		viewport.shaded[size_t(index)]=1;
+		}
 	if(!defer_interface||vp->screentexpos_interface==nullptr)stage();
 	else with_zeroed_values(stage,vp->screentexpos_interface[index]);
 }
@@ -836,14 +860,14 @@ void draw_interface_only(
 
 void redraw_world_tile(
 	df::renderer_2d_base *renderer,
-	const std::vector<viewport_renderst> &viewports,
+	std::vector<viewport_renderst> &viewports,
 	const tile_coveragest &staged,
 	int32_t x,
 	int32_t y)
 {
 	// The stage pass repaints everything above the lowest across the staged tiles, after the proxies.
 	const bool staged_tile=staged.count({x,y})!=0;
-	for(const viewport_renderst &viewport:viewports)
+	for(viewport_renderst &viewport:viewports)
 		{
 		if(inside_clip(viewport.viewport,x,y))
 			redraw_viewport_tile(renderer,viewport,x,y,staged_tile);
@@ -867,7 +891,8 @@ void redraw_above(
 	int32_t x,
 	int32_t y,
 	visual_render_groupst group,
-	const std::unordered_map<int32_t,uint16_t> &selected)
+	const std::unordered_map<int32_t,uint16_t> &selected,
+	bool with_interface)
 {
 	const int32_t index=x*vp->dim_y+y;
 	const auto redraw=[&]{staged_repaint(renderer,vp,x,y);};
@@ -882,8 +907,9 @@ void redraw_above(
 				redraw);
 			};
 		// The interface layer sits above every group, so each group's redraw would paint it again.
-		// draw_interface_only places it once, after the sprites.
-		if(vp->screentexpos_interface==nullptr)stage();
+		// It rides on the repaint above the tile's last group when nothing is drawn over the tile
+		// afterwards; otherwise draw_interface_only places it once, after the sprites.
+		if(with_interface||vp->screentexpos_interface==nullptr)stage();
 		else with_zeroed_values(stage,vp->screentexpos_interface[index]);
 		};
 	if(group==visual_render_groupst::item||group==visual_render_groupst::vehicle)
@@ -1346,7 +1372,9 @@ std::vector<viewport_renderst> collect_viewport_renders(
 	renders.reserve(viewports.size());
 	for(df::graphic_viewportst *vp:viewports)
 		{
-		viewport_renderst render={vp,collect_proxies(renderer,vp),{}};
+		viewport_renderst render;
+		render.viewport=vp;
+		render.proxies=collect_proxies(renderer,vp);
 		render.coverage=collect_coverage(render.proxies,vp->dim_y);
 		renders.push_back(std::move(render));
 		}
@@ -1363,26 +1391,50 @@ tile_coveragest collect_viewport_coverage(
 	return coverage;
 }
 
+// For every tile with a repaint above a sprite group, the last such group: its repaint is the
+// tile's last, so the shading can ride on it, unless something is drawn over the tile later.
+void collect_shading_groups(viewport_renderst &viewport)
+{
+	df::graphic_viewportst *vp=viewport.viewport;
+	for(size_t index=0;index<viewport.coverage.groups.size();++index)
+		{
+		if(static_cast<visual_render_groupst>(index)==visual_render_groupst::designation)
+			continue;
+		for(const auto &[x,y]:viewport.coverage.groups[index])
+			{
+			const size_t tile=size_t(x*vp->dim_y+y);
+			if(!viewport.drawn_over[tile]&&!shadow_keeps_interface_pass(vp,int32_t(tile)))
+				viewport.shading_group[tile]=uint8_t(index);
+			}
+		}
+}
+
 void draw_interpolation_stages(
 	df::renderer_2d_base *renderer,
-	df::graphic_viewportst *vp,
-	const std::vector<render_proxyst> &proxies,
-	const render_coveragest &coverage)
+	viewport_renderst &viewport)
 {
+	df::graphic_viewportst *vp=viewport.viewport;
+	const render_coveragest &coverage=viewport.coverage;
+	collect_shading_groups(viewport);
 	for(size_t index=0;index<coverage.groups.size();++index)
 		{
 		const auto group=static_cast<visual_render_groupst>(index);
-		for(const render_proxyst &proxy:proxies)
+		for(const render_proxyst &proxy:viewport.proxies)
 			if(visual_render_group(proxy.layer)==group)draw_proxy(renderer,proxy);
 		if(group==visual_render_groupst::designation)continue;
 		for(const auto &[x,y]:coverage.groups[index])
-			redraw_above(renderer,vp,x,y,group,coverage.selected);
+			{
+			const size_t tile=size_t(x*vp->dim_y+y);
+			const bool with_interface=viewport.shading_group[tile]==uint8_t(index);
+			if(with_interface)viewport.shaded[tile]=1;
+			redraw_above(renderer,vp,x,y,group,coverage.selected,with_interface);
+			}
 		}
 }
 
 void redraw_viewport_tiles(
 	df::renderer_2d_base *renderer,
-	const viewport_renderst &viewport,
+	viewport_renderst &viewport,
 	const tile_coveragest &coverage)
 {
 	df::graphic_viewportst *vp=viewport.viewport;
@@ -1395,7 +1447,7 @@ void redraw_viewport_tiles(
 
 void draw_viewport_interpolation_stages(
 	df::renderer_2d_base *renderer,
-	const std::vector<viewport_renderst> &viewports,
+	std::vector<viewport_renderst> &viewports,
 	const tile_coveragest &coverage,
 	const std::vector<carried_item_proxyst> &carried_items)
 {
@@ -1404,17 +1456,18 @@ void draw_viewport_interpolation_stages(
 		// A lower z-level's proxy must be covered by the next viewport's fog and terrain.
 		// Reapply that viewport before its own proxies, matching DF's lower-to-main draw order.
 		if(index>0)redraw_viewport_tiles(renderer,viewports[index],coverage);
-		const viewport_renderst &viewport=viewports[index];
-		draw_interpolation_stages(
-			renderer,viewport.viewport,viewport.proxies,viewport.coverage);
+		viewport_renderst &viewport=viewports[index];
+		draw_interpolation_stages(renderer,viewport);
 		if(index+1==viewports.size())
 			for(const carried_item_proxyst &proxy:carried_items)
 				draw_carried_item_proxy(renderer,proxy);
 		// A viewport shades everything drawn beneath it, so this covers every staged tile.
 		// Restricting it to the tiles this viewport has sprites on would not deepen with distance.
+		// A tile whose shading already rode on its last repaint is done.
 		for(const auto &[x,y]:coverage)
 			{
-			if(inside_clip(viewport.viewport,x,y))
+			if(inside_clip(viewport.viewport,x,y)&&
+				!viewport.shaded[size_t(x*viewport.viewport->dim_y+y)])
 				draw_interface_only(renderer,viewport.viewport,x,y);
 			}
 		}
@@ -1499,6 +1552,25 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 
 	std::vector<viewport_renderst> viewport_renders=
 		collect_viewport_renders(renderer,viewports);
+	// Designation sprites have no repaint above them, and carried items are drawn last over
+	// the main viewport: the shading of the tiles they cover waits for the interface-only pass.
+	for(viewport_renderst &render:viewport_renders)
+		{
+		const size_t tile_count=size_t(render.viewport->dim_x)*size_t(render.viewport->dim_y);
+		render.shaded.assign(tile_count,0);
+		render.drawn_over.assign(tile_count,0);
+		render.shading_group.assign(tile_count,viewport_renderst::no_group);
+		for(const auto &[x,y]:render.coverage.groups[
+				static_cast<size_t>(visual_render_groupst::designation)])
+			render.drawn_over[size_t(x*render.viewport->dim_y+y)]=1;
+		}
+	if(!viewport_renders.empty())
+		{
+		viewport_renderst &main_render=viewport_renders.back();
+		for(const carried_item_proxyst &proxy:carried_items)
+			for(const auto &[x,y]:proxy.coverage)
+				main_render.drawn_over[size_t(x*main_render.viewport->dim_y+y)]=1;
+		}
 	tile_coveragest coverage=collect_viewport_coverage(viewport_renders);
 	for(const carried_item_proxyst &proxy:carried_items)
 		coverage.insert(proxy.coverage.begin(),proxy.coverage.end());

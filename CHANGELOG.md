@@ -9,6 +9,11 @@
   zeroed, most tiles of a level below the camera are all zero, and the engine paints nothing
   for them; the render hook now checks that before asking. `smooth-movement stats` reports
   how many repaints were skipped.
+- Fold a staged tile's shading into its last repaint. The engine paints the interface layer
+  last within a repaint, so the tile that the last render group of a viewport touches no
+  longer needs the separate interface-only repaint afterwards; tiles with a designation
+  sprite, a carried item or a top shadow over them keep it. Cuts the repaints of a busy
+  frame by about a fifth more.
 - Set smoothstep movement tweens to 150 ms. Add optional linear easing with
   adaptive 150–500 ms durations based on the cadence between consecutive steps
   (`smooth-movement linear on`) and icons for boulders, bars, and wood hauled by units
