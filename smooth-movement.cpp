@@ -111,12 +111,95 @@ struct scope_guardst
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
 decltype(&SDL_RenderCopyExF) render_copy_ex_f=nullptr;
 decltype(&SDL_RenderFillRect) render_fill_rect=nullptr;
+decltype(&SDL_RenderFillRects) render_fill_rects=nullptr;
 decltype(&SDL_RenderSetClipRect) render_set_clip_rect=nullptr;
 decltype(&SDL_GetRenderDrawColor) get_render_draw_color=nullptr;
 decltype(&SDL_SetRenderDrawColor) set_render_draw_color=nullptr;
 
 visual_animation_managerst animation_manager;
-std::set<std::pair<int32_t,int32_t>> previous_coverage;
+// The set of tiles a frame touches. A flag per tile answers membership in one load, and the
+// tiles are listed as they arrive so a pass can walk them without scanning the grid. Walks go
+// in x-then-y order, the order the engine sweeps a viewport in, so the flags are sorted first.
+class tile_coveragest
+{
+	int32_t dim_x=0;
+	int32_t dim_y=0;
+	std::vector<uint8_t> flags;
+	std::vector<std::pair<int32_t,int32_t>> marks;
+	bool sorted=true;
+
+	public:
+		bool empty() const
+		{
+			return marks.empty();
+		}
+
+		size_t size() const
+		{
+			return marks.size();
+		}
+
+		void clear()
+		{
+			std::fill(flags.begin(),flags.end(),0);
+			marks.clear();
+			sorted=true;
+		}
+
+		bool count(std::pair<int32_t,int32_t> tile) const
+		{
+			const auto [x,y]=tile;
+			return x>=0&&x<dim_x&&y>=0&&y<dim_y&&flags[size_t(x)*size_t(dim_y)+size_t(y)]!=0;
+		}
+
+		void insert(std::pair<int32_t,int32_t> tile)
+		{
+			const auto [x,y]=tile;
+			if(x<0||y<0)return;
+			if(x>=dim_x||y>=dim_y)grow(x+1,y+1);
+			uint8_t &flag=flags[size_t(x)*size_t(dim_y)+size_t(y)];
+			if(flag)return;
+			flag=1;
+			if(sorted&&!marks.empty()&&marks.back()>tile)sorted=false;
+			marks.push_back(tile);
+		}
+
+		template<typename Iterator>
+		void insert(Iterator first,Iterator last)
+		{
+			for(;first!=last;++first)insert(*first);
+		}
+
+		// The tiles in x-then-y order.
+		const std::vector<std::pair<int32_t,int32_t>> &tiles()
+		{
+			if(!sorted)
+				{
+				std::sort(marks.begin(),marks.end());
+				sorted=true;
+				}
+			return marks;
+		}
+
+	private:
+		void grow(int32_t new_dim_x,int32_t new_dim_y)
+		{
+			new_dim_x=std::max(new_dim_x,dim_x);
+			new_dim_y=std::max(new_dim_y,dim_y);
+			std::vector<uint8_t> grown(size_t(new_dim_x)*size_t(new_dim_y),0);
+			for(const auto &[x,y]:marks)
+				grown[size_t(x)*size_t(new_dim_y)+size_t(y)]=1;
+			flags.swap(grown);
+			dim_x=new_dim_x;
+			dim_y=new_dim_y;
+		}
+};
+
+// The frame's working sets, kept across frames so their grids are allocated once.
+tile_coveragest previous_coverage;
+tile_coveragest coverage_scratch;
+tile_coveragest redraw_coverage_scratch;
+std::vector<SDL_Rect> tile_rects_scratch;
 uint64_t visual_context_revision=0;
 const void *previous_viewport=nullptr;
 std::array<int32_t,12> previous_view_signature{};
@@ -592,7 +675,8 @@ struct render_proxyst
 	SDL_Texture *texture;
 	bool mirrored=false;
 	int32_t mirror_shift=0;
-	std::set<std::pair<int32_t,int32_t>> coverage;
+	// The tiles the sprite crosses; a handful, listed once each.
+	std::vector<std::pair<int32_t,int32_t>> coverage;
 };
 
 struct carried_item_proxyst
@@ -603,16 +687,15 @@ struct carried_item_proxyst
 	int32_t target_y;
 	float progress;
 	SDL_Texture *texture;
-	std::set<std::pair<int32_t,int32_t>> coverage;
+	std::vector<std::pair<int32_t,int32_t>> coverage;
 };
-
-using tile_coveragest=std::set<std::pair<int32_t,int32_t>>;
 
 struct render_coveragest
 {
 	tile_coveragest all;
 	std::array<tile_coveragest,static_cast<size_t>(visual_render_groupst::count)> groups;
-	std::unordered_map<int32_t,uint16_t> selected;
+	// The visual layers with a proxy on each tile, indexed like the viewport buffers.
+	std::vector<uint16_t> selected;
 };
 
 struct viewport_renderst
@@ -627,12 +710,9 @@ constexpr uint16_t visual_layer_bit(viewport_visual_layer layer)
 	return uint16_t(1U<<static_cast<uint8_t>(layer));
 }
 
-uint16_t selected_mask(
-	const std::unordered_map<int32_t,uint16_t> &selected,
-	int32_t index)
+uint16_t selected_mask(const std::vector<uint16_t> &selected,int32_t index)
 {
-	const auto found=selected.find(index);
-	return found==selected.end()?0:found->second;
+	return index>=0&&size_t(index)<selected.size()?selected[size_t(index)]:0;
 }
 
 template<size_t Layer=0,typename Callback>
@@ -821,7 +901,7 @@ void redraw_above(
 	int32_t x,
 	int32_t y,
 	visual_render_groupst group,
-	const std::unordered_map<int32_t,uint16_t> &selected)
+	const std::vector<uint16_t> &selected)
 {
 	const int32_t index=x*vp->dim_y+y;
 	const auto redraw=[&]{engine_repaint(renderer,vp,x,y);};
@@ -1008,7 +1088,7 @@ std::vector<carried_item_proxyst> collect_carried_item_proxies(
 			for(int32_t coverage_y=int32_t(std::floor(std::min(source_y,float(y))));
 				coverage_y<=int32_t(std::ceil(std::max(source_y,float(y))));++coverage_y)
 				if(inside_clip(vp,coverage_x,coverage_y))
-					proxy.coverage.emplace(coverage_x,coverage_y);
+					proxy.coverage.push_back({coverage_x,coverage_y});
 		proxies.push_back(std::move(proxy));
 		}
 	return proxies;
@@ -1160,31 +1240,32 @@ std::vector<render_proxyst> collect_proxies(
 							blocked=true;
 							break;
 							}
-						proxy.coverage.emplace(coverage_x,coverage_y);
+						proxy.coverage.push_back({coverage_x,coverage_y});
 						}
 					if(blocked)break;
 					}
 				if(blocked)continue;
 				if(proxy.mirror_shift!=0)
 					{
-					std::set<std::pair<int32_t,int32_t>> mirrored_coverage;
-					for(const auto &tile:proxy.coverage)
-						mirrored_coverage.emplace(
-							tile.first+proxy.mirror_shift,tile.second);
-					for(const auto &tile:mirrored_coverage)
+					// The shifted copies are appended behind the originals; a shifted tile
+					// that lands on an original is listed twice, which the coverage absorbs.
+					const size_t unshifted=proxy.coverage.size();
+					for(size_t tile=0;tile<unshifted;++tile)
 						{
-						if(!inside_clip(vp,tile.first,tile.second))
+						const int32_t tile_x=proxy.coverage[tile].first+proxy.mirror_shift;
+						const int32_t tile_y=proxy.coverage[tile].second;
+						if(!inside_clip(vp,tile_x,tile_y))
 							{
 							blocked=true;
 							break;
 							}
 						if(visual_render_group(proxy.layer)==visual_render_groupst::main&&
-							has_fire(vp,tile.first,tile.second))
+							has_fire(vp,tile_x,tile_y))
 							{
 							blocked=true;
 							break;
 							}
-						proxy.coverage.insert(tile);
+						proxy.coverage.push_back({tile_x,tile_y});
 						}
 					if(blocked)continue;
 					}
@@ -1203,12 +1284,11 @@ std::vector<render_proxyst> collect_proxies(
 	// A fragment's tile is its anchor minus the layer's centre offset, inverting the moving path.
 	if(flip_enabled)
 		{
-		// (layer, tile) pairs already given a proxy, so a resting sprite is not drawn twice.
-		std::set<std::pair<uint8_t,int32_t>> drawn;
+		// The layers already given a proxy on each tile, so a resting sprite is not drawn twice.
+		std::vector<uint16_t> drawn(size_t(vp->dim_x)*size_t(vp->dim_y),0);
 		for(const render_proxyst &existing:proxies)
-			drawn.emplace(
-				static_cast<uint8_t>(existing.layer),
-				existing.target_x*vp->dim_y+existing.target_y);
+			drawn[size_t(existing.target_x*vp->dim_y+existing.target_y)]|=
+				visual_layer_bit(existing.layer);
 		// Mirrored tiles come in index order, which is the x outer, y inner sweep order.
 		for(const int32_t anchor_index:animation_manager.mirrored_tiles(vp))
 			{
@@ -1230,8 +1310,7 @@ std::vector<render_proxyst> collect_proxies(
 					const size_t layer=static_cast<size_t>(visual_layer);
 					const int32_t texpos=layers[layer][x*vp->dim_y+y];
 					if(texpos==0)continue;
-					if(drawn.count({static_cast<uint8_t>(visual_layer),x*vp->dim_y+y}))
-						continue;
+					if(drawn[size_t(x*vp->dim_y+y)]&visual_layer_bit(visual_layer))continue;
 
 					// source == target at progress 1.0 draws in place, moved only by mirror_shift.
 					render_proxyst proxy=
@@ -1263,13 +1342,13 @@ std::vector<render_proxyst> collect_proxies(
 							blocked=true;
 							break;
 							}
-						proxy.coverage.emplace(coverage_x,y);
+						proxy.coverage.push_back({coverage_x,y});
 						}
 					if(blocked)continue;
 
 					proxy.texture=cached_texture(renderer,texpos);
 					if(proxy.texture==nullptr)continue;
-					drawn.emplace(static_cast<uint8_t>(visual_layer),x*vp->dim_y+y);
+					drawn[size_t(x*vp->dim_y+y)]|=visual_layer_bit(visual_layer);
 					proxies.push_back(std::move(proxy));
 					}
 				}
@@ -1280,13 +1359,15 @@ std::vector<render_proxyst> collect_proxies(
 
 render_coveragest collect_coverage(
 	const std::vector<render_proxyst> &proxies,
+	int32_t dim_x,
 	int32_t dim_y)
 {
 	render_coveragest coverage;
+	if(!proxies.empty())coverage.selected.assign(size_t(dim_x)*size_t(dim_y),0);
 	for(const render_proxyst &proxy:proxies)
 		{
 		coverage.all.insert(proxy.coverage.begin(),proxy.coverage.end());
-		coverage.selected[proxy.target_x*dim_y+proxy.target_y]|=
+		coverage.selected[size_t(proxy.target_x*dim_y+proxy.target_y)]|=
 			visual_layer_bit(proxy.layer);
 		auto &group=coverage.groups[static_cast<size_t>(visual_render_group(proxy.layer))];
 		group.insert(proxy.coverage.begin(),proxy.coverage.end());
@@ -1317,27 +1398,17 @@ std::vector<viewport_renderst> collect_viewport_renders(
 	for(df::graphic_viewportst *vp:viewports)
 		{
 		viewport_renderst render={vp,collect_proxies(renderer,vp),{}};
-		render.coverage=collect_coverage(render.proxies,vp->dim_y);
+		render.coverage=collect_coverage(render.proxies,vp->dim_x,vp->dim_y);
 		renders.push_back(std::move(render));
 		}
 	return renders;
-}
-
-tile_coveragest collect_viewport_coverage(
-	const std::vector<viewport_renderst> &viewports)
-{
-	tile_coveragest coverage;
-	for(const viewport_renderst &viewport:viewports)
-		coverage.insert(
-			viewport.coverage.all.begin(),viewport.coverage.all.end());
-	return coverage;
 }
 
 void draw_interpolation_stages(
 	df::renderer_2d_base *renderer,
 	df::graphic_viewportst *vp,
 	const std::vector<render_proxyst> &proxies,
-	const render_coveragest &coverage)
+	render_coveragest &coverage)
 {
 	for(size_t index=0;index<coverage.groups.size();++index)
 		{
@@ -1345,7 +1416,7 @@ void draw_interpolation_stages(
 		for(const render_proxyst &proxy:proxies)
 			if(visual_render_group(proxy.layer)==group)draw_proxy(renderer,proxy);
 		if(group==visual_render_groupst::designation)continue;
-		for(const auto &[x,y]:coverage.groups[index])
+		for(const auto &[x,y]:coverage.groups[index].tiles())
 			redraw_above(renderer,vp,x,y,group,coverage.selected);
 		}
 }
@@ -1353,10 +1424,10 @@ void draw_interpolation_stages(
 void redraw_viewport_tiles(
 	df::renderer_2d_base *renderer,
 	const viewport_renderst &viewport,
-	const tile_coveragest &coverage)
+	tile_coveragest &coverage)
 {
 	df::graphic_viewportst *vp=viewport.viewport;
-	for(const auto &[x,y]:coverage)
+	for(const auto &[x,y]:coverage.tiles())
 		{
 		if(!inside_clip(vp,x,y))continue;
 		redraw_viewport_tile(renderer,viewport,x,y,true);
@@ -1365,8 +1436,8 @@ void redraw_viewport_tiles(
 
 void draw_viewport_interpolation_stages(
 	df::renderer_2d_base *renderer,
-	const std::vector<viewport_renderst> &viewports,
-	const tile_coveragest &coverage,
+	std::vector<viewport_renderst> &viewports,
+	tile_coveragest &coverage,
 	const std::vector<carried_item_proxyst> &carried_items)
 {
 	for(size_t index=0;index<viewports.size();++index)
@@ -1374,7 +1445,7 @@ void draw_viewport_interpolation_stages(
 		// A lower z-level's proxy must be covered by the next viewport's fog and terrain.
 		// Reapply that viewport before its own proxies, matching DF's lower-to-main draw order.
 		if(index>0)redraw_viewport_tiles(renderer,viewports[index],coverage);
-		const viewport_renderst &viewport=viewports[index];
+		viewport_renderst &viewport=viewports[index];
 		draw_interpolation_stages(
 			renderer,viewport.viewport,viewport.proxies,viewport.coverage);
 		if(index+1==viewports.size())
@@ -1382,7 +1453,7 @@ void draw_viewport_interpolation_stages(
 				draw_carried_item_proxy(renderer,proxy);
 		// A viewport shades everything drawn beneath it, so this covers every staged tile.
 		// Restricting it to the tiles this viewport has sprites on would not deepen with distance.
-		for(const auto &[x,y]:coverage)
+		for(const auto &[x,y]:coverage.tiles())
 			{
 			if(inside_clip(viewport.viewport,x,y))
 				draw_interface_only(renderer,viewport.viewport,x,y);
@@ -1469,7 +1540,13 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 
 	std::vector<viewport_renderst> viewport_renders=
 		collect_viewport_renders(renderer,viewports);
-	tile_coveragest coverage=collect_viewport_coverage(viewport_renders);
+	tile_coveragest &coverage=coverage_scratch;
+	coverage.clear();
+	for(viewport_renderst &viewport:viewport_renders)
+		{
+		const auto &tiles=viewport.coverage.all.tiles();
+		coverage.insert(tiles.begin(),tiles.end());
+		}
 	for(const carried_item_proxyst &proxy:carried_items)
 		coverage.insert(proxy.coverage.begin(),proxy.coverage.end());
 
@@ -1520,26 +1597,34 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		return;
 		}
 
-	tile_coveragest redraw_coverage=coverage;
-	redraw_coverage.insert(previous_coverage.begin(),previous_coverage.end());
-	Uint8 old_r=0,old_g=0,old_b=0,old_a=255;
-	get_render_draw_color(sdl_renderer,&old_r,&old_g,&old_b,&old_a);
-	set_render_draw_color(sdl_renderer,0,0,0,255);
-	for(const auto &[x,y]:redraw_coverage)
+	tile_coveragest &redraw_coverage=redraw_coverage_scratch;
+	redraw_coverage.clear();
+	redraw_coverage.insert(coverage.tiles().begin(),coverage.tiles().end());
+	redraw_coverage.insert(previous_coverage.tiles().begin(),previous_coverage.tiles().end());
+	// Every tile blanks to the same colour, so they go to the renderer as one call.
+	std::vector<SDL_Rect> &tile_rects=tile_rects_scratch;
+	tile_rects.clear();
+	for(const auto &[x,y]:redraw_coverage.tiles())
 		{
 		if(!inside_clip(vp,x,y))continue;
-		const SDL_Rect tile_rect=
+		tile_rects.push_back(
 			{
 			tile_pixel(x,renderer->origin_x,zoom),
 			tile_pixel(y,renderer->origin_y,zoom),
 			tile_size,
 			tile_size
-			};
-		render_fill_rect(sdl_renderer,&tile_rect);
+			});
 		}
-	set_render_draw_color(sdl_renderer,old_r,old_g,old_b,old_a);
+	if(!tile_rects.empty())
+		{
+		Uint8 old_r=0,old_g=0,old_b=0,old_a=255;
+		get_render_draw_color(sdl_renderer,&old_r,&old_g,&old_b,&old_a);
+		set_render_draw_color(sdl_renderer,0,0,0,255);
+		render_fill_rects(sdl_renderer,tile_rects.data(),int(tile_rects.size()));
+		set_render_draw_color(sdl_renderer,old_r,old_g,old_b,old_a);
+		}
 
-	for(const auto &[x,y]:redraw_coverage)
+	for(const auto &[x,y]:redraw_coverage.tiles())
 		{
 		if(inside_clip(vp,x,y))
 			redraw_world_tile(renderer,viewport_renders,coverage,x,y);
@@ -1547,7 +1632,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	draw_viewport_interpolation_stages(
 		renderer,viewport_renders,coverage,carried_items);
 
-	previous_coverage=std::move(coverage);
+	std::swap(previous_coverage,coverage);
 }
 
 struct renderer_hook : df::renderer_2d_base
@@ -1570,6 +1655,7 @@ void clear_sdl_bindings()
 	render_copy_f=nullptr;
 	render_copy_ex_f=nullptr;
 	render_fill_rect=nullptr;
+	render_fill_rects=nullptr;
 	render_set_clip_rect=nullptr;
 	get_render_draw_color=nullptr;
 	set_render_draw_color=nullptr;
@@ -1589,6 +1675,7 @@ bool load_sdl(color_ostream &out)
 	bind(SDL_RenderCopyF,render_copy_f);
 	bind(SDL_RenderCopyExF,render_copy_ex_f);
 	bind(SDL_RenderFillRect,render_fill_rect);
+	bind(SDL_RenderFillRects,render_fill_rects);
 	bind(SDL_RenderSetClipRect,render_set_clip_rect);
 	bind(SDL_GetRenderDrawColor,get_render_draw_color);
 	bind(SDL_SetRenderDrawColor,set_render_draw_color);

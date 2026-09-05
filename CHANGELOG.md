@@ -10,6 +10,11 @@
   layer. Fragments find their anchor through a per-tile table, and resting mirrored
   creatures come from a list the manager keeps, so the collector no longer touches
   every tile of the viewport each frame. Same sprites, same order, same pixels.
+- Flat coverage bookkeeping and one blank-out fill per frame. The tiles a frame touches are
+  tracked in a per-tile flag grid with a mark list instead of ordered sets of pairs, the
+  per-tile selected-layer mask is a vector indexed like the buffers, and the tiles blanked
+  before repainting go to SDL in a single `SDL_RenderFillRects` call. Same repaints and
+  draws in the same order; less time between them.
 - Set smoothstep movement tweens to 150 ms. Add optional linear easing with
   adaptive 150–500 ms durations based on the cadence between consecutive steps
   (`smooth-movement linear on`) and icons for boulders, bars, and wood hauled by units
