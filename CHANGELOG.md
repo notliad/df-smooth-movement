@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add `smooth-movement stats [on|off|reset]`: counts frames, frames that reached the draw
+  stage and engine tile repaints, and (while on) times the render hook split into movement
+  detection and drawing. Off by default; the counters cost a few increments per frame.
 - Set smoothstep movement tweens to 150 ms. Add optional linear easing with
   adaptive 150–500 ms durations based on the cadence between consecutive steps
   (`smooth-movement linear on`) and icons for boulders, bars, and wood hauled by units

@@ -7,3 +7,9 @@ add_executable(
     EXCLUDE_FROM_ALL
     test_visual_animation_manager.cpp)
 target_compile_features(smooth-movement-test PRIVATE cxx_std_17)
+
+add_executable(
+    smooth-movement-bench
+    EXCLUDE_FROM_ALL
+    bench_visual_animation_manager.cpp)
+target_compile_features(smooth-movement-bench PRIVATE cxx_std_17)
