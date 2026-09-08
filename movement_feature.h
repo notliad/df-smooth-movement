@@ -10,11 +10,11 @@
 namespace movement_feature
 {
 	void reset();
-	movement_prepare_resultst prepare(const movement_frame_contextst &frame);
+	movement_prepare_result prepare(const movement_frame_context &frame);
 	void render(
-		const movement_frame_contextst &frame,
-		const camera_render_offsetst &camera,
-		const sprite_flip_featurest &sprite_flip);
+		const movement_frame_context &frame,
+		const camera_render_offset &camera,
+		const sprite_flip_feature &sprite_flip);
 }
 
 #endif

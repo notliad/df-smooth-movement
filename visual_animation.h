@@ -24,7 +24,7 @@ enum class viewport_visual_layer : uint8_t
 	count
 };
 
-enum class visual_render_groupst : uint8_t
+enum class visual_render_group : uint8_t
 {
 	item,
 	vehicle,
@@ -34,10 +34,10 @@ enum class visual_render_groupst : uint8_t
 	count
 };
 
-struct visual_layer_descriptorst
+struct visual_layer_descriptor
 {
 	viewport_visual_layer layer;
-	visual_render_groupst render_group;
+	visual_render_group render_group;
 	bool moves_independently;
 	bool matches_any_previous;
 	uint8_t draw_order;
@@ -47,24 +47,24 @@ struct visual_layer_descriptorst
 
 constexpr std::array visual_layer_descriptors=
 	{
-	visual_layer_descriptorst{viewport_visual_layer::right,
-		visual_render_groupst::main,false,false,3,-1,0},
-	visual_layer_descriptorst{viewport_visual_layer::center,
-		visual_render_groupst::main,true,false,0,0,0},
-	visual_layer_descriptorst{viewport_visual_layer::left,
-		visual_render_groupst::main,false,false,4,1,0},
-	visual_layer_descriptorst{viewport_visual_layer::upright,
-		visual_render_groupst::upper,false,false,5,-1,1},
-	visual_layer_descriptorst{viewport_visual_layer::up,
-		visual_render_groupst::upper,false,false,6,0,1},
-	visual_layer_descriptorst{viewport_visual_layer::upleft,
-		visual_render_groupst::upper,false,false,7,1,1},
-	visual_layer_descriptorst{viewport_visual_layer::vehicle,
-		visual_render_groupst::vehicle,true,true,2,0,0},
-	visual_layer_descriptorst{viewport_visual_layer::item,
-		visual_render_groupst::item,true,false,1,0,0},
-	visual_layer_descriptorst{viewport_visual_layer::designation,
-		visual_render_groupst::designation,false,true,8,0,0}
+	visual_layer_descriptor{viewport_visual_layer::right,
+		visual_render_group::main,false,false,3,-1,0},
+	visual_layer_descriptor{viewport_visual_layer::center,
+		visual_render_group::main,true,false,0,0,0},
+	visual_layer_descriptor{viewport_visual_layer::left,
+		visual_render_group::main,false,false,4,1,0},
+	visual_layer_descriptor{viewport_visual_layer::upright,
+		visual_render_group::upper,false,false,5,-1,1},
+	visual_layer_descriptor{viewport_visual_layer::up,
+		visual_render_group::upper,false,false,6,0,1},
+	visual_layer_descriptor{viewport_visual_layer::upleft,
+		visual_render_group::upper,false,false,7,1,1},
+	visual_layer_descriptor{viewport_visual_layer::vehicle,
+		visual_render_group::vehicle,true,true,2,0,0},
+	visual_layer_descriptor{viewport_visual_layer::item,
+		visual_render_group::item,true,false,1,0,0},
+	visual_layer_descriptor{viewport_visual_layer::designation,
+		visual_render_group::designation,false,true,8,0,0}
 	};
 
 constexpr bool valid_visual_layer_descriptors()
@@ -83,7 +83,7 @@ constexpr bool valid_visual_layer_descriptors()
 
 static_assert(valid_visual_layer_descriptors());
 
-constexpr const visual_layer_descriptorst &visual_layer_descriptor(
+constexpr const visual_layer_descriptor &get_visual_layer_descriptor(
 	viewport_visual_layer layer)
 {
 	return visual_layer_descriptors[static_cast<size_t>(layer)];
@@ -96,21 +96,21 @@ constexpr viewport_visual_layer visual_layer_at_draw_order(uint8_t draw_order)
 	return viewport_visual_layer::count;
 }
 
-constexpr visual_render_groupst visual_render_group(viewport_visual_layer layer)
+constexpr visual_render_group get_visual_render_group(viewport_visual_layer layer)
 {
-	return visual_layer_descriptor(layer).render_group;
+	return get_visual_layer_descriptor(layer).render_group;
 }
 
 constexpr bool visual_layer_moves_independently(viewport_visual_layer layer)
 {
-	return visual_layer_descriptor(layer).moves_independently;
+	return get_visual_layer_descriptor(layer).moves_independently;
 }
 
 constexpr bool visual_layer_tracks_own_movement(viewport_visual_layer layer)
 {
-	const auto &descriptor=visual_layer_descriptor(layer);
+	const auto &descriptor=get_visual_layer_descriptor(layer);
 	return descriptor.moves_independently||
-		descriptor.render_group==visual_render_groupst::designation;
+		descriptor.render_group==visual_render_group::designation;
 }
 
 constexpr bool visual_layer_matches(
@@ -118,12 +118,12 @@ constexpr bool visual_layer_matches(
 	int32_t current,
 	int32_t previous)
 {
-	return visual_layer_descriptor(layer).matches_any_previous?
+	return get_visual_layer_descriptor(layer).matches_any_previous?
 		previous!=0:
 		previous==current;
 }
 
-struct viewport_visual_animation_inputst
+struct viewport_visual_animation_input
 {
 	const void *viewport=nullptr;
 	int32_t dim_x=0;
@@ -147,7 +147,7 @@ struct viewport_visual_animation_inputst
 		}
 };
 
-struct visual_movement_renderst
+struct visual_movement_render
 {
 	bool active=false;
 	float source_x=0.0f;
@@ -185,22 +185,22 @@ inline int32_t inherited_visual_source_tile(
 	return overlay_target+int32_t(std::lround(center_source-center_target));
 }
 
-enum class visual_facingst : int8_t
+enum class visual_facing : int8_t
 {
 	east=0,
 	west=1
 };
 
 // DF creature art faces west, so only east needs flipping. Also the default and cleared value.
-constexpr visual_facingst native_sprite_facing=visual_facingst::west;
+constexpr visual_facing native_sprite_facing=visual_facing::west;
 
 // Sticky facing: only a horizontal component changes it.
-constexpr visual_facingst facing_after_move(
+constexpr visual_facing facing_after_move(
 	int32_t dx,
-	visual_facingst previous)
+	visual_facing previous)
 {
-	if(dx>0)return visual_facingst::east;
-	if(dx<0)return visual_facingst::west;
+	if(dx>0)return visual_facing::east;
+	if(dx<0)return visual_facing::west;
 	return previous;
 }
 
@@ -210,9 +210,9 @@ constexpr int32_t mirrored_tile_x(int32_t piece_x,int32_t anchor_x)
 	return anchor_x-(piece_x-anchor_x);
 }
 
-class visual_animation_managerst
+class visual_animation_manager
 {
-	struct movementst
+	struct movement
 	{
 		viewport_visual_layer layer;
 		int32_t texpos;
@@ -223,7 +223,7 @@ class visual_animation_managerst
 		uint32_t start_time_ms;
 	};
 
-	struct viewport_animationst
+	struct viewport_animation
 	{
 		const void *viewport=nullptr;
 		int32_t dim_x=0;
@@ -231,7 +231,7 @@ class visual_animation_managerst
 		uint64_t context_revision=0;
 		bool has_context=false;
 		bool seen=false;
-		std::vector<movementst> movements;
+		std::vector<movement> movements;
 		// One facing per tile, not per unit: the viewport exposes one creature texpos per tile.
 		std::vector<int8_t> facing;
 		// Stationary mirrored creatures are repainted every frame; this is the cheap pre-check.
@@ -259,7 +259,7 @@ class visual_animation_managerst
 	uint32_t frame_delta_ms=0;
 	bool has_frame=false;
 	bool force_full_redraw=false;
-	std::vector<viewport_animationst> viewports;
+	std::vector<viewport_animation> viewports;
 
 	static constexpr uint32_t movement_duration_ms=100;
 	// Scrolling faster than detection keeps up: give up rather than test ever more prefixes.
@@ -267,20 +267,20 @@ class visual_animation_managerst
 	// Bounds the wait on a scroll that never lands, so suppression cannot stick forever.
 	static constexpr int32_t max_pending_age_frames=120;
 
-	static void clear_pending(viewport_animationst &state)
+	static void clear_pending(viewport_animation &state)
 		{
 		state.pending.clear();
 		state.pending_frames=0;
 		state.pending_age=0;
 		}
 
-	static void abandon_pending(viewport_animationst &state)
+	static void abandon_pending(viewport_animation &state)
 		{
 		state.movements.clear();
 		clear_pending(state);
 		}
 
-	static void reset_facing(viewport_animationst &state)
+	static void reset_facing(viewport_animation &state)
 		{
 		std::fill(
 			state.facing.begin(),
@@ -289,14 +289,14 @@ class visual_animation_managerst
 		state.has_mirrored=false;
 		}
 
-	static void reset_tracking(viewport_animationst &state)
+	static void reset_tracking(viewport_animation &state)
 		{
 		abandon_pending(state);
 		state.suppress_frames=0;
 		}
 
 	// Identifies the buffer contents this frame, to tell a redrawn viewport from a repeated one.
-	static uint64_t compute_buffer_signature(const viewport_visual_animation_inputst &input)
+	static uint64_t compute_buffer_signature(const viewport_visual_animation_input &input)
 		{
 		// FNV-1a. Only ever compared against the previous frame's value, never stored.
 		constexpr uint64_t fnv_offset_basis=0xcbf29ce484222325ULL;
@@ -319,7 +319,7 @@ class visual_animation_managerst
 	// Fraction of tracked sprites consistent with a buffer shift: current[x]==previous[x+dwx].
 	// Negative when there is nothing to compare.
 	static double shift_match_ratio(
-		const viewport_visual_animation_inputst &input,
+		const viewport_visual_animation_input &input,
 		int32_t dwx,
 		int32_t dwy)
 		{
@@ -331,7 +331,7 @@ class visual_animation_managerst
 			if(!visual_layer_tracks_own_movement(id))continue;
 			// A layer matching any non-zero previous carries no position, so it would vote for
 			// every hypothesis and carry an unapplied scroll over the bar.
-			if(visual_layer_descriptor(id).matches_any_previous)continue;
+			if(get_visual_layer_descriptor(id).matches_any_previous)continue;
 			const int32_t *current=input.current[layer];
 			const int32_t *previous=input.previous[layer];
 			for(int32_t x=0;x<input.dim_x;++x)
@@ -394,9 +394,9 @@ class visual_animation_managerst
 		return ambiguous?std::array<int32_t,2>{}:best;
 		}
 
-	viewport_animationst &get_viewport(const viewport_visual_animation_inputst &input)
+	viewport_animation &get_viewport(const viewport_visual_animation_input &input)
 		{
-		for(viewport_animationst &state:viewports)
+		for(viewport_animation &state:viewports)
 			{
 			if(state.viewport==input.viewport)return state;
 			}
@@ -412,7 +412,7 @@ class visual_animation_managerst
 		}
 
 	public:
-		visual_animation_managerst()=default;
+		visual_animation_manager()=default;
 
 		void begin_frame(uint32_t now_ms)
 			{
@@ -421,17 +421,17 @@ class visual_animation_managerst
 			has_frame=true;
 			force_full_redraw=false;
 			// Keep one final full redraw when the last movement expires.
-			for(viewport_animationst &state:viewports)
+			for(viewport_animation &state:viewports)
 				{
 				state.seen=false;
 				if(!state.movements.empty())force_full_redraw=true;
 				}
 			}
 
-		void synchronize_viewport(const viewport_visual_animation_inputst &input)
+		void synchronize_viewport(const viewport_visual_animation_input &input)
 			{
 			if(input.viewport==nullptr)return;
-			viewport_animationst &state=get_viewport(input);
+			viewport_animation &state=get_viewport(input);
 			state.seen=true;
 
 			if(!input.valid())
@@ -549,7 +549,7 @@ class visual_animation_managerst
 						std::remove_if(
 							state.movements.begin(),
 							state.movements.end(),
-							[&](movementst &movement)
+							[&](movement &movement)
 								{
 								movement.source_x-=dwx;
 								movement.source_y-=dwy;
@@ -723,15 +723,17 @@ class visual_animation_managerst
 							if(candidate_count!=1)continue;
 
 							claimed_sources[source]=1;
-							float visual_source_x=float(source/input.dim_y);
-							float visual_source_y=float(source%input.dim_y);
+							const int32_t source_x=source/input.dim_y;
+							const int32_t source_y=source%input.dim_y;
+							float visual_source_x=float(source_x);
+							float visual_source_y=float(source_y);
 							for(size_t i=0;i<existing_movement_count;++i)
 								{
-								const movementst &movement=state.movements[i];
+								const movement &movement=state.movements[i];
 								if(movement.layer!=
 										static_cast<viewport_visual_layer>(layer)||
-									movement.target_x!=visual_source_x||
-									movement.target_y!=visual_source_y)continue;
+									movement.target_x!=source_x||
+									movement.target_y!=source_y)continue;
 								const float progress=
 									movement_progress(movement.start_time_ms);
 								visual_source_x=movement.source_x+
@@ -757,14 +759,12 @@ class visual_animation_managerst
 								!facing_at_frame_start.empty()&&
 								facing_at_frame_start.size()==state.facing.size())
 								{
-								const int32_t source_tile_x=source/input.dim_y;
-								const int32_t target_index=x*input.dim_y+y;
-								state.facing[target_index]=int8_t(
+								state.facing[target]=int8_t(
 									facing_after_move(
-										x-source_tile_x,
-										static_cast<visual_facingst>(
+										x-source_x,
+										static_cast<visual_facing>(
 											facing_at_frame_start[source])));
-								facing_target_written[size_t(target_index)]=1;
+								facing_target_written[size_t(target)]=1;
 								pending_facing_source_clears.push_back(source);
 								}
 							}
@@ -785,7 +785,7 @@ class visual_animation_managerst
 				std::remove_if(
 					state.movements.begin(),
 					state.movements.end(),
-					[&](const movementst &movement)
+					[&](const movement &movement)
 						{
 						const size_t layer=static_cast<size_t>(movement.layer);
 						const int32_t target=movement.target_x*input.dim_y+movement.target_y;
@@ -820,9 +820,9 @@ class visual_animation_managerst
 				std::remove_if(
 					viewports.begin(),
 					viewports.end(),
-					[](const viewport_animationst &state){return !state.seen;}),
+					[](const viewport_animation &state){return !state.seen;}),
 				viewports.end());
-			for(const viewport_animationst &state:viewports)
+			for(const viewport_animation &state:viewports)
 				{
 				if(!state.movements.empty())force_full_redraw=true;
 				}
@@ -838,25 +838,25 @@ class visual_animation_managerst
 			return frame_delta_ms;
 			}
 
-		visual_facingst get_facing(
+		visual_facing get_facing(
 			const void *viewport,
 			int32_t x,
 			int32_t y) const
 			{
-			for(const viewport_animationst &state:viewports)
+			for(const viewport_animation &state:viewports)
 				{
 				if(state.viewport!=viewport)continue;
 				if(x<0||x>=state.dim_x||y<0||y>=state.dim_y)break;
 				const size_t index=size_t(x)*size_t(state.dim_y)+size_t(y);
 				if(index>=state.facing.size())break;
-				return static_cast<visual_facingst>(state.facing[index]);
+				return static_cast<visual_facing>(state.facing[index]);
 				}
 			return native_sprite_facing;
 			}
 
 		bool has_mirrored_facing(const void *viewport) const
 			{
-			for(const viewport_animationst &state:viewports)
+			for(const viewport_animation &state:viewports)
 				{
 				if(state.viewport!=viewport)continue;
 				return state.has_mirrored;
@@ -869,18 +869,18 @@ class visual_animation_managerst
 			return force_full_redraw;
 			}
 
-		visual_movement_renderst get_movement(
+		visual_movement_render get_movement(
 			const void *viewport,
 			viewport_visual_layer layer,
 			int32_t target_x,
 			int32_t target_y) const
 			{
-			for(const viewport_animationst &state:viewports)
+			for(const viewport_animation &state:viewports)
 				{
 				if(state.viewport!=viewport)continue;
-				const movementst *companion=nullptr;
+				const movement *companion=nullptr;
 				bool ambiguous=false;
-				for(const movementst &movement:state.movements)
+				for(const movement &movement:state.movements)
 					{
 					if(movement.layer==layer&&movement.target_x==target_x&&
 						movement.target_y==target_y)

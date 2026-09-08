@@ -5,7 +5,7 @@
 
 #include "visual_animation.h"
 
-class sprite_flip_featurest
+class sprite_flip_feature
 {
 	bool enabled_=false;
 
@@ -14,7 +14,7 @@ class sprite_flip_featurest
 		void set_enabled(bool enable) { enabled_=enable; }
 		bool enabled() const { return enabled_; }
 
-		bool should_mirror(visual_render_groupst group,visual_facingst facing) const;
+		bool should_mirror(visual_render_group group,visual_facing facing) const;
 		int32_t mirror_shift(int32_t piece_x,int32_t anchor_x) const;
 };
 

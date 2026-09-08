@@ -9,7 +9,18 @@
 
 int main()
 {
-	camera_featurest camera;
+	{
+	camera_feature sizing;
+	sizing.set_offset(0.48,-0.48,nullptr,nullptr);
+	const auto small=sizing.render_offset(64);
+	assert(small.x==-8&&small.y==8);
+	const auto normal=sizing.render_offset(128);
+	assert(normal.x==-15&&normal.y==15);
+	const auto fractional=sizing.render_offset(130);
+	assert(fractional.x==-15&&fractional.y==15);
+	}
+
+	camera_feature camera;
 	assert(!camera.enabled());
 	int32_t window_x=10;
 	int32_t window_y=10;
@@ -28,7 +39,7 @@ int main()
 
 	constexpr int32_t dimension=2;
 	int32_t background[dimension*dimension]={1,2,3,4};
-	camera_frame_inputst input;
+	camera_frame_input input;
 	input.zoom_factor=128;
 	input.window_x=&window_x;
 	input.window_y=&window_y;

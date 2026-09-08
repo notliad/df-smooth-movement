@@ -6,13 +6,13 @@
 #include <cmath>
 #include <cstdlib>
 
-double camera_featurest::tile_pixels(int32_t zoom_factor)
+double camera_feature::tile_pixels(int32_t zoom_factor)
 {
-	return double(zoom_factor==128?32:std::max(1,zoom_factor*32/128));
+	return double(std::max(1,zoom_factor/4));
 }
 
-double camera_featurest::background_match_ratio(
-	const camera_frame_inputst &input,
+double camera_feature::background_match_ratio(
+	const camera_frame_input &input,
 	int32_t dx,
 	int32_t dy)
 {
@@ -37,7 +37,7 @@ double camera_featurest::background_match_ratio(
 	return considered==0?-1.0:double(matches)/double(considered);
 }
 
-void camera_featurest::clear_pending()
+void camera_feature::clear_pending()
 {
 	pending_dx_=0;
 	pending_dy_=0;
@@ -46,7 +46,7 @@ void camera_featurest::clear_pending()
 	self_scroll_y_=0;
 }
 
-void camera_featurest::cancel_transients()
+void camera_feature::cancel_transients()
 {
 	transient_x_=0.0;
 	transient_y_=0.0;
@@ -54,7 +54,7 @@ void camera_featurest::cancel_transients()
 	drag_active_=false;
 }
 
-void camera_featurest::reset()
+void camera_feature::reset()
 {
 	cancel_transients();
 	enabled_=false;
@@ -66,7 +66,7 @@ void camera_featurest::reset()
 	has_previous_window_=false;
 }
 
-void camera_featurest::set_enabled(bool enable)
+void camera_feature::set_enabled(bool enable)
 {
 	if(enabled_==enable)return;
 	enabled_=enable;
@@ -76,7 +76,7 @@ void camera_featurest::set_enabled(bool enable)
 	has_previous_window_=false;
 }
 
-void camera_featurest::normalize_rest(int32_t *window_x,int32_t *window_y)
+void camera_feature::normalize_rest(int32_t *window_x,int32_t *window_y)
 {
 	const int32_t dx=int32_t(-std::llround(rest_x_));
 	const int32_t dy=int32_t(-std::llround(rest_y_));
@@ -92,7 +92,7 @@ void camera_featurest::normalize_rest(int32_t *window_x,int32_t *window_y)
 		}
 }
 
-void camera_featurest::set_offset(
+void camera_feature::set_offset(
 	double east,
 	double south,
 	int32_t *window_x,
@@ -104,13 +104,13 @@ void camera_featurest::set_offset(
 	normalize_rest(window_x,window_y);
 }
 
-void camera_featurest::reset_offset()
+void camera_feature::reset_offset()
 {
 	rest_x_=0.0;
 	rest_y_=0.0;
 }
 
-void camera_featurest::attribute_landed(int32_t dx,int32_t dy,double tile)
+void camera_feature::attribute_landed(int32_t dx,int32_t dy,double tile)
 {
 	int32_t self_x=0;
 	if(self_scroll_x_!=0&&(self_scroll_x_>0)==(dx>0)&&dx!=0)
@@ -139,7 +139,7 @@ void camera_featurest::attribute_landed(int32_t dx,int32_t dy,double tile)
 		}
 }
 
-void camera_featurest::update(const camera_frame_inputst &input)
+void camera_feature::update(const camera_frame_input &input)
 {
 	if(!enabled_)return;
 	const double tile=tile_pixels(input.zoom_factor);
@@ -273,10 +273,10 @@ void camera_featurest::update(const camera_frame_inputst &input)
 		}
 }
 
-camera_render_offsetst camera_featurest::render_offset(int32_t zoom_factor)
+camera_render_offset camera_feature::render_offset(int32_t zoom_factor)
 {
 	const double tile=tile_pixels(zoom_factor);
-	camera_render_offsetst offset;
+	camera_render_offset offset;
 	offset.x=int32_t(std::lround(transient_x_+rest_x_*tile));
 	offset.y=int32_t(std::lround(transient_y_+rest_y_*tile));
 	const bool active=offset.x!=0||offset.y!=0;

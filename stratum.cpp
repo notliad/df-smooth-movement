@@ -32,17 +32,15 @@ namespace {
 
 constexpr const char *plugin_version="0.3.0";
 
-render_functionst render_functions;
-camera_featurest camera_feature;
-sprite_flip_featurest sprite_flip_feature;
+render_function render_functions;
+camera_feature camera;
+sprite_flip_feature sprite_flip;
 
-movement_frame_contextst make_frame_context(df::renderer_2d_base *renderer)
+movement_frame_context make_frame_context(df::renderer_2d_base *renderer)
 {
-	movement_frame_contextst frame;
+	movement_frame_context frame;
 	frame.renderer=renderer;
-	frame.window_x=window_x?*window_x:0;
-	frame.window_y=window_y?*window_y:0;
-	frame.window_z=window_z?*window_z:0;
+	frame.window_pos=df::coord(window_x?*window_x:0,window_y?*window_y:0,window_z?*window_z:0);
 	frame.now_ms=Core::getInstance().p->getTickCount();
 	frame.render=render_functions;
 	if(gps!=nullptr)
@@ -56,11 +54,11 @@ movement_frame_contextst make_frame_context(df::renderer_2d_base *renderer)
 	return frame;
 }
 
-camera_frame_inputst make_camera_input(
-	const movement_frame_contextst &frame,
+camera_frame_input make_camera_input(
+	const movement_frame_context &frame,
 	uint32_t delta_ms)
 {
-	camera_frame_inputst input;
+	camera_frame_input input;
 	input.zoom_factor=frame.renderer->viewport_zoom_factor;
 	input.window_x=window_x;
 	input.window_y=window_y;
@@ -83,16 +81,16 @@ camera_frame_inputst make_camera_input(
 
 void render_stratum(df::renderer_2d_base *renderer)
 {
-	movement_frame_contextst frame=make_frame_context(renderer);
-	const movement_prepare_resultst prepared=movement_feature::prepare(frame);
-	if(prepared.context_changed)camera_feature.cancel_transients();
+	movement_frame_context frame=make_frame_context(renderer);
+	const movement_prepare_result prepared=movement_feature::prepare(frame);
+	if(prepared.context_changed)camera.cancel_transients();
 	if(!prepared.main_viewport_readable||renderer->sdl_renderer==nullptr)return;
 
-	camera_feature.update(make_camera_input(frame,prepared.frame_delta_ms));
-	const camera_render_offsetst camera=
-		camera_feature.render_offset(renderer->viewport_zoom_factor);
-	if(camera.request_cleanup_redraw&&gps!=nullptr)++gps->force_full_display_count;
-	movement_feature::render(frame,camera,sprite_flip_feature);
+	camera.update(make_camera_input(frame,prepared.frame_delta_ms));
+	const camera_render_offset offset=
+		camera.render_offset(renderer->viewport_zoom_factor);
+	if(offset.request_cleanup_redraw&&gps!=nullptr)++gps->force_full_display_count;
+	movement_feature::render(frame,offset,sprite_flip);
 }
 
 struct renderer_hook : df::renderer_2d_base
@@ -138,8 +136,8 @@ bool load_sdl(color_ostream &out)
 void reset_state()
 {
 	movement_feature::reset();
-	camera_feature.reset();
-	sprite_flip_feature.reset();
+	camera.reset();
+	sprite_flip.reset();
 }
 
 command_result status_command(
@@ -151,10 +149,10 @@ command_result status_command(
 		out.print("stratum {}: {}\n",plugin_version,is_enabled?"enabled":"disabled");
 		out.print(
 			"free camera: {}, offset {:.3f} {:.3f} (tiles east/south of the grid)\n",
-			camera_feature.enabled()?"on":"off",
-			camera_feature.offset_x(),
-			camera_feature.offset_y());
-		out.print("sprite flipping: {}\n",sprite_flip_feature.enabled()?"on":"off");
+			camera.enabled()?"on":"off",
+			camera.offset_x(),
+			camera.offset_y());
+		out.print("sprite flipping: {}\n",sprite_flip.enabled()?"on":"off");
 		return CR_OK;
 		}
 	if(parameters[0]=="camera")
@@ -163,24 +161,24 @@ command_result status_command(
 			{
 			out.print(
 				"free camera: {}, offset {:.3f} {:.3f}\n",
-				camera_feature.enabled()?"on":"off",
-				camera_feature.offset_x(),
-				camera_feature.offset_y());
+				camera.enabled()?"on":"off",
+				camera.offset_x(),
+				camera.offset_y());
 			return CR_OK;
 			}
 		if(parameters.size()==2&&parameters[1]=="on")
 			{
-			camera_feature.set_enabled(true);
+			camera.set_enabled(true);
 			return CR_OK;
 			}
 		if(parameters.size()==2&&parameters[1]=="off")
 			{
-			camera_feature.set_enabled(false);
+			camera.set_enabled(false);
 			return CR_OK;
 			}
 		if(parameters.size()==2&&parameters[1]=="reset")
 			{
-			camera_feature.reset_offset();
+			camera.reset_offset();
 			return CR_OK;
 			}
 		if(parameters.size()==3)
@@ -194,7 +192,7 @@ command_result status_command(
 					out.printerr("offsets must be within -0.99..0.99 tiles\n");
 					return CR_FAILURE;
 					}
-				camera_feature.set_offset(x,y,window_x,window_y);
+				camera.set_offset(x,y,window_x,window_y);
 				return CR_OK;
 				}
 			catch(...)
@@ -208,14 +206,14 @@ command_result status_command(
 		{
 		if(parameters.size()==1)
 			{
-			out.print("sprite flipping: {}\n",sprite_flip_feature.enabled()?"on":"off");
+			out.print("sprite flipping: {}\n",sprite_flip.enabled()?"on":"off");
 			return CR_OK;
 			}
 		if(parameters.size()==2&&
 			(parameters[1]=="on"||parameters[1]=="off"))
 			{
 			const bool enable=parameters[1]=="on";
-			sprite_flip_feature.set_enabled(enable);
+			sprite_flip.set_enabled(enable);
 			if(gps!=nullptr)++gps->force_full_display_count;
 			out.print(
 				"stratum: sprite flipping {}\n",

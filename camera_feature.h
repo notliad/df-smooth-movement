@@ -5,7 +5,7 @@
 
 #include <cstdint>
 
-struct camera_frame_inputst
+struct camera_frame_input
 {
 	int32_t zoom_factor=128;
 	int32_t *window_x=nullptr;
@@ -20,14 +20,14 @@ struct camera_frame_inputst
 	uint32_t delta_ms=0;
 };
 
-struct camera_render_offsetst
+struct camera_render_offset
 {
 	int32_t x=0;
 	int32_t y=0;
 	bool request_cleanup_redraw=false;
 };
 
-class camera_featurest
+class camera_feature
 {
 	static constexpr int32_t max_glide_tiles=3;
 	static constexpr double tau_ms=35.0;
@@ -54,7 +54,7 @@ class camera_featurest
 
 	static double tile_pixels(int32_t zoom_factor);
 	static double background_match_ratio(
-		const camera_frame_inputst &input,
+		const camera_frame_input &input,
 		int32_t dx,
 		int32_t dy);
 	void clear_pending();
@@ -67,8 +67,8 @@ class camera_featurest
 		void set_enabled(bool enable);
 		void set_offset(double east,double south,int32_t *window_x,int32_t *window_y);
 		void reset_offset();
-		void update(const camera_frame_inputst &input);
-		camera_render_offsetst render_offset(int32_t zoom_factor);
+		void update(const camera_frame_input &input);
+		camera_render_offset render_offset(int32_t zoom_factor);
 
 		bool enabled() const { return enabled_; }
 		double offset_x() const { return -rest_x_; }

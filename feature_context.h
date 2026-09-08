@@ -5,13 +5,14 @@
 
 #include "df/graphic_viewportst.h"
 #include "df/renderer_2d_base.h"
+#include "df/coord.h"
 
 #include <SDL_render.h>
 
 #include <array>
 #include <cstdint>
 
-struct render_functionst
+struct render_function
 {
 	decltype(&SDL_RenderCopyF) copy=nullptr;
 	decltype(&SDL_RenderCopyExF) copy_ex=nullptr;
@@ -27,21 +28,19 @@ struct render_functionst
 		}
 };
 
-struct movement_frame_contextst
+struct movement_frame_context
 {
 	df::renderer_2d_base *renderer=nullptr;
 	df::graphic_viewportst *main_viewport=nullptr;
 	std::array<df::graphic_viewportst *,8> lower_viewports{};
-	int32_t window_x=0;
-	int32_t window_y=0;
-	int32_t window_z=0;
+	df::coord window_pos{0,0,0};
 	int32_t screen_dim_x=0;
 	int32_t screen_dim_y=0;
 	uint32_t now_ms=0;
-	render_functionst render;
+	render_function render;
 };
 
-struct movement_prepare_resultst
+struct movement_prepare_result
 {
 	uint32_t frame_delta_ms=0;
 	bool context_changed=false;
