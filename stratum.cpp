@@ -14,6 +14,8 @@
 #include "movement_feature.h"
 #include "sprite_flip_feature.h"
 
+#include <cmath>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -34,6 +36,7 @@ constexpr const char *plugin_version="0.3.0";
 
 render_function render_functions;
 camera_feature camera;
+camera_background_observer camera_background;
 sprite_flip_feature sprite_flip;
 
 movement_frame_context make_frame_context(df::renderer_2d_base *renderer)
@@ -83,10 +86,18 @@ void render_stratum(df::renderer_2d_base *renderer)
 {
 	movement_frame_context frame=make_frame_context(renderer);
 	const movement_prepare_result prepared=movement_feature::prepare(frame);
-	if(prepared.context_changed)camera.cancel_transients();
-	if(!prepared.main_viewport_readable||renderer->sdl_renderer==nullptr)return;
+	camera_frame_input input=make_camera_input(frame,prepared.frame_delta_ms);
+	const bool readable=prepared.main_viewport_readable&&
+		renderer->sdl_renderer!=nullptr&&enabler!=nullptr;
+	const auto background=camera_background.observe({
+		renderer,frame.main_viewport,input.background,input.previous_background,
+		input.dim_x,input.dim_y,enabler?uint32_t(enabler->gputicks):0,
+		readable,prepared.context_changed});
+	input.background_generation=background.generation;
+	input.background_discontinuity=background.discontinuity;
+	camera.update(input);
+	if(!readable)return;
 
-	camera.update(make_camera_input(frame,prepared.frame_delta_ms));
 	const camera_render_offset offset=
 		camera.render_offset(renderer->viewport_zoom_factor);
 	if(offset.request_cleanup_redraw&&gps!=nullptr)++gps->force_full_display_count;
@@ -137,6 +148,7 @@ void reset_state()
 {
 	movement_feature::reset();
 	camera.reset();
+	camera_background={};
 	sprite_flip.reset();
 }
 
@@ -183,22 +195,30 @@ command_result status_command(
 			}
 		if(parameters.size()==3)
 			{
+			double x,y;
+			size_t x_consumed,y_consumed;
 			try
 				{
-				const double x=std::stod(parameters[1]);
-				const double y=std::stod(parameters[2]);
-				if(x<-0.99||x>0.99||y<-0.99||y>0.99)
-					{
-					out.printerr("offsets must be within -0.99..0.99 tiles\n");
-					return CR_FAILURE;
-					}
-				camera.set_offset(x,y,window_x,window_y);
-				return CR_OK;
+				x=std::stod(parameters[1],&x_consumed);
+				y=std::stod(parameters[2],&y_consumed);
 				}
-			catch(...)
+			catch(const std::invalid_argument &)
 				{
 				return CR_WRONG_USAGE;
 				}
+			catch(const std::out_of_range &)
+				{
+				return CR_WRONG_USAGE;
+				}
+			if(x_consumed!=parameters[1].size()||y_consumed!=parameters[2].size()||
+				!std::isfinite(x)||!std::isfinite(y))return CR_WRONG_USAGE;
+			if(x<-0.99||x>0.99||y<-0.99||y>0.99)
+				{
+				out.printerr("offsets must be within -0.99..0.99 tiles\n");
+				return CR_FAILURE;
+				}
+			camera.set_offset(x,y,window_x,window_y);
+			return CR_OK;
 			}
 		return CR_WRONG_USAGE;
 		}

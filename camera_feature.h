@@ -5,6 +5,36 @@
 
 #include <cstdint>
 
+struct camera_background_observation
+{
+	const void *renderer=nullptr;
+	const void *viewport=nullptr;
+	const void *current=nullptr;
+	const void *previous=nullptr;
+	int32_t dim_x=0;
+	int32_t dim_y=0;
+	uint32_t gputicks=0;
+	bool readable=false;
+	bool context_changed=false;
+};
+
+struct camera_background_result
+{
+	uint64_t generation=0;
+	bool discontinuity=false;
+};
+
+class camera_background_observer
+{
+	camera_background_observation previous_;
+	uint64_t generation_=0;
+	bool observed_=false;
+	bool readable_=false;
+
+	public:
+		camera_background_result observe(const camera_background_observation &input);
+};
+
 struct camera_frame_input
 {
 	int32_t zoom_factor=128;
@@ -17,6 +47,8 @@ struct camera_frame_input
 	int32_t dim_y=0;
 	const int32_t *background=nullptr;
 	const int32_t *previous_background=nullptr;
+	uint64_t background_generation=0;
+	bool background_discontinuity=false;
 	uint32_t delta_ms=0;
 };
 
@@ -51,6 +83,8 @@ class camera_feature
 	int32_t previous_window_x_=0;
 	int32_t previous_window_y_=0;
 	bool has_previous_window_=false;
+	uint64_t background_generation_=0;
+	bool background_consumed_=false;
 
 	static double tile_pixels(int32_t zoom_factor);
 	static double background_match_ratio(

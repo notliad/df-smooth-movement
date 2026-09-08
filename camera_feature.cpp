@@ -6,6 +6,29 @@
 #include <cmath>
 #include <cstdlib>
 
+camera_background_result camera_background_observer::observe(
+	const camera_background_observation &input)
+{
+	const bool readable=input.readable&&input.renderer&&input.viewport&&
+		input.current&&input.previous&&input.dim_x>0&&input.dim_y>0;
+	const bool same=input.current==previous_.current&&input.previous==previous_.previous;
+	const bool reversed=input.current==previous_.previous&&input.previous==previous_.current;
+	// The engine increments gputicks after display, not before the hook.
+	const uint32_t elapsed=input.gputicks-previous_.gputicks;
+	const bool discontinuity=!readable||(observed_&&
+		(!readable_||elapsed>1||input.renderer!=previous_.renderer||
+		input.viewport!=previous_.viewport||input.dim_x!=previous_.dim_x||
+		input.dim_y!=previous_.dim_y||(!same&&!reversed)));
+	// The first valid hook may already have a normalized offset pending.
+	if(!discontinuity&&(!observed_||!same))++generation_;
+	const camera_background_result result={
+		generation_,discontinuity||(observed_&&input.context_changed)};
+	previous_=input;
+	observed_=true;
+	readable_=readable;
+	return result;
+}
+
 double camera_feature::tile_pixels(int32_t zoom_factor)
 {
 	return double(std::max(1,zoom_factor/4));
@@ -64,6 +87,8 @@ void camera_feature::reset()
 	previous_window_x_=0;
 	previous_window_y_=0;
 	has_previous_window_=false;
+	background_generation_=0;
+	background_consumed_=false;
 }
 
 void camera_feature::set_enabled(bool enable)
@@ -99,6 +124,12 @@ void camera_feature::set_offset(
 	int32_t *window_y)
 {
 	set_enabled(true);
+	if(!has_previous_window_)
+		{
+		previous_window_x_=window_x?*window_x:0;
+		previous_window_y_=window_y?*window_y:0;
+		has_previous_window_=true;
+		}
 	rest_x_=-east;
 	rest_y_=-south;
 	normalize_rest(window_x,window_y);
@@ -141,6 +172,21 @@ void camera_feature::attribute_landed(int32_t dx,int32_t dy,double tile)
 
 void camera_feature::update(const camera_frame_input &input)
 {
+	// Cancellation alone does not make a consumed landing fresh again.
+	if(input.background_generation!=background_generation_)
+		{
+		background_generation_=input.background_generation;
+		background_consumed_=false;
+		}
+	if(input.background_discontinuity)
+		{
+		cancel_transients();
+		previous_window_x_=input.window_x?*input.window_x:0;
+		previous_window_y_=input.window_y?*input.window_y:0;
+		has_previous_window_=true;
+		background_consumed_=true;
+		return;
+		}
 	if(!enabled_)return;
 	const double tile=tile_pixels(input.zoom_factor);
 	const int32_t window_x=input.window_x?*input.window_x:0;
@@ -172,7 +218,7 @@ void camera_feature::update(const camera_frame_input &input)
 			transient_y_=0.0;
 			clear_pending();
 			}
-		else
+		else if(!background_consumed_)
 			{
 			const int32_t step_x=(pending_dx_>0)-(pending_dx_<0);
 			const int32_t step_y=(pending_dy_>0)-(pending_dy_<0);
@@ -208,6 +254,7 @@ void camera_feature::update(const camera_frame_input &input)
 				clear_pending();
 			else if(best_magnitude>0)
 				{
+				background_consumed_=true;
 				attribute_landed(best_x,best_y,tile);
 				pending_dx_-=best_x;
 				pending_dy_-=best_y;
