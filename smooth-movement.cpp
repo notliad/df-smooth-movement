@@ -28,6 +28,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <set>
@@ -53,6 +55,62 @@ REQUIRE_GLOBAL(window_z);
 namespace {
 
 constexpr const char *plugin_version="0.5.0";
+
+// Frame timing for `smooth-movement stats`. Counting is always on: one increment per frame,
+// one per painted frame, one per engine repaint. The clock is read three times per frame while
+// enabled. Sync covers movement detection across every viewport; render covers everything
+// after it, including the camera update and carried-item lookup that feed the draw decision,
+// then proxy collection, tile blanking, engine repaints and sprites. The render thread
+// writes, the console thread reads and clears, so the fields are relaxed atomics; a clear
+// that lands mid-frame skews that one frame and nothing else.
+struct frame_statsst
+{
+	std::atomic<bool> enabled{false};
+	std::atomic<uint64_t> frames{0};
+	std::atomic<uint64_t> painted{0};
+	std::atomic<uint64_t> repaints{0};
+	std::atomic<uint64_t> timed{0};
+	std::atomic<uint64_t> sync_us{0};
+	std::atomic<uint64_t> sync_max_us{0};
+	std::atomic<uint64_t> render_us{0};
+	std::atomic<uint64_t> render_max_us{0};
+
+	static uint64_t now_us()
+		{
+		return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count());
+		}
+
+	void clear()
+		{
+		for(std::atomic<uint64_t> *counter:{&frames,&painted,&repaints,&timed,
+			&sync_us,&sync_max_us,&render_us,&render_max_us})
+			counter->store(0,std::memory_order_relaxed);
+		}
+
+	static void add(std::atomic<uint64_t> &total,std::atomic<uint64_t> &max,uint64_t us)
+		{
+		total.fetch_add(us,std::memory_order_relaxed);
+		uint64_t seen=max.load(std::memory_order_relaxed);
+		while(seen<us&&!max.compare_exchange_weak(seen,us,std::memory_order_relaxed)){}
+		}
+
+	void add_sync(uint64_t us){add(sync_us,sync_max_us,us);}
+	void add_render(uint64_t us){add(render_us,render_max_us,us);}
+};
+
+frame_statsst frame_stats;
+
+// Runs a callback when the scope ends, whichever return path is taken.
+template<typename Callback>
+struct scope_guardst
+{
+	Callback callback;
+	explicit scope_guardst(Callback c):callback(std::move(c)){}
+	~scope_guardst(){callback();}
+	scope_guardst(const scope_guardst &)=delete;
+	scope_guardst &operator=(const scope_guardst &)=delete;
+};
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -649,6 +707,13 @@ void with_upper_suppressed(
 		});
 }
 
+// Every engine repaint the plugin asks for goes through here so `stats` can count them.
+void engine_repaint(df::renderer_2d_base *renderer,df::graphic_viewportst *vp,int32_t x,int32_t y)
+{
+	frame_stats.repaints.fetch_add(1,std::memory_order_relaxed);
+	renderer->update_viewport_tile(vp,x,y);
+}
+
 void redraw_viewport_tile(
 	df::renderer_2d_base *renderer,
 	const viewport_renderst &viewport,
@@ -658,7 +723,7 @@ void redraw_viewport_tile(
 {
 	df::graphic_viewportst *vp=viewport.viewport;
 	const int32_t index=x*vp->dim_y+y;
-	const auto redraw=[&]{renderer->update_viewport_tile(vp,x,y);};
+	const auto redraw=[&]{engine_repaint(renderer,vp,x,y);};
 	const auto stage=[&]
 		{
 		with_suppressed_visual_layers(
@@ -701,7 +766,7 @@ void draw_interface_only(
 {
 	if(!interface_pass_readable(vp))return;
 	const int32_t index=x*vp->dim_y+y;
-	const auto redraw=[&]{renderer->update_viewport_tile(vp,x,y);};
+	const auto redraw=[&]{engine_repaint(renderer,vp,x,y);};
 	const auto without_visuals=[&]
 		{
 		with_suppressed_visual_layers(
@@ -764,7 +829,7 @@ void redraw_above(
 	const std::unordered_map<int32_t,uint16_t> &selected)
 {
 	const int32_t index=x*vp->dim_y+y;
-	const auto redraw=[&]{renderer->update_viewport_tile(vp,x,y);};
+	const auto redraw=[&]{engine_repaint(renderer,vp,x,y);};
 	const auto suppress_visuals=[&]
 		{
 		const auto stage=[&]
@@ -890,7 +955,7 @@ SDL_Texture *cached_viewport_texture(
 	// Hauled items are not normally drawn, so stage one tile to populate the renderer cache.
 	scoped_value_restorest<int32_t> staged(vp->screentexpos_background_two[index]);
 	vp->screentexpos_background_two[index]=texpos;
-	renderer->update_viewport_tile(vp,index/vp->dim_y,index%vp->dim_y);
+	engine_repaint(renderer,vp,index/vp->dim_y,index%vp->dim_y);
 	return cached_texture(renderer,texpos);
 }
 
@@ -1324,6 +1389,21 @@ bool has_mirrored_viewport_facing(
 
 void render_interpolated_world(df::renderer_2d_base *renderer)
 {
+	frame_stats.frames.fetch_add(1,std::memory_order_relaxed);
+	// Read once: if the console flipped the flag on mid-frame, the guard would subtract a
+	// start time of zero.
+	const bool timing_enabled=frame_stats.enabled.load(std::memory_order_relaxed);
+	const uint64_t frame_start_us=timing_enabled?frame_statsst::now_us():0;
+	uint64_t sync_end_us=frame_start_us;
+	// Runs on every exit, including the early return for frames with nothing to draw.
+	const scope_guardst timing([&]
+		{
+		if(!timing_enabled)return;
+		const uint64_t end_us=frame_statsst::now_us();
+		frame_stats.timed.fetch_add(1,std::memory_order_relaxed);
+		frame_stats.add_sync(sync_end_us-frame_start_us);
+		frame_stats.add_render(end_us-sync_end_us);
+		});
 	df::graphic_viewportst *vp=gps?gps->main_viewport:nullptr;
 	const std::vector<df::graphic_viewportst *> viewports=active_viewports();
 
@@ -1342,6 +1422,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	for(df::graphic_viewportst *viewport:viewports)
 		animation_manager.synchronize_viewport(animation_input(viewport));
 	animation_manager.end_frame();
+	if(timing_enabled)sync_end_us=frame_statsst::now_us();
 
 	if(!viewport_readable(vp)||renderer->sdl_renderer==nullptr)
 		return;
@@ -1374,6 +1455,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		(!flip_enabled||!has_mirrored_viewport_facing(viewports))&&
 		carried_items.empty()&&previous_coverage.empty())
 		return;
+	frame_stats.painted.fetch_add(1,std::memory_order_relaxed);
 
 	std::vector<viewport_renderst> viewport_renders=
 		collect_viewport_renders(renderer,viewports);
@@ -1524,6 +1606,38 @@ void reset_state()
 	native_follow_id=-1;
 	flip_enabled=false;
 	hauled_enabled=false;
+	frame_stats.enabled=false;
+	frame_stats.clear();
+}
+
+void print_frame_stats(color_ostream &out)
+{
+	const auto get=[](const std::atomic<uint64_t> &v){return v.load(std::memory_order_relaxed);};
+	const uint64_t frames=get(frame_stats.frames),painted=get(frame_stats.painted),
+		repaints=get(frame_stats.repaints),timed=get(frame_stats.timed),
+		sync_us=get(frame_stats.sync_us),render_us=get(frame_stats.render_us);
+	out.print("frame stats: {}\n",frame_stats.enabled?"on":"off");
+	if(frames==0)
+		{
+		out.print("no frames counted\n");
+		return;
+		}
+	const auto mean=[](uint64_t total,uint64_t count)
+		{
+		return count==0?0.0:double(total)/double(count);
+		};
+	out.print("frames: {} ({} painted, {:.0f}%)\n",
+		frames,painted,100.0*mean(painted,frames));
+	out.print("engine tile repaints: {} ({:.1f} per frame, {:.1f} per painted frame)\n",
+		repaints,mean(repaints,frames),mean(repaints,painted));
+	if(timed==0)return;
+	out.print("timed frames: {}\n",timed);
+	out.print("sync: mean {:.0f} us, max {} us\n",
+		mean(sync_us,timed),get(frame_stats.sync_max_us));
+	out.print("render: mean {:.0f} us, max {} us\n",
+		mean(render_us,timed),get(frame_stats.render_max_us));
+	out.print("total: mean {:.0f} us per timed frame\n",
+		mean(sync_us+render_us,timed));
 }
 
 command_result status_command(
@@ -1544,7 +1658,33 @@ command_result status_command(
 			animation_manager.is_linear()?"on":"off");
 		out.print("hauled item icons: {}\n",
 			hauled_enabled?"on":"off");
+		out.print("frame stats: {}\n",
+			frame_stats.enabled?"on":"off");
 		return CR_OK;
+		}
+	if(parameters[0]=="stats")
+		{
+		if(parameters.size()==1)
+			{
+			print_frame_stats(out);
+			return CR_OK;
+			}
+		if(parameters.size()==2&&
+			(parameters[1]=="on"||parameters[1]=="off"))
+			{
+			const bool on=parameters[1]=="on";
+			if(on)frame_stats.clear();
+			frame_stats.enabled=on;
+			out.print("smooth-movement: frame stats {}\n",parameters[1]);
+			return CR_OK;
+			}
+		if(parameters.size()==2&&parameters[1]=="reset")
+			{
+			frame_stats.clear();
+			out.print("smooth-movement: frame stats reset\n");
+			return CR_OK;
+			}
+		return CR_WRONG_USAGE;
 		}
 	if(parameters[0]=="all")
 		{
@@ -1555,7 +1695,7 @@ command_result status_command(
 		animation_manager.set_linear(enabled);
 		hauled_enabled=enabled;
 		if(gps!=nullptr)++gps->force_full_display_count;
-		out.print("smooth-movement: all non-camera flags {}\n",parameters[1]);
+		out.print("smooth-movement: flip, linear and hauled {}\n",parameters[1]);
 		return CR_OK;
 		}
 	if(parameters[0]=="camera")
@@ -1680,9 +1820,10 @@ plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 	commands.emplace_back(
 		"smooth-movement",
 		"Smooth movement status; free camera: camera on|off|reset|<fx> <fy>; "
-		"all non-camera flags: all on|off; "
+		"flip, linear and hauled together: all on|off; "
 		"sprite flipping: flip on|off; linear movement: linear on|off; "
-		"hauled item icons: hauled on|off.",
+		"hauled item icons: hauled on|off; "
+		"frame timing: stats [on|off|reset].",
 		status_command);
 	return CR_OK;
 }

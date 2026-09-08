@@ -28,12 +28,13 @@ enable smooth-movement
 ```text
 smooth-movement             # show plugin status
 disable smooth-movement     # disable the plugin
-smooth-movement all on      # enable every flag except the WIP free camera
-smooth-movement all off     # disable every flag except the WIP free camera
+smooth-movement all on      # enable flip, linear and hauled (not the WIP free camera or stats)
+smooth-movement all off     # disable flip, linear and hauled
 smooth-movement flip on     # enable sprites flip
 smooth-movement camera on   # enable the free camera
 smooth-movement linear on   # use linear easing with adaptive 150–500 ms movement tweens
 smooth-movement hauled on   # show icons for carried boulders, bars, and wood
+smooth-movement stats on    # time the render hook; `smooth-movement stats` prints the numbers
 ```
 
 ## Compatibility
