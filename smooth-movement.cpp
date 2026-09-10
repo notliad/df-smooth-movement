@@ -598,6 +598,7 @@ struct render_proxyst
 	bool mirrored=false;
 	int32_t mirror_shift=0;
 	std::set<std::pair<int32_t,int32_t>> coverage;
+	visual_movement_idst movement_id=no_visual_movement;
 };
 
 struct carried_item_proxyst
@@ -1055,9 +1056,11 @@ std::vector<render_proxyst> collect_proxies(
 						if(anchor.layer==viewport_visual_layer::center&&
 							std::abs(anchor.target_x-x)<=1&&
 							std::abs(anchor.target_y-y)<=1&&
-							anchor.source_x-anchor.target_x==movement.source_x-x&&
+							(visual_layer!=viewport_visual_layer::designation?
+							anchor.movement_id==movement.movement_id:
+							(anchor.source_x-anchor.target_x==movement.source_x-x&&
 							anchor.source_y-anchor.target_y==movement.source_y-y&&
-							anchor.progress==movement.progress)anchored=true;
+							anchor.progress==movement.progress)))anchored=true;
 						}
 					if(!anchored)continue;
 					}
@@ -1092,9 +1095,7 @@ std::vector<render_proxyst> collect_proxies(
 						if(anchor.layer==viewport_visual_layer::center&&
 							anchor.target_x==x+descriptor.center_x&&
 							anchor.target_y==y+descriptor.center_y&&
-							anchor.source_x-anchor.target_x==movement.source_x-x&&
-							anchor.source_y-anchor.target_y==movement.source_y-y&&
-							anchor.progress==movement.progress)owns_fragment=true;
+							anchor.movement_id==movement.movement_id)owns_fragment=true;
 					if(!owns_fragment)continue;
 						}
 					}
@@ -1185,6 +1186,7 @@ std::vector<render_proxyst> collect_proxies(
 
 				proxy.texture=cached_texture(renderer,texpos);
 				if(proxy.texture==nullptr)continue;
+				proxy.movement_id=movement.movement_id;
 				proxies.push_back(std::move(proxy));
 				}
 			}

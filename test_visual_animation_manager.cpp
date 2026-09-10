@@ -470,6 +470,34 @@ int main()
 	assert(visual_layer_descriptor(viewport_visual_layer::upleft).center_x==1&&
 		visual_layer_descriptor(viewport_visual_layer::upleft).center_y==1);
 
+	// A fragment follows its exact anchor even when another nearby creature moves differently.
+	{
+	constexpr int32_t dim=5;
+	int32_t empty[dim*dim]={};
+	int32_t before[dim*dim]={};
+	int32_t after[dim*dim]={};
+	before[1*dim+2]=11;
+	before[3*dim+2]=22;
+	after[2*dim+2]=11; // east
+	after[3*dim+1]=22; // north
+	const int token=0;
+	const void *crowded_viewport=&token;
+	visual_animation_managerst crowded;
+	auto crowded_input=make_input(crowded_viewport,dim,empty);
+	set_layer(crowded_input,viewport_visual_layer::center,before,empty);
+	run_frame(crowded,crowded_input,1000);
+	set_layer(crowded_input,viewport_visual_layer::center,after,before);
+	run_frame(crowded,crowded_input,1016);
+	const auto anchor=crowded.get_movement(
+		crowded_viewport,viewport_visual_layer::center,2,2);
+	const auto fragment=crowded.get_movement(
+		crowded_viewport,viewport_visual_layer::right,3,2);
+	assert(anchor.active&&fragment.active&&fragment.inherited);
+	assert(fragment.movement_id==anchor.movement_id);
+	assert(fragment.source_x==2&&fragment.source_y==2);
+	assert(fragment.progress==anchor.progress);
+	}
+
 	std::array<int32_t,9> empty{};
 	std::array<int32_t,9> current{};
 	std::array<int32_t,9> previous{};

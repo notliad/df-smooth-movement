@@ -1177,6 +1177,7 @@ class visual_animation_managerst
 			for(const viewport_animationst &state:viewports)
 				{
 				if(state.viewport!=viewport)continue;
+				const auto &descriptor=visual_layer_descriptor(layer);
 				const movementst *companion=nullptr;
 				bool ambiguous=false;
 				for(const movementst &movement:state.movements)
@@ -1196,8 +1197,21 @@ class visual_animation_managerst
 						}
 					if(layer==viewport_visual_layer::vehicle||
 						layer==viewport_visual_layer::center||
-						movement.layer!=viewport_visual_layer::center||
-						std::abs(movement.target_x-target_x)>1||
+						movement.layer!=viewport_visual_layer::center)continue;
+					const bool creature_fragment=
+						descriptor.render_group==visual_render_groupst::main||
+						descriptor.render_group==visual_render_groupst::upper;
+					if(creature_fragment)
+						{
+						if(movement.target_x==target_x+descriptor.center_x&&
+							movement.target_y==target_y+descriptor.center_y)
+							{
+							companion=&movement;
+							break;
+							}
+						continue;
+						}
+					if(std::abs(movement.target_x-target_x)>1||
 						std::abs(movement.target_y-target_y)>1)continue;
 					if(companion!=nullptr&&
 						(companion->source_x-companion->target_x!=
