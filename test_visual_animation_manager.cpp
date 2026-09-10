@@ -38,6 +38,32 @@ void set_layer(
 	input.previous[index]=previous;
 }
 
+template<size_t N>
+void fill_background(std::array<int32_t,N> &background,int32_t seed)
+{
+	for(size_t i=0;i<N;++i)background[i]=seed+int32_t(i);
+}
+
+template<size_t N>
+void shift_background(
+	std::array<int32_t,N> &current,
+	const std::array<int32_t,N> &previous,
+	int32_t dimension,
+	int32_t dx,
+	int32_t dy,
+	int32_t exposed_seed)
+{
+	for(int32_t x=0;x<dimension;++x)
+		for(int32_t y=0;y<dimension;++y)
+			{
+			const int32_t sx=x+dx;
+			const int32_t sy=y+dy;
+			const size_t index=size_t(x*dimension+y);
+			current[index]=sx>=0&&sx<dimension&&sy>=0&&sy<dimension?
+				previous[size_t(sx*dimension+sy)]:exposed_seed+int32_t(index);
+			}
+}
+
 void run_frame(
 	visual_animation_managerst &manager,
 	const viewport_visual_animation_inputst &input,
@@ -84,6 +110,12 @@ int main()
 	assert(mirrored_tile_x(4,5)==6);   // left spill -> right
 	// The formula is a general reflection, so it holds for offsets no layer can express.
 	assert(mirrored_tile_x(8,5)==2);
+	assert(!camera_glide_enabled(false,false));
+	assert(camera_glide_enabled(false,true));
+	assert(camera_glide_enabled(true,false));
+	assert(native_follow_changed(-1,42));
+	assert(!native_follow_changed(42,42));
+	assert(native_follow_changed(42,-1));
 	// center_x is only ever -1, 0 or +1, so the real mirror shift is only ever -2, 0 or +2.
 	for(const auto &descriptor:visual_layer_descriptors)
 		assert(descriptor.center_x>=-1&&descriptor.center_x<=1);
@@ -125,6 +157,12 @@ int main()
 	assert(manager.get_facing(viewport,1,2)==visual_facingst::west);
 	set_layer(input,viewport_visual_layer::center,before,west_after);
 	run_frame(manager,input,1032);
+	assert(manager.get_facing(viewport,2,2)==visual_facingst::east);
+	assert(manager.get_movement(
+		viewport,viewport_visual_layer::center,2,2).active);
+	manager.cancel_transitions();
+	assert(!manager.get_movement(
+		viewport,viewport_visual_layer::center,2,2).active);
 	assert(manager.get_facing(viewport,2,2)==visual_facingst::east);
 	}
 
@@ -413,7 +451,14 @@ int main()
 	assert(manager.get_facing(gap_viewport,2,3)==native_sprite_facing);
 	}
 
-	assert(animation_progress(100,0,100)==1.0f);
+	assert(animation_progress(150,0,150)==1.0f);
+	assert(animation_progress(75,0,150)==0.5f);
+	assert(animation_progress(75,0,150,true)==0.5f);
+	assert(animation_progress(25,0,150,true)==float(1)/6);
+	assert(animation_progress(25,0,150)<float(1)/6);
+	const auto carried_icon=carried_item_icon_rect(100.0f,200.0f,20.0f);
+	assert(carried_icon.x==101.0f&&carried_icon.y==204.0f);
+	assert(carried_icon.width==14.0f&&carried_icon.height==14.0f);
 	assert(inherited_visual_source_tile(0,0,1)==-1);
 	assert(inherited_visual_source_tile(2,0,1)==1);
 	assert(visual_layer_descriptor(viewport_visual_layer::right).center_x==-1);
@@ -424,6 +469,34 @@ int main()
 		visual_layer_descriptor(viewport_visual_layer::up).center_y==1);
 	assert(visual_layer_descriptor(viewport_visual_layer::upleft).center_x==1&&
 		visual_layer_descriptor(viewport_visual_layer::upleft).center_y==1);
+
+	// A fragment follows its exact anchor even when another nearby creature moves differently.
+	{
+	constexpr int32_t dim=5;
+	int32_t empty[dim*dim]={};
+	int32_t before[dim*dim]={};
+	int32_t after[dim*dim]={};
+	before[1*dim+2]=11;
+	before[3*dim+2]=22;
+	after[2*dim+2]=11; // east
+	after[3*dim+1]=22; // north
+	const int token=0;
+	const void *crowded_viewport=&token;
+	visual_animation_managerst crowded;
+	auto crowded_input=make_input(crowded_viewport,dim,empty);
+	set_layer(crowded_input,viewport_visual_layer::center,before,empty);
+	run_frame(crowded,crowded_input,1000);
+	set_layer(crowded_input,viewport_visual_layer::center,after,before);
+	run_frame(crowded,crowded_input,1016);
+	const auto anchor=crowded.get_movement(
+		crowded_viewport,viewport_visual_layer::center,2,2);
+	const auto fragment=crowded.get_movement(
+		crowded_viewport,viewport_visual_layer::right,3,2);
+	assert(anchor.active&&fragment.active&&fragment.inherited);
+	assert(fragment.movement_id==anchor.movement_id);
+	assert(fragment.source_x==2&&fragment.source_y==2);
+	assert(fragment.progress==anchor.progress);
+	}
 
 	std::array<int32_t,9> empty{};
 	std::array<int32_t,9> current{};
@@ -447,20 +520,123 @@ int main()
 
 	previous=current;
 	set_layer(input,viewport_visual_layer::center,current.data(),previous.data());
-	run_frame(movement,input,2050);
+	run_frame(movement,input,2075);
 	render=movement.get_movement(viewport,viewport_visual_layer::center,1,1);
 	assert(render.active);
 	assert(render.progress==0.5f);
 
-	run_frame(movement,input,2100);
+	run_frame(movement,input,2150);
 	assert(!movement.get_movement(
 		viewport,viewport_visual_layer::center,1,1).active);
 	assert(movement.requires_full_redraw());
 
-	run_frame(movement,input,2120);
+	run_frame(movement,input,2170);
 	assert(!movement.requires_full_redraw());
 
+	visual_animation_managerst linear_movement;
+	linear_movement.set_linear(true);
+	current.fill(0);
+	previous.fill(0);
+	set_layer(input,viewport_visual_layer::center,current.data(),previous.data());
+	run_frame(linear_movement,input,2190);
+	previous[0*3+1]=42;
+	current[1*3+1]=42;
+	run_frame(linear_movement,input,2200);
+	previous=current;
+	run_frame(linear_movement,input,2225);
+	assert(linear_movement.get_movement(
+		viewport,viewport_visual_layer::center,1,1).progress==float(1)/6);
+
+	// Linear cadence follows the latest step, while completed movement stays silent history.
+	{
+	std::array<int32_t,9> at_zero{};
+	std::array<int32_t,9> at_one{};
+	std::array<int32_t,9> at_two{};
+	at_zero[0*3+1]=42;
+	at_one[1*3+1]=42;
+	at_two[2*3+1]=42;
+
+	visual_animation_managerst adaptive;
+	adaptive.set_linear(true);
+	set_layer(input,viewport_visual_layer::center,at_zero.data(),empty.data());
+	run_frame(adaptive,input,1000);
+	set_layer(input,viewport_visual_layer::center,at_one.data(),at_zero.data());
+	run_frame(adaptive,input,1010);
+	run_frame(adaptive,input,1085);
+	assert(adaptive.get_movement(
+		viewport,viewport_visual_layer::center,1,1).progress==0.5f); // first: 150 ms
+	run_frame(adaptive,input,1160);
+	assert(!adaptive.get_movement(
+		viewport,viewport_visual_layer::center,1,1).active);
+	run_frame(adaptive,input,1161);
+	assert(!adaptive.requires_full_redraw());
+	set_layer(input,viewport_visual_layer::center,at_two.data(),at_one.data());
+	run_frame(adaptive,input,1310);
+	run_frame(adaptive,input,1460);
+	assert(adaptive.get_movement(
+		viewport,viewport_visual_layer::center,2,1).progress==0.5f); // cadence: 300 ms
+
+	visual_animation_managerst minimum;
+	minimum.set_linear(true);
+	set_layer(input,viewport_visual_layer::center,at_zero.data(),empty.data());
+	run_frame(minimum,input,2000);
+	set_layer(input,viewport_visual_layer::center,at_one.data(),at_zero.data());
+	run_frame(minimum,input,2010);
+	set_layer(input,viewport_visual_layer::center,at_two.data(),at_one.data());
+	run_frame(minimum,input,2110);
+	run_frame(minimum,input,2185);
+	assert(minimum.get_movement(
+		viewport,viewport_visual_layer::center,2,1).progress==0.5f); // clamped to 150 ms
+
+	visual_animation_managerst maximum;
+	maximum.set_linear(true);
+	set_layer(input,viewport_visual_layer::center,at_zero.data(),empty.data());
+	run_frame(maximum,input,3000);
+	set_layer(input,viewport_visual_layer::center,at_one.data(),at_zero.data());
+	run_frame(maximum,input,3010);
+	set_layer(input,viewport_visual_layer::center,at_two.data(),at_one.data());
+	run_frame(maximum,input,3510);
+	run_frame(maximum,input,3760);
+	assert(maximum.get_movement(
+		viewport,viewport_visual_layer::center,2,1).progress==0.5f); // clamped to 500 ms
+	set_layer(input,viewport_visual_layer::center,at_one.data(),at_two.data());
+	run_frame(maximum,input,4111);
+	run_frame(maximum,input,4186);
+	assert(maximum.get_movement(
+		viewport,viewport_visual_layer::center,1,1).progress==0.5f); // history expired: 150 ms
+
+	// Reversal leaves two predecessors at B; the newer B->A step must win for A->B.
+	visual_animation_managerst reversal;
+	reversal.set_linear(true);
+	set_layer(input,viewport_visual_layer::center,at_zero.data(),empty.data());
+	run_frame(reversal,input,4000);
+	set_layer(input,viewport_visual_layer::center,at_one.data(),at_zero.data());
+	run_frame(reversal,input,4010);
+	set_layer(input,viewport_visual_layer::center,at_zero.data(),at_one.data());
+	run_frame(reversal,input,4310);
+	set_layer(input,viewport_visual_layer::center,at_one.data(),at_zero.data());
+	run_frame(reversal,input,4510);
+	run_frame(reversal,input,4610);
+	assert(reversal.get_movement(
+		viewport,viewport_visual_layer::center,1,1).progress==0.5f); // latest cadence: 200 ms
+
+	visual_animation_managerst smoothstep;
+	set_layer(input,viewport_visual_layer::center,at_zero.data(),empty.data());
+	run_frame(smoothstep,input,5000);
+	set_layer(input,viewport_visual_layer::center,at_one.data(),at_zero.data());
+	run_frame(smoothstep,input,5010);
+	set_layer(input,viewport_visual_layer::center,at_two.data(),at_one.data());
+	run_frame(smoothstep,input,5110);
+	run_frame(smoothstep,input,5185);
+	assert(smoothstep.get_movement(
+		viewport,viewport_visual_layer::center,2,1).progress==0.5f); // fixed 150 ms
+	}
+
 	visual_animation_managerst ambiguous;
+	assert(!ambiguous.is_linear());
+	ambiguous.set_linear(true);
+	assert(ambiguous.is_linear());
+	set_layer(input,viewport_visual_layer::center,current.data(),previous.data());
 	run_frame(ambiguous,input,2990);
 	previous.fill(0);
 	previous[0*3+1]=42;
@@ -652,7 +828,7 @@ int main()
 	assert(carried_item.active&&carried_item.inherited);
 	previous=current;
 	status_current[1*3+0]=92;
-	run_frame(companion,input,9050);
+	run_frame(companion,input,9075);
 	status=companion.get_movement(viewport,viewport_visual_layer::designation,1,0);
 	assert(status.active&&status.progress==0.5f);
 
@@ -709,7 +885,7 @@ int main()
 		viewport,viewport_visual_layer::vehicle,1,1).active);
 	previous=current;
 	current[1*3+1]=79;
-	run_frame(vehicle,input,12050);
+	run_frame(vehicle,input,12075);
 	const auto cart=vehicle.get_movement(
 		viewport,viewport_visual_layer::vehicle,1,1);
 	assert(cart.active&&cart.progress==0.5f);
@@ -721,4 +897,107 @@ int main()
 		viewport,viewport_visual_layer::vehicle,2,1);
 	assert(chained.active&&chained.source_x>0.0f&&chained.source_x<1.0f&&
 		chained.progress==0.0f);
+
+	// Every cardinal and diagonal follow step gets a stable inverse visual anchor.
+	for(int32_t dx=-1;dx<=1;++dx)
+		for(int32_t dy=-1;dy<=1;++dy)
+			{
+			if(dx==0&&dy==0)continue;
+			constexpr int32_t dim=7;
+			constexpr size_t tiles=size_t(dim)*size_t(dim);
+			const int token=dx*3+dy;
+			std::array<int32_t,tiles> empty{};
+			std::array<int32_t,tiles> creature{};
+			std::array<int32_t,tiles> creature_old{};
+			std::array<int32_t,tiles> background{};
+			std::array<int32_t,tiles> background_old{};
+			fill_background(background_old,2000);
+			background=background_old;
+			const int32_t center=dim/2;
+			creature[size_t(center*dim+center)]=42;
+			creature_old=creature;
+			auto follow_input=make_input(&token,dim,empty.data());
+			set_layer(follow_input,viewport_visual_layer::center,
+				creature.data(),creature_old.data());
+			follow_input.current_background=background.data();
+			follow_input.previous_background=background_old.data();
+			visual_animation_managerst follow_manager;
+			run_frame(follow_manager,follow_input,20000);
+			follow_input.pan_x=dx;
+			follow_input.pan_y=dy;
+			run_frame(follow_manager,follow_input,20010);
+			shift_background(background,background_old,dim,dx,dy,3000);
+			run_frame(follow_manager,follow_input,20020);
+			const auto scroll=follow_manager.get_scroll(&token);
+			assert(scroll.landed&&scroll.landed_x==dx&&scroll.landed_y==dy&&
+				!scroll.pending&&scroll.follow_candidate!=no_visual_movement);
+			const auto movement=follow_manager.get_movement(
+				&token,viewport_visual_layer::center,center,center);
+			const auto follow=follow_manager.get_follow(&token,scroll.follow_candidate);
+			assert(movement.active&&follow.active&&
+				movement.movement_id==scroll.follow_candidate);
+			assert(std::abs((movement.source_x-center)*(1.0f-movement.progress)+
+				follow.offset_x)<0.000001f);
+			assert(std::abs((movement.source_y-center)*(1.0f-movement.progress)+
+				follow.offset_y)<0.000001f);
+			run_frame(follow_manager,follow_input,20095);
+			const auto fractional=follow_manager.get_follow(&token,scroll.follow_candidate);
+			assert(fractional.active&&std::abs(fractional.offset_x)<1.0f&&
+				std::abs(fractional.offset_y)<1.0f);
+			}
+
+	// A multi-tile announcement may land partially, then retire the remaining debt.
+	{
+	constexpr int32_t dim=6;
+	constexpr size_t tiles=size_t(dim)*size_t(dim);
+	const int token=0;
+	std::array<int32_t,tiles> empty{};
+	std::array<int32_t,tiles> background{};
+	std::array<int32_t,tiles> background_old{};
+	fill_background(background_old,4000);
+	background=background_old;
+	auto input=make_input(&token,dim,empty.data());
+	input.current_background=background.data();
+	input.previous_background=background_old.data();
+	visual_animation_managerst partial;
+	run_frame(partial,input,21000);
+	input.pan_x=3;
+	run_frame(partial,input,21010);
+	shift_background(background,background_old,dim,1,0,5000);
+	run_frame(partial,input,21020);
+	auto scroll=partial.get_scroll(&token);
+	assert(scroll.landed&&scroll.landed_x==1&&scroll.pending&&scroll.pending_x==2);
+	background_old=background;
+	shift_background(background,background_old,dim,2,0,6000);
+	run_frame(partial,input,21030);
+	scroll=partial.get_scroll(&token);
+	assert(scroll.landed&&scroll.landed_x==2&&!scroll.pending);
+	}
+
+	// Uniform terrain is visually safe to retire; absent data abandons without an offset.
+	{
+	constexpr int32_t dim=4;
+	constexpr size_t tiles=size_t(dim)*size_t(dim);
+	const int uniform_token=0,empty_token=1;
+	std::array<int32_t,tiles> empty{};
+	std::array<int32_t,tiles> uniform{};
+	uniform.fill(77);
+	auto input=make_input(&uniform_token,dim,empty.data());
+	input.current_background=uniform.data();
+	input.previous_background=uniform.data();
+	visual_animation_managerst manager;
+	run_frame(manager,input,22000);
+	input.pan_x=1;
+	run_frame(manager,input,22010);
+	assert(manager.get_scroll(&uniform_token).landed);
+	auto empty_input=make_input(&empty_token,dim,empty.data());
+	empty_input.current_background=empty.data();
+	empty_input.previous_background=empty.data();
+	visual_animation_managerst empty_manager;
+	run_frame(empty_manager,empty_input,22100);
+	empty_input.pan_x=1;
+	run_frame(empty_manager,empty_input,22110);
+	const auto abandoned=empty_manager.get_scroll(&empty_token);
+	assert(abandoned.abandoned&&!abandoned.pending);
+	}
 }
