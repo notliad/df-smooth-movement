@@ -6,12 +6,21 @@
 #include "VTableInterpose.h"
 
 #include "modules/DFSDL.h"
+#include "modules/Materials.h"
+#include "modules/Units.h"
 
 #include "df/enabler.h"
 #include "df/graphic.h"
 #include "df/graphic_viewportst.h"
+#include "df/item.h"
+#include "df/item_type.h"
+#include "df/material.h"
+#include "df/plotinfost.h"
 #include "df/renderer_2d_base.h"
 #include "df/texture_fullid.h"
+#include "df/unit.h"
+#include "df/unit_inventory_item.h"
+#include "df/viewport_spatter_flag.h"
 
 #include "visual_animation.h"
 
@@ -19,6 +28,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <set>
@@ -35,13 +46,71 @@ DFHACK_PLUGIN_IS_ENABLED(is_enabled);
 
 REQUIRE_GLOBAL(enabler);
 REQUIRE_GLOBAL(gps);
+REQUIRE_GLOBAL(pause_state);
+REQUIRE_GLOBAL(plotinfo);
 REQUIRE_GLOBAL(window_x);
 REQUIRE_GLOBAL(window_y);
 REQUIRE_GLOBAL(window_z);
 
 namespace {
 
-constexpr const char *plugin_version="0.3.0";
+constexpr const char *plugin_version="0.5.0";
+
+// Frame timing for `smooth-movement stats`. Counting is always on: one increment per frame,
+// one per painted frame, one per engine repaint. The clock is read three times per frame while
+// enabled. Sync covers movement detection across every viewport; render covers everything
+// after it, including the camera update and carried-item lookup that feed the draw decision,
+// then proxy collection, tile blanking, engine repaints and sprites. The render thread
+// writes, the console thread reads and clears, so the fields are relaxed atomics; a clear
+// that lands mid-frame skews that one frame and nothing else.
+struct frame_statsst
+{
+	std::atomic<bool> enabled{false};
+	std::atomic<uint64_t> frames{0};
+	std::atomic<uint64_t> painted{0};
+	std::atomic<uint64_t> repaints{0};
+	std::atomic<uint64_t> timed{0};
+	std::atomic<uint64_t> sync_us{0};
+	std::atomic<uint64_t> sync_max_us{0};
+	std::atomic<uint64_t> render_us{0};
+	std::atomic<uint64_t> render_max_us{0};
+
+	static uint64_t now_us()
+		{
+		return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count());
+		}
+
+	void clear()
+		{
+		for(std::atomic<uint64_t> *counter:{&frames,&painted,&repaints,&timed,
+			&sync_us,&sync_max_us,&render_us,&render_max_us})
+			counter->store(0,std::memory_order_relaxed);
+		}
+
+	static void add(std::atomic<uint64_t> &total,std::atomic<uint64_t> &max,uint64_t us)
+		{
+		total.fetch_add(us,std::memory_order_relaxed);
+		uint64_t seen=max.load(std::memory_order_relaxed);
+		while(seen<us&&!max.compare_exchange_weak(seen,us,std::memory_order_relaxed)){}
+		}
+
+	void add_sync(uint64_t us){add(sync_us,sync_max_us,us);}
+	void add_render(uint64_t us){add(render_us,render_max_us,us);}
+};
+
+frame_statsst frame_stats;
+
+// Runs a callback when the scope ends, whichever return path is taken.
+template<typename Callback>
+struct scope_guardst
+{
+	Callback callback;
+	explicit scope_guardst(Callback c):callback(std::move(c)){}
+	~scope_guardst(){callback();}
+	scope_guardst(const scope_guardst &)=delete;
+	scope_guardst &operator=(const scope_guardst &)=delete;
+};
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -64,6 +133,7 @@ int32_t previous_pan_x=0;
 int32_t previous_pan_y=0;
 bool has_pan_context=false;
 bool flip_enabled=false;
+bool hauled_enabled=false;
 
 // --- free camera -------------------------------------------------------------------------------
 // The camera is visually unbound from the tile grid. Two layered offsets:
@@ -85,11 +155,13 @@ double transient_x=0.0;                       // decaying glide offset, pixels
 double transient_y=0.0;
 double rest_x=0.0;                            // persistent free-camera offset, tiles
 double rest_y=0.0;                            // (positive = view sits WEST/NORTH of window)
-int32_t camera_pending_dx=0;                  // scroll delta announced but not yet in the buffers
-int32_t camera_pending_dy=0;
-int32_t camera_pending_frames=0;
 int32_t self_scroll_x=0;                      // window deltas WE wrote: visual no-ops when landing
 int32_t self_scroll_y=0;
+visual_movement_idst camera_follow_id=no_visual_movement;
+const void *camera_follow_viewport=nullptr;
+double camera_follow_x=0.0;
+double camera_follow_y=0.0;
+bool camera_ignore_pending=false;
 bool drag_active=false;
 double drag_anchor_vx=0.0;                    // visual camera at drag start, tiles
 double drag_anchor_vy=0.0;
@@ -99,6 +171,7 @@ bool camera_was_offset=false;                 // edge-detects offset->0 for one 
 int32_t camera_prev_wx=0;                     // window-scroll observation baseline
 int32_t camera_prev_wy=0;
 bool camera_has_prev=false;
+int32_t native_follow_id=-1;
 
 double tile_px(const df::renderer_2d_base *renderer)
 {
@@ -108,44 +181,24 @@ double tile_px(const df::renderer_2d_base *renderer)
 
 // Match ratio of "buffers shifted by (dwx,dwy)" on the background layer: 0..1, or -1 when there
 // is nothing to compare (empty background).
-double background_match_ratio(const df::graphic_viewportst *vp,int32_t dwx,int32_t dwy)
-{
-	int32_t considered=0;
-	int32_t matches=0;
-	for(int32_t x=0;x<vp->dim_x;++x)
-		{
-		const int32_t sx=x+dwx;
-		if(sx<0||sx>=vp->dim_x)continue;
-		for(int32_t y=0;y<vp->dim_y;++y)
-			{
-			const int32_t sy=y+dwy;
-			if(sy<0||sy>=vp->dim_y)continue;
-			const int32_t cur=vp->screentexpos_background[x*vp->dim_y+y];
-			if(cur==0)continue;
-			++considered;
-			if(vp->screentexpos_background_old[sx*vp->dim_y+sy]==cur)++matches;
-			}
-		}
-	if(considered==0)return -1.0;
-	return double(matches)/double(considered);
-}
-
 // Cancel everything except the persistent rest offset (the camera keeps its sub-tile position
 // across zoom/z/resize; only the in-flight animation state is unfollowable).
-void clear_camera_pending()
+void clear_camera_tracking()
 {
-	camera_pending_dx=0;
-	camera_pending_dy=0;
-	camera_pending_frames=0;
 	self_scroll_x=0;
 	self_scroll_y=0;
+	camera_follow_id=no_visual_movement;
+	camera_follow_viewport=nullptr;
+	camera_follow_x=0.0;
+	camera_follow_y=0.0;
+	camera_ignore_pending=false;
 }
 
 void cancel_camera_transients()
 {
 	transient_x=0.0;
 	transient_y=0.0;
-	clear_camera_pending();
+	clear_camera_tracking();
 	drag_active=false;
 }
 
@@ -178,47 +231,19 @@ void normalize_rest()
 		}
 }
 
-// A scroll of (ax,ay) tiles has landed in the buffers: our own normalization writes are visual
-// no-ops (they move into rest); the remainder is a real scroll and glides -- unless a drag is
-// driving the position directly, in which case it folds into rest wholesale.
-void attribute_landed(int32_t ax,int32_t ay,double tile)
-{
-	int32_t sx=0;
-	if(self_scroll_x!=0&&(self_scroll_x>0)==(ax>0)&&ax!=0)
-		sx=(std::abs(self_scroll_x)<=std::abs(ax))?self_scroll_x:ax;
-	int32_t sy=0;
-	if(self_scroll_y!=0&&(self_scroll_y>0)==(ay>0)&&ay!=0)
-		sy=(std::abs(self_scroll_y)<=std::abs(ay))?self_scroll_y:ay;
-	self_scroll_x-=sx;
-	self_scroll_y-=sy;
-	rest_x+=sx;
-	rest_y+=sy;
-	const int32_t gx=ax-sx;
-	const int32_t gy=ay-sy;
-	if(drag_active)
-		{
-		rest_x+=gx;
-		rest_y+=gy;
-		}
-	else
-		{
-		transient_x+=gx*tile;
-		transient_y+=gy*tile;
-		const double cap=tile*(camera_max_glide_tiles+0.5);
-		transient_x=std::clamp(transient_x,-cap,cap);
-		transient_y=std::clamp(transient_y,-cap,cap);
-		}
-}
-
 // Per-frame camera bookkeeping: observe window scrolls, attribute them when the buffers apply
 // them (glide vs our own normalization writes), drive the drag, decay the transient.
 void update_camera(
 	df::renderer_2d_base *renderer,
 	const df::graphic_viewportst *vp,
-	uint32_t delta_ms)
+	uint32_t delta_ms,
+	bool native_follow_active)
 {
-	if(!camera_enabled)return;
+	if(!camera_glide_enabled(camera_enabled,native_follow_active))return;
 	const double tile=tile_px(renderer);
+	const double k=std::exp(-double(delta_ms)/camera_tau_ms);
+	transient_x*=k;
+	transient_y*=k;
 	const int32_t wx=window_x?*window_x:0;
 	const int32_t wy=window_y?*window_y:0;
 	if(camera_has_prev&&(wx!=camera_prev_wx||wy!=camera_prev_wy))
@@ -227,79 +252,83 @@ void update_camera(
 		const int32_t dy=wy-camera_prev_wy;
 		if((std::abs(dx)>camera_max_glide_tiles||std::abs(dy)>camera_max_glide_tiles)&&
 			!drag_active)
-			cancel_camera_transients();   // teleport-like jump (recenter/minimap): snap
-		else
 			{
-			camera_pending_dx+=dx;
-			camera_pending_dy+=dy;
-			camera_pending_frames=0;
+			transient_x=0.0;
+			transient_y=0.0;
+			camera_follow_id=no_visual_movement;
+			camera_follow_x=0.0;
+			camera_follow_y=0.0;
+			camera_ignore_pending=true;
 			}
 		}
 	camera_prev_wx=wx;
 	camera_prev_wy=wy;
 	camera_has_prev=true;
 
-	if(camera_pending_dx!=0||camera_pending_dy!=0)
+	const visual_scroll_renderst scroll=animation_manager.get_scroll(vp);
+	if(scroll.abandoned)
 		{
-		if(std::abs(camera_pending_dx)>6||std::abs(camera_pending_dy)>6)
+		clear_camera_tracking();
+		}
+	if(scroll.landed)
+		{
+		int32_t sx=0;
+		if(self_scroll_x!=0&&scroll.landed_x!=0&&
+			(self_scroll_x>0)==(scroll.landed_x>0))
+			sx=std::abs(self_scroll_x)<=std::abs(scroll.landed_x)?
+				self_scroll_x:scroll.landed_x;
+		int32_t sy=0;
+		if(self_scroll_y!=0&&scroll.landed_y!=0&&
+			(self_scroll_y>0)==(scroll.landed_y>0))
+			sy=std::abs(self_scroll_y)<=std::abs(scroll.landed_y)?
+				self_scroll_y:scroll.landed_y;
+		self_scroll_x-=sx;
+		self_scroll_y-=sy;
+		rest_x+=sx;
+		rest_y+=sy;
+		const int32_t gx=scroll.landed_x-sx;
+		const int32_t gy=scroll.landed_y-sy;
+		const bool ignore=camera_ignore_pending;
+		if(!scroll.pending)camera_ignore_pending=false;
+		if(drag_active)
 			{
-			// Scrolling far outran detection: snap (keep rest, drop the animation debt).
+			rest_x+=gx;
+			rest_y+=gy;
+			}
+		else if((gx!=0||gy!=0)&&!ignore&&native_follow_active&&sx==0&&sy==0&&
+			scroll.follow_candidate!=no_visual_movement)
+			{
+			camera_follow_id=scroll.follow_candidate;
+			camera_follow_viewport=vp;
 			transient_x=0.0;
 			transient_y=0.0;
-			clear_camera_pending();
+			}
+		else if((gx!=0||gy!=0)&&!ignore)
+			{
+			camera_follow_id=no_visual_movement;
+			camera_follow_viewport=nullptr;
+			camera_follow_x=0.0;
+			camera_follow_y=0.0;
+			const double cap=tile*(camera_max_glide_tiles+0.5);
+			transient_x=std::clamp(transient_x+gx*tile,-cap,cap);
+			transient_y=std::clamp(transient_y+gy*tile,-cap,cap);
+			}
+		}
+	if(camera_follow_id!=no_visual_movement)
+		{
+		const auto follow=animation_manager.get_follow(
+			camera_follow_viewport,camera_follow_id);
+		if(follow.active)
+			{
+			camera_follow_x=follow.offset_x*tile;
+			camera_follow_y=follow.offset_y*tile;
 			}
 		else
 			{
-			// Fast scrolling applies the pending delta PIECEMEAL: the buffers may hold +1 of a
-			// pending +3 this frame. Testing only the total made landings miss, time out, and
-			// snap -- the fast-scroll jitter. Instead, find the LARGEST applied prefix of the
-			// pending scroll and attribute just that; the rest keeps pending. Ties between
-			// qualifying shifts only happen on uniform terrain, where mistiming is invisible.
-			const int32_t stepx=(camera_pending_dx>0)-(camera_pending_dx<0);
-			const int32_t stepy=(camera_pending_dy>0)-(camera_pending_dy<0);
-			int32_t best_ax=0,best_ay=0,best_mag=-1;
-			double best_score=-1.0;
-			bool no_data=false;
-			for(int32_t ix=0;ix<=std::abs(camera_pending_dx);++ix)
-				{
-				for(int32_t iy=0;iy<=std::abs(camera_pending_dy);++iy)
-					{
-					const double score=background_match_ratio(vp,ix*stepx,iy*stepy);
-					if(score<0.0){no_data=true;break;}
-					const int32_t mag=ix+iy;
-					if(score>=0.6&&(mag>best_mag||(mag==best_mag&&score>best_score)))
-						{
-						best_mag=mag;
-						best_score=score;
-						best_ax=ix*stepx;
-						best_ay=iy*stepy;
-						}
-					}
-				if(no_data)break;
-				}
-			if(no_data)
-				{
-				// Nothing to compare against (empty background): give up on attribution.
-				clear_camera_pending();
-				}
-			else if(best_mag>0)
-				{
-				attribute_landed(best_ax,best_ay,tile);
-				camera_pending_dx-=best_ax;
-				camera_pending_dy-=best_ay;
-				camera_pending_frames=0;
-				}
-			else if(best_mag==0)
-				{
-				// Content demonstrably hasn't moved yet: keep waiting, no timeout pressure.
-				camera_pending_frames=0;
-				}
-			else if(++camera_pending_frames>4)
-				{
-				// Neither static nor any prefix recognizable (heavy simultaneous change):
-				// drop the debt without touching the in-flight glide.
-				clear_camera_pending();
-				}
+			camera_follow_id=no_visual_movement;
+			camera_follow_viewport=nullptr;
+			camera_follow_x=0.0;
+			camera_follow_y=0.0;
 			}
 		}
 
@@ -307,18 +336,22 @@ void update_camera(
 	// released. DF's own drag still moves window in tile steps; rest carries the remainder.
 	// Positions are tracked against the CONTENT window (window minus unlanded jumps) so the
 	// buffer lag never causes a visible stutter.
-	const bool mbut=enabler!=nullptr&&enabler->mouse_mbut;
-	const double content_wx=double(wx-camera_pending_dx);
-	const double content_wy=double(wy-camera_pending_dy);
+	const bool mbut=camera_enabled&&enabler!=nullptr&&enabler->mouse_mbut;
+	const double content_wx=double(wx-scroll.pending_x);
+	const double content_wy=double(wy-scroll.pending_y);
 	if(mbut&&!drag_active&&gps!=nullptr)
 		{
 		drag_active=true;
-		drag_anchor_vx=content_wx-rest_x-transient_x/tile;
-		drag_anchor_vy=content_wy-rest_y-transient_y/tile;
+		drag_anchor_vx=content_wx-rest_x-(transient_x+camera_follow_x)/tile;
+		drag_anchor_vy=content_wy-rest_y-(transient_y+camera_follow_y)/tile;
 		drag_anchor_mx=gps->precise_mouse_x;
 		drag_anchor_my=gps->precise_mouse_y;
 		transient_x=0.0;
 		transient_y=0.0;
+		camera_follow_id=no_visual_movement;
+		camera_follow_viewport=nullptr;
+		camera_follow_x=0.0;
+		camera_follow_y=0.0;
 		}
 	if(drag_active)
 		{
@@ -347,20 +380,12 @@ void update_camera(
 			}
 		}
 
-	if(transient_x!=0.0||transient_y!=0.0)
+	if(std::abs(transient_x)<0.5&&std::abs(transient_y)<0.5)
 		{
-		const double k=std::exp(-double(delta_ms)/camera_tau_ms);
-		transient_x*=k;
-		transient_y*=k;
-		if(std::abs(transient_x)<0.5&&std::abs(transient_y)<0.5)
-			{
-			transient_x=0.0;
-			transient_y=0.0;
-			}
+		transient_x=0.0;
+		transient_y=0.0;
 		}
 }
-
-constexpr uint32_t fire_bits=0x70000000U;
 
 void update_visual_context(
 	const df::renderer_2d_base *renderer,
@@ -483,6 +508,8 @@ viewport_visual_animation_inputst animation_input(df::graphic_viewportst *vp)
 		visual_context_revision,
 		visual_layers(const_viewport),
 		visual_layers(const_viewport,true),
+		vp->screentexpos_background,
+		vp->screentexpos_background_old,
 		window_x?*window_x:0,
 		window_y?*window_y:0
 		};
@@ -505,10 +532,19 @@ bool inside_clip(const df::graphic_viewportst *vp,int32_t x,int32_t y)
 		y>=vp->clipy[0]&&y<=vp->clipy[1];
 }
 
+template<typename Flag>
+bool fire_frame(const Flag &flag)
+{
+	if constexpr(std::is_same_v<std::remove_cv_t<Flag>,uint32_t>)
+		return (flag&0x70000000U)!=0;
+	else
+		return flag.bits.fire_frame_type!=0;
+}
+
 bool has_fire(const df::graphic_viewportst *vp,int32_t x,int32_t y)
 {
 	return vp->screentexpos_spatter_flag!=nullptr&&
-		(vp->screentexpos_spatter_flag[x*vp->dim_y+y]&fire_bits)!=0;
+		fire_frame(vp->screentexpos_spatter_flag[x*vp->dim_y+y]);
 }
 
 template<typename T>
@@ -561,6 +597,18 @@ struct render_proxyst
 	SDL_Texture *texture;
 	bool mirrored=false;
 	int32_t mirror_shift=0;
+	std::set<std::pair<int32_t,int32_t>> coverage;
+	visual_movement_idst movement_id=no_visual_movement;
+};
+
+struct carried_item_proxyst
+{
+	float source_x;
+	float source_y;
+	int32_t target_x;
+	int32_t target_y;
+	float progress;
+	SDL_Texture *texture;
 	std::set<std::pair<int32_t,int32_t>> coverage;
 };
 
@@ -660,6 +708,13 @@ void with_upper_suppressed(
 		});
 }
 
+// Every engine repaint the plugin asks for goes through here so `stats` can count them.
+void engine_repaint(df::renderer_2d_base *renderer,df::graphic_viewportst *vp,int32_t x,int32_t y)
+{
+	frame_stats.repaints.fetch_add(1,std::memory_order_relaxed);
+	renderer->update_viewport_tile(vp,x,y);
+}
+
 void redraw_viewport_tile(
 	df::renderer_2d_base *renderer,
 	const viewport_renderst &viewport,
@@ -669,7 +724,7 @@ void redraw_viewport_tile(
 {
 	df::graphic_viewportst *vp=viewport.viewport;
 	const int32_t index=x*vp->dim_y+y;
-	const auto redraw=[&]{renderer->update_viewport_tile(vp,x,y);};
+	const auto redraw=[&]{engine_repaint(renderer,vp,x,y);};
 	const auto stage=[&]
 		{
 		with_suppressed_visual_layers(
@@ -712,7 +767,7 @@ void draw_interface_only(
 {
 	if(!interface_pass_readable(vp))return;
 	const int32_t index=x*vp->dim_y+y;
-	const auto redraw=[&]{renderer->update_viewport_tile(vp,x,y);};
+	const auto redraw=[&]{engine_repaint(renderer,vp,x,y);};
 	const auto without_visuals=[&]
 		{
 		with_suppressed_visual_layers(
@@ -775,7 +830,7 @@ void redraw_above(
 	const std::unordered_map<int32_t,uint16_t> &selected)
 {
 	const int32_t index=x*vp->dim_y+y;
-	const auto redraw=[&]{renderer->update_viewport_tile(vp,x,y);};
+	const auto redraw=[&]{engine_repaint(renderer,vp,x,y);};
 	const auto suppress_visuals=[&]
 		{
 		const auto stage=[&]
@@ -859,6 +914,112 @@ void draw_proxy(df::renderer_2d_base *renderer,const render_proxyst &proxy)
 		proxy.mirrored);
 }
 
+void draw_carried_item_proxy(
+	df::renderer_2d_base *renderer,
+	const carried_item_proxyst &proxy)
+{
+	const int32_t zoom=renderer->viewport_zoom_factor;
+	const float tile_size=float(zoom==128?32:std::max(1,zoom*32/128));
+	const float target_x=tile_pixel(proxy.target_x,renderer->origin_x,zoom);
+	const float target_y=tile_pixel(proxy.target_y,renderer->origin_y,zoom);
+	const float source_x=target_x+(proxy.source_x-proxy.target_x)*tile_size;
+	const float source_y=target_y+(proxy.source_y-proxy.target_y)*tile_size;
+	const auto icon=carried_item_icon_rect(
+		source_x+(target_x-source_x)*proxy.progress,
+		source_y+(target_y-source_y)*proxy.progress,
+		tile_size);
+	const SDL_FRect destination={icon.x,icon.y,icon.width,icon.height};
+	render_copy_f(
+		static_cast<SDL_Renderer *>(renderer->sdl_renderer),
+		proxy.texture,nullptr,&destination);
+}
+
+df::item *hauled_item(const df::unit *unit)
+{
+	if(unit==nullptr)return nullptr;
+	for(const df::unit_inventory_item *inventory_item:unit->inventory)
+		if(inventory_item!=nullptr&&inventory_item->item!=nullptr&&
+			inventory_item->mode==df::inv_item_role_type::Hauled)
+			return inventory_item->item;
+	return nullptr;
+}
+
+SDL_Texture *cached_viewport_texture(
+	df::renderer_2d_base *renderer,
+	df::graphic_viewportst *vp,
+	int32_t index,
+	int32_t texpos)
+{
+	if(texpos==0)return nullptr;
+	SDL_Texture *texture=cached_texture(renderer,texpos);
+	if(texture!=nullptr||vp->screentexpos_background_two==nullptr)return texture;
+	// Hauled items are not normally drawn, so stage one tile to populate the renderer cache.
+	scoped_value_restorest<int32_t> staged(vp->screentexpos_background_two[index]);
+	vp->screentexpos_background_two[index]=texpos;
+	engine_repaint(renderer,vp,index/vp->dim_y,index%vp->dim_y);
+	return cached_texture(renderer,texpos);
+}
+
+int32_t item_texpos(df::item *item)
+{
+	if(item==nullptr)return 0;
+	const MaterialInfo material(item);
+	if(!material.isValid())return 0;
+	switch(item->getType())
+		{
+		case df::item_type::BOULDER:
+			return material.material->boulder_texpos1!=0?
+				material.material->boulder_texpos1:
+				material.material->boulder_texpos2;
+		case df::item_type::BAR:
+			return material.material->bar_texpos;
+		case df::item_type::WOOD:
+			return material.material->wood_texpos;
+		default:
+			return 0;
+		}
+}
+
+std::vector<carried_item_proxyst> collect_carried_item_proxies(
+	df::renderer_2d_base *renderer,
+	df::graphic_viewportst *vp)
+{
+	std::vector<carried_item_proxyst> proxies;
+	if(window_x==nullptr||window_y==nullptr||window_z==nullptr)return proxies;
+
+	std::vector<df::unit *> units;
+	Units::getUnitsInBox(
+		units,
+		*window_x,*window_y,*window_z,
+		*window_x+vp->dim_x-1,*window_y+vp->dim_y-1,*window_z,
+		[](df::unit *unit){return !Units::isHidden(unit);});
+	for(const df::unit *unit:units)
+		{
+		const int32_t x=unit->pos.x-*window_x;
+		const int32_t y=unit->pos.y-*window_y;
+		if(!inside_clip(vp,x,y))continue;
+		const int32_t index=x*vp->dim_y+y;
+		if(vp->screentexpos[index]==0)continue;
+		const int32_t texpos=item_texpos(hauled_item(unit));
+		SDL_Texture *texture=cached_viewport_texture(renderer,vp,index,texpos);
+		if(texture==nullptr)continue;
+		const auto movement=animation_manager.get_movement(
+			vp,viewport_visual_layer::center,x,y);
+		const float source_x=movement.active?movement.source_x:float(x);
+		const float source_y=movement.active?movement.source_y:float(y);
+		carried_item_proxyst proxy={
+			source_x,source_y,x,y,movement.active?movement.progress:1.0f,texture,{}};
+		for(int32_t coverage_x=int32_t(std::floor(std::min(source_x,float(x))));
+			coverage_x<=int32_t(std::ceil(std::max(source_x,float(x))));++coverage_x)
+			for(int32_t coverage_y=int32_t(std::floor(std::min(source_y,float(y))));
+				coverage_y<=int32_t(std::ceil(std::max(source_y,float(y))));++coverage_y)
+				if(inside_clip(vp,coverage_x,coverage_y))
+					proxy.coverage.emplace(coverage_x,coverage_y);
+		proxies.push_back(std::move(proxy));
+		}
+	return proxies;
+}
+
 std::vector<render_proxyst> collect_proxies(
 	df::renderer_2d_base *renderer,
 	df::graphic_viewportst *vp)
@@ -895,9 +1056,11 @@ std::vector<render_proxyst> collect_proxies(
 						if(anchor.layer==viewport_visual_layer::center&&
 							std::abs(anchor.target_x-x)<=1&&
 							std::abs(anchor.target_y-y)<=1&&
-							anchor.source_x-anchor.target_x==movement.source_x-x&&
+							(visual_layer!=viewport_visual_layer::designation?
+							anchor.movement_id==movement.movement_id:
+							(anchor.source_x-anchor.target_x==movement.source_x-x&&
 							anchor.source_y-anchor.target_y==movement.source_y-y&&
-							anchor.progress==movement.progress)anchored=true;
+							anchor.progress==movement.progress)))anchored=true;
 						}
 					if(!anchored)continue;
 					}
@@ -932,9 +1095,7 @@ std::vector<render_proxyst> collect_proxies(
 						if(anchor.layer==viewport_visual_layer::center&&
 							anchor.target_x==x+descriptor.center_x&&
 							anchor.target_y==y+descriptor.center_y&&
-							anchor.source_x-anchor.target_x==movement.source_x-x&&
-							anchor.source_y-anchor.target_y==movement.source_y-y&&
-							anchor.progress==movement.progress)owns_fragment=true;
+							anchor.movement_id==movement.movement_id)owns_fragment=true;
 					if(!owns_fragment)continue;
 						}
 					}
@@ -1025,6 +1186,7 @@ std::vector<render_proxyst> collect_proxies(
 
 				proxy.texture=cached_texture(renderer,texpos);
 				if(proxy.texture==nullptr)continue;
+				proxy.movement_id=movement.movement_id;
 				proxies.push_back(std::move(proxy));
 				}
 			}
@@ -1195,7 +1357,8 @@ void redraw_viewport_tiles(
 void draw_viewport_interpolation_stages(
 	df::renderer_2d_base *renderer,
 	const std::vector<viewport_renderst> &viewports,
-	const tile_coveragest &coverage)
+	const tile_coveragest &coverage,
+	const std::vector<carried_item_proxyst> &carried_items)
 {
 	for(size_t index=0;index<viewports.size();++index)
 		{
@@ -1205,6 +1368,9 @@ void draw_viewport_interpolation_stages(
 		const viewport_renderst &viewport=viewports[index];
 		draw_interpolation_stages(
 			renderer,viewport.viewport,viewport.proxies,viewport.coverage);
+		if(index+1==viewports.size())
+			for(const carried_item_proxyst &proxy:carried_items)
+				draw_carried_item_proxy(renderer,proxy);
 		// A viewport shades everything drawn beneath it, so this covers every staged tile.
 		// Restricting it to the tiles this viewport has sprites on would not deepen with distance.
 		for(const auto &[x,y]:coverage)
@@ -1225,22 +1391,57 @@ bool has_mirrored_viewport_facing(
 
 void render_interpolated_world(df::renderer_2d_base *renderer)
 {
+	frame_stats.frames.fetch_add(1,std::memory_order_relaxed);
+	// Read once: if the console flipped the flag on mid-frame, the guard would subtract a
+	// start time of zero.
+	const bool timing_enabled=frame_stats.enabled.load(std::memory_order_relaxed);
+	const uint64_t frame_start_us=timing_enabled?frame_statsst::now_us():0;
+	uint64_t sync_end_us=frame_start_us;
+	// Runs on every exit, including the early return for frames with nothing to draw.
+	const scope_guardst timing([&]
+		{
+		if(!timing_enabled)return;
+		const uint64_t end_us=frame_statsst::now_us();
+		frame_stats.timed.fetch_add(1,std::memory_order_relaxed);
+		frame_stats.add_sync(sync_end_us-frame_start_us);
+		frame_stats.add_render(end_us-sync_end_us);
+		});
 	df::graphic_viewportst *vp=gps?gps->main_viewport:nullptr;
 	const std::vector<df::graphic_viewportst *> viewports=active_viewports();
 
 	if(vp!=nullptr)update_visual_context(renderer,vp);
+	const int32_t follow_id=plotinfo?plotinfo->follow_unit:-1;
+	if(native_follow_changed(native_follow_id,follow_id))
+		{
+		native_follow_id=follow_id;
+		++visual_context_revision;
+		previous_coverage.clear();
+		cancel_camera_transients();
+		camera_has_prev=false;
+		}
 	const uint32_t now_ms=Core::getInstance().p->getTickCount();
 	animation_manager.begin_frame(now_ms);
 	for(df::graphic_viewportst *viewport:viewports)
 		animation_manager.synchronize_viewport(animation_input(viewport));
 	animation_manager.end_frame();
+	if(timing_enabled)sync_end_us=frame_statsst::now_us();
 
 	if(!viewport_readable(vp)||renderer->sdl_renderer==nullptr)
 		return;
-	update_camera(renderer,vp,animation_manager.get_frame_delta_ms());
+	const bool paused=pause_state&&*pause_state;
+	if(paused)
+		{
+		cancel_camera_transients();
+		camera_has_prev=false;
+		}
+	const bool native_follow_active=follow_id>=0;
+	if(!paused)
+		update_camera(renderer,vp,animation_manager.get_frame_delta_ms(),native_follow_active);
 	const double cam_tile=tile_px(renderer);
-	const int32_t glide_x=int32_t(std::lround(transient_x+rest_x*cam_tile));
-	const int32_t glide_y=int32_t(std::lround(transient_y+rest_y*cam_tile));
+	const int32_t glide_x=int32_t(std::lround(
+		transient_x+camera_follow_x+rest_x*cam_tile));
+	const int32_t glide_y=int32_t(std::lround(
+		transient_y+camera_follow_y+rest_y*cam_tile));
 	const bool glide=glide_x!=0||glide_y!=0;
 	if(!glide&&camera_was_offset)
 		{
@@ -1249,13 +1450,20 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		if(gps!=nullptr)++gps->force_full_display_count;
 		}
 	if(glide)camera_was_offset=true;
+	std::vector<carried_item_proxyst> carried_items=
+		hauled_enabled?collect_carried_item_proxies(renderer,vp):
+		std::vector<carried_item_proxyst>{};
 	if(!glide&&!animation_manager.requires_full_redraw()&&
-		(!flip_enabled||!has_mirrored_viewport_facing(viewports)))
+		(!flip_enabled||!has_mirrored_viewport_facing(viewports))&&
+		carried_items.empty()&&previous_coverage.empty())
 		return;
+	frame_stats.painted.fetch_add(1,std::memory_order_relaxed);
 
 	std::vector<viewport_renderst> viewport_renders=
 		collect_viewport_renders(renderer,viewports);
 	tile_coveragest coverage=collect_viewport_coverage(viewport_renders);
+	for(const carried_item_proxyst &proxy:carried_items)
+		coverage.insert(proxy.coverage.begin(),proxy.coverage.end());
 
 	SDL_Renderer *sdl_renderer=static_cast<SDL_Renderer *>(renderer->sdl_renderer);
 	const int32_t zoom=renderer->viewport_zoom_factor;
@@ -1293,7 +1501,8 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 			for(int32_t y=vp->clipy[0];y<=vp->clipy[1];++y)
 				redraw_world_tile(renderer,viewport_renders,coverage,x,y);
 			}
-		draw_viewport_interpolation_stages(renderer,viewport_renders,coverage);
+		draw_viewport_interpolation_stages(
+			renderer,viewport_renders,coverage,carried_items);
 		renderer->origin_x=saved_origin_x;
 		renderer->origin_y=saved_origin_y;
 		render_set_clip_rect(sdl_renderer,nullptr);
@@ -1327,7 +1536,8 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 		if(inside_clip(vp,x,y))
 			redraw_world_tile(renderer,viewport_renders,coverage,x,y);
 		}
-	draw_viewport_interpolation_stages(renderer,viewport_renders,coverage);
+	draw_viewport_interpolation_stages(
+		renderer,viewport_renders,coverage,carried_items);
 
 	previous_coverage=std::move(coverage);
 }
@@ -1395,7 +1605,41 @@ void reset_state()
 	camera_enabled=false;
 	camera_has_prev=false;
 	camera_was_offset=false;
+	native_follow_id=-1;
 	flip_enabled=false;
+	hauled_enabled=false;
+	frame_stats.enabled=false;
+	frame_stats.clear();
+}
+
+void print_frame_stats(color_ostream &out)
+{
+	const auto get=[](const std::atomic<uint64_t> &v){return v.load(std::memory_order_relaxed);};
+	const uint64_t frames=get(frame_stats.frames),painted=get(frame_stats.painted),
+		repaints=get(frame_stats.repaints),timed=get(frame_stats.timed),
+		sync_us=get(frame_stats.sync_us),render_us=get(frame_stats.render_us);
+	out.print("frame stats: {}\n",frame_stats.enabled?"on":"off");
+	if(frames==0)
+		{
+		out.print("no frames counted\n");
+		return;
+		}
+	const auto mean=[](uint64_t total,uint64_t count)
+		{
+		return count==0?0.0:double(total)/double(count);
+		};
+	out.print("frames: {} ({} painted, {:.0f}%)\n",
+		frames,painted,100.0*mean(painted,frames));
+	out.print("engine tile repaints: {} ({:.1f} per frame, {:.1f} per painted frame)\n",
+		repaints,mean(repaints,frames),mean(repaints,painted));
+	if(timed==0)return;
+	out.print("timed frames: {}\n",timed);
+	out.print("sync: mean {:.0f} us, max {} us\n",
+		mean(sync_us,timed),get(frame_stats.sync_max_us));
+	out.print("render: mean {:.0f} us, max {} us\n",
+		mean(render_us,timed),get(frame_stats.render_max_us));
+	out.print("total: mean {:.0f} us per timed frame\n",
+		mean(sync_us+render_us,timed));
 }
 
 command_result status_command(
@@ -1412,6 +1656,48 @@ command_result status_command(
 			camera_enabled?"on":"off",-rest_x,-rest_y);
 		out.print("sprite flipping: {}\n",
 			flip_enabled?"on":"off");
+		out.print("linear movement: {}\n",
+			animation_manager.is_linear()?"on":"off");
+		out.print("hauled item icons: {}\n",
+			hauled_enabled?"on":"off");
+		out.print("frame stats: {}\n",
+			frame_stats.enabled?"on":"off");
+		return CR_OK;
+		}
+	if(parameters[0]=="stats")
+		{
+		if(parameters.size()==1)
+			{
+			print_frame_stats(out);
+			return CR_OK;
+			}
+		if(parameters.size()==2&&
+			(parameters[1]=="on"||parameters[1]=="off"))
+			{
+			const bool on=parameters[1]=="on";
+			if(on)frame_stats.clear();
+			frame_stats.enabled=on;
+			out.print("smooth-movement: frame stats {}\n",parameters[1]);
+			return CR_OK;
+			}
+		if(parameters.size()==2&&parameters[1]=="reset")
+			{
+			frame_stats.clear();
+			out.print("smooth-movement: frame stats reset\n");
+			return CR_OK;
+			}
+		return CR_WRONG_USAGE;
+		}
+	if(parameters[0]=="all")
+		{
+		if(parameters.size()!=2||
+			(parameters[1]!="on"&&parameters[1]!="off"))return CR_WRONG_USAGE;
+		const bool enabled=parameters[1]=="on";
+		flip_enabled=enabled;
+		animation_manager.set_linear(enabled);
+		hauled_enabled=enabled;
+		if(gps!=nullptr)++gps->force_full_display_count;
+		out.print("smooth-movement: flip, linear and hauled {}\n",parameters[1]);
 		return CR_OK;
 		}
 	if(parameters[0]=="camera")
@@ -1491,6 +1777,40 @@ command_result status_command(
 			}
 		return CR_WRONG_USAGE;
 		}
+	if(parameters[0]=="linear")
+		{
+		if(parameters.size()==1)
+			{
+			out.print("linear movement: {}\n",
+				animation_manager.is_linear()?"on":"off");
+			return CR_OK;
+			}
+		if(parameters.size()==2&&
+			(parameters[1]=="on"||parameters[1]=="off"))
+			{
+			animation_manager.set_linear(parameters[1]=="on");
+			out.print("smooth-movement: linear movement {}\n",parameters[1]);
+			return CR_OK;
+			}
+		return CR_WRONG_USAGE;
+		}
+	if(parameters[0]=="hauled")
+		{
+		if(parameters.size()==1)
+			{
+			out.print("hauled item icons: {}\n",hauled_enabled?"on":"off");
+			return CR_OK;
+			}
+		if(parameters.size()==2&&
+			(parameters[1]=="on"||parameters[1]=="off"))
+			{
+			hauled_enabled=parameters[1]=="on";
+			if(gps!=nullptr)++gps->force_full_display_count;
+			out.print("smooth-movement: hauled item icons {}\n",parameters[1]);
+			return CR_OK;
+			}
+		return CR_WRONG_USAGE;
+		}
 	return CR_WRONG_USAGE;
 }
 
@@ -1502,7 +1822,10 @@ plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 	commands.emplace_back(
 		"smooth-movement",
 		"Smooth movement status; free camera: camera on|off|reset|<fx> <fy>; "
-		"sprite flipping: flip on|off.",
+		"flip, linear and hauled together: all on|off; "
+		"sprite flipping: flip on|off; linear movement: linear on|off; "
+		"hauled item icons: hauled on|off; "
+		"frame timing: stats [on|off|reset].",
 		status_command);
 	return CR_OK;
 }
