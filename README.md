@@ -1,5 +1,8 @@
 # DF Smooth Movement
 
+> [!NOTE]
+> We will use this project to keep adding crazy and experimental visual features.<br/> If you want a vanilla experience use DFHack's smooth-movement.
+
 A visual plugin for Dwarf Fortress that makes movement smoother.
 
 ## Features
